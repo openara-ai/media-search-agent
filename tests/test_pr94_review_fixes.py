@@ -234,6 +234,15 @@ def test_run_export_does_not_drop_legacy_face_table(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+_PORTER_SCRIPT = (
+    Path(__file__).resolve().parents[1] / "internal" / "scripts" / "port_faiss_to_sqlite.py"
+)
+
+
+@pytest.mark.skipif(
+    not _PORTER_SCRIPT.exists(),
+    reason="port_faiss_to_sqlite.py is in internal/scripts/ (private repo only)",
+)
 def test_porter_dry_run_does_not_create_embedding_tables(tmp_path, monkeypatch):
     """A porter dry-run on a DB without the embedding tables should NOT
     create them. Calling init_schema would, even when no embeddings are
@@ -241,7 +250,7 @@ def test_porter_dry_run_does_not_create_embedding_tables(tmp_path, monkeypatch):
     """
     import sqlite3
     import sys
-    SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
+    SCRIPTS_DIR = _PORTER_SCRIPT.parent
     if str(SCRIPTS_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPTS_DIR))
 
