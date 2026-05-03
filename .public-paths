@@ -1,0 +1,54 @@
+# Public paths manifest — what migrates to the public openara-ai mirror.
+#
+# One pattern per line. `**` matches recursively, `*` matches a single
+# path segment. Lines starting with `#` are comments. Lines starting with
+# `!` exclude paths matched by an earlier pattern. Anything not matched
+# stays private by default (CLAUDE.md, AGENTS.md, internal/, etc.).
+#
+# This file is the single source of truth for the public migration script
+# and for scripts/check_doc_separation.py.
+
+# ---- Top-level public files ----
+README.md
+LICENSE
+NOTICE
+CHANGELOG.md
+SECURITY.md
+.gitignore
+.pre-commit-config.yaml
+.public-paths
+pyproject.toml
+requirements.txt
+requirements-api.txt
+requirements-windows.txt
+config.yaml
+
+# ---- Public docs (curated; internal/docs/ stays private) ----
+docs/**
+
+# ---- Code ----
+src/**
+tests/**
+scripts/**
+
+# ---- Installer / packaging assets ----
+installer/**
+
+# ---- CI and GitHub config ----
+# Excluded files are meta-internal (link into internal/ or contain
+# phase-specific content) and need a public-version rewrite before
+# they can ship.
+.github/**
+!.github/copilot-instructions.md
+!.github/PULL_REQUEST_TEMPLATE.md
+# Workflows that are private-only:
+#   - claude.yml uses an Anthropic API key
+#   - build-macos-dev.yml and build-macos-full.yml are dev-only heavy CI
+#   - mirror-staging.yml drives the public mirror itself; the staging deploy
+#     key only exists on the private repo, so this workflow has no purpose
+#     (and would always fail) if mirrored
+!.github/workflows/claude.yml
+!.github/workflows/build-macos-dev.yml
+!.github/workflows/build-macos-full.yml
+!.github/workflows/mirror-staging.yml
+

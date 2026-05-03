@@ -1,0 +1,1 @@
+This directory is for static file serving (e.g., thumbnails) via FastAPI. See app.py for mounting details.

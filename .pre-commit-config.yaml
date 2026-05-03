@@ -1,0 +1,17 @@
+# Pre-commit hooks for media-search-agent.
+#
+# Activate locally:
+#   pip install pre-commit
+#   pre-commit install
+#
+# Run manually against the working tree:
+#   pre-commit run --all-files
+repos:
+  - repo: local
+    hooks:
+      - id: check-doc-separation
+        name: Public docs must not link into internal/
+        entry: python scripts/check_doc_separation.py
+        language: system
+        pass_filenames: false
+        always_run: true

@@ -1,0 +1,62 @@
+# Media Search Agent — Windows Native Python requirements
+#
+# IMPORTANT: Do NOT pip install this file directly. The Windows installer
+# (installer/windows-native/shell/install.ps1) installs torch + torchvision
+# from the Blackwell-compatible CUDA index URL (cu128 or later —
+# sm_120-supporting) first, then processes this file. It additionally installs
+# facenet-pytorch with --no-deps after this file to prevent torch downgrade.
+#
+# numpy<2 is pinned until the OpenCV wheel in the runtime is verified against NumPy 2.
+# Revisit this pin when upgrading opencv-python-headless to a NumPy-2-built wheel.
+
+# --- Core ---
+numpy==1.26.4
+pyyaml
+ruamel.yaml  # comment-preserving YAML round-trips for config writes
+rich
+loguru
+
+# --- Media I/O ---
+Pillow
+pillow-heif
+# opencv-python-headless: keep pinned at 4.9.x — the wheel was compiled against
+# NumPy 1.x ABI; importing cv2 with numpy>=2 emits _ARRAY_API errors and breaks
+# video frame extraction. Revisit when upgrading to a NumPy-2-built OpenCV wheel.
+opencv-python-headless==4.9.0.80
+pymediainfo
+
+# --- EXIF ---
+exifread
+
+# --- Embeddings & models ---
+# torch and torchvision are installed by the Windows installers from the
+# Blackwell-compatible CUDA index URL (cu128 or later — sm_120-supporting)
+# before this file is processed. facenet-pytorch is installed by the shell
+# installer with --no-deps after torch is in place (the legacy installer does
+# not install facenet-pytorch). See header for the authoritative install order.
+# `requests` is a runtime dep of facenet-pytorch (its inception_resnet_v1
+# imports it at module load); needed here because --no-deps suppresses
+# transitive resolution.
+requests
+open_clip_torch
+# Object detection — RT-DETR backend (Apache-2.0, default)
+transformers>=4.42.0
+tokenizers>=0.19.0   # transitive of transformers; pinned for stability
+accelerate>=0.27.0   # transitive of transformers; needed for device_map
+scenedetect
+
+# --- Geo ---
+reverse-geocoder
+
+# --- API ---
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+pydantic-settings
+qdrant-client==1.11.3
+
+# Note: removed packages with no direct imports across src/, scripts/,
+# tests/, internal/scripts/ (audited via internal/scripts/audit_unused_deps.py):
+# - pandas, tqdm, piexif, pyexiftool, sentence-transformers, sqlite-utils,
+#   python-dateutil, SQLAlchemy, python-dotenv, requests
+# - faiss-cpu (FAISS removed at runtime per ADR-010; SQLite is canonical store)

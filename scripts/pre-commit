@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# Pre-commit hook for media-search-agent
+# Runs fast automated checks before every commit.
+#
+# Install: cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+# The installer (setup.sh / wsl-bootstrap.sh) installs this automatically.
+
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+PASS=0
+FAIL=0
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+green() { printf '\033[0;32m%s\033[0m\n' "$*"; }
+red()   { printf '\033[0;31m%s\033[0m\n' "$*"; }
+bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
+
+check_pass() { green "  ✓ $1"; PASS=$((PASS + 1)); }
+check_fail() { red   "  ✗ $1"; FAIL=$((FAIL + 1)); }
+
+# ── Branch guard ─────────────────────────────────────────────────────────────
+
+bold "Checking branch..."
+BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "detached")
+if [ "$BRANCH" = "main" ]; then
+  red "  ✗ Direct commits to main are not allowed."
+  red "    Create a feature branch: git checkout -b feature/<description>"
+  exit 1
+fi
+check_pass "Branch: $BRANCH (not main)"
+
+# ── shellcheck ───────────────────────────────────────────────────────────────
+
+if command -v shellcheck &>/dev/null; then
+  bold "Running shellcheck..."
+  # Collect only .sh files staged for commit
+  STAGED_SH=$(git diff --cached --name-only --diff-filter=ACM | grep '\.sh$' || true)
+  if [ -n "$STAGED_SH" ]; then
+    SHELLCHECK_FAIL=0
+    while IFS= read -r f; do
+      if shellcheck "$ROOT/$f"; then
+        check_pass "shellcheck: $f"
+      else
+        check_fail "shellcheck: $f"
+        SHELLCHECK_FAIL=1
+      fi
+    done <<< "$STAGED_SH"
+    [ "$SHELLCHECK_FAIL" -eq 1 ] && FAIL=$((FAIL + 1)) || true
+  else
+    green "  ✓ shellcheck: no .sh files staged"
+  fi
+else
+  printf '\033[0;33m  ~ shellcheck not installed — skipping (install: apt install shellcheck)\033[0m\n'
+fi
+
+# ── PSScriptAnalyzer (.ps1 files) ────────────────────────────────────────────
+
+STAGED_PS1=$(git diff --cached --name-only --diff-filter=ACM | grep '\.ps1$' || true)
+if [ -n "$STAGED_PS1" ]; then
+  if command -v pwsh &>/dev/null; then
+    bold "Running PSScriptAnalyzer..."
+    PSSA_FAIL=0
+    while IFS= read -r f; do
+      COUNT=$(pwsh -Command "Import-Module PSScriptAnalyzer -ErrorAction SilentlyContinue; \
+        \$r = Invoke-ScriptAnalyzer -Path '$ROOT/$f' -Severity Warning,Error 2>/dev/null; \
+        if (\$r) { \$r | Format-Table RuleName,Line,Message -AutoSize | Out-String | Write-Host; \$r.Count } else { 0 }" 2>&1 | tail -1)
+      if [ "${COUNT:-0}" -eq 0 ] 2>/dev/null; then
+        check_pass "PSScriptAnalyzer: $f"
+      else
+        check_fail "PSScriptAnalyzer: $f ($COUNT warning(s))"
+        PSSA_FAIL=1
+      fi
+    done <<< "$STAGED_PS1"
+    [ "$PSSA_FAIL" -eq 1 ] && FAIL=$((FAIL + 1)) || true
+  else
+    printf '\033[0;33m  ~ pwsh not installed — skipping PSScriptAnalyzer (install: https://github.com/PowerShell/PowerShell)\033[0m\n'
+  fi
+
+  bold "Checking Windows PowerShell 5.1 compatibility..."
+  PS51_FAIL=0
+  while IFS= read -r f; do
+    if command -v powershell.exe &>/dev/null; then
+      if powershell.exe -NoProfile -NonInteractive -Command "\$null = [System.Management.Automation.Language.Parser]::ParseFile('$(wslpath -w "$ROOT/$f")', [ref]\$null, [ref]\$null)" >/dev/null 2>&1; then
+        check_pass "PowerShell 5.1 parse: $f"
+      else
+        check_fail "PowerShell 5.1 parse: $f"
+        PS51_FAIL=1
+      fi
+    else
+      if LC_ALL=C grep -qP '[^\x00-\x7F]' "$ROOT/$f"; then
+        check_fail "PowerShell 5.1 fallback: $f contains non-ASCII text"
+        PS51_FAIL=1
+      elif head -c 3 "$ROOT/$f" | LC_ALL=C grep -q $'^\xEF\xBB\xBF'; then
+        check_fail "PowerShell 5.1 fallback: $f contains a UTF-8 BOM"
+        PS51_FAIL=1
+      else
+        check_pass "PowerShell 5.1 fallback: $f"
+      fi
+    fi
+  done <<< "$STAGED_PS1"
+  [ "$PS51_FAIL" -eq 1 ] && FAIL=$((FAIL + 1)) || true
+else
+  green "  ✓ PowerShell checks: no .ps1 files staged"
+fi
+
+# ── pytest (fast — not slow) ─────────────────────────────────────────────────
+
+bold "Running pytest (fast tests only)..."
+PYTHON=""
+if [ -f "$ROOT/.venv/bin/python" ]; then
+  PYTHON="$ROOT/.venv/bin/python"
+elif command -v python3 &>/dev/null; then
+  PYTHON="python3"
+fi
+
+if [ -n "$PYTHON" ]; then
+  if "$PYTHON" -m pytest "$ROOT/tests/" -q -m "not slow" \
+      --tb=short --no-header 2>&1; then
+    check_pass "pytest fast suite"
+  else
+    check_fail "pytest fast suite — fix failing tests before committing"
+  fi
+else
+  printf '\033[0;33m  ~ python not found — skipping pytest\033[0m\n'
+fi
+
+# ── Vitest (if ui directory exists and npm is available) ─────────────────────
+
+UI_DIR="$ROOT/src/msa_apps/ui"
+if [ -d "$UI_DIR" ] && command -v npm &>/dev/null; then
+  bold "Running Vitest..."
+  if (cd "$UI_DIR" && npm run test -- --run --reporter=verbose 2>&1); then
+    check_pass "Vitest"
+  else
+    check_fail "Vitest — fix failing component tests before committing"
+  fi
+fi
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+
+echo ""
+bold "Pre-commit summary: $PASS passed, $FAIL failed"
+
+if [ "$FAIL" -gt 0 ]; then
+  red "Commit blocked. Fix the above failures and try again."
+  red "To skip this hook in an emergency: git commit --no-verify (use sparingly)"
+  exit 1
+fi
+
+green "All checks passed. Proceeding with commit."
+exit 0

@@ -1,0 +1,96 @@
+# Ignore ALL index backups
+index_backups/
+
+# Privacy-sensitive local config (never check in)
+private/
+# config.yaml.template is generated at build time (copied from the platform-
+# specific checked-in template) and must not be committed at the repo root
+config.yaml.template
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.DS_Store
+/.idea/
+/.vscode/
+/index/*.index
+/index/*.bin
+/index/*.json
+/index/*.sqlite
+/logs/*
+/data/thumbnails/*
+
+
+# Qdrant data files
+qdrant/
+# Build and packaging
+*.egg-info/
+__pycache__/
+*.pyc
+
+# Index artifacts
+index/*.faiss
+index/*.faiss.*
+index/*.ids
+index/*.npy
+index/*.sqlite*
+data/
+logs/
+
+# Jupyter
+*.ipynb
+!internal/notebooks/*.ipynb
+.ipynb_checkpoints/
+
+# Virtual environment
+.venv/
+# media samples (ignore big videos)
+data/sample_photos/*.MOV
+
+# Ignore Windows ADS
+*Zone.Identifier*
+.ipynb_checkpoints/requirements-checkpoint.txt
+
+# YOLOv8 model files (auto-downloaded by ultralytics)
+yolov8*.pt
+/models/
+
+# React UI build artifacts
+src/msa_apps/ui/dist/
+src/msa_apps/ui/node_modules/
+tests/e2e/node_modules/
+tests/e2e/playwright-report/
+tests/e2e/playwright-test-results/
+tests/e2e/playwright-results.json
+tests/e2e/playwright-junit.xml
+
+# Installer build output
+dist/
+build/
+installer/windows/assets/app.tar.gz
+installer/windows-native/assets/app.zip
+installer/windows-native/assets/ui-dist.zip
+installer/windows-native/assets/uv.exe
+
+installer/windows-native/tray/bin/
+installer/windows-native/tray/obj/
+
+
+# macOS installer: downloaded static binaries (fetched by build.sh at build time)
+installer/macos/bin/
+installer/macos/bin-x86_64/
+installer/macos/lib/
+# macOS installer: Platypus-built .app bundles (built by build.sh)
+installer/macos/payload/Applications/MediaSearchAgent.app
+installer/macos/payload/Applications/MediaSearchAgent/
+
+# Stray directories created by MagicMock during test runs
+<MagicMock*/
+index1/
+run/
+
+# Runtime / tool artifacts
+msa-api.lock
+.codex/
+.artifacts/

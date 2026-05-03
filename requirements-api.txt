@@ -1,0 +1,75 @@
+# Packaged-app runtime requirements (lean — only what the indexer + API
+# server need at runtime). This is the file shipped by
+# installer/macos/shell/build-bundle.sh and installed by install.sh on
+# Linux/macOS bundles, and the file scripts/dev-setup.sh prefers when
+# building a developer venv.
+#
+# For full local-dev requirements (notebooks, GUI opencv, plotting, ML
+# analysis libs) see requirements.txt.
+# For the Windows native CUDA build see requirements-windows.txt.
+#
+# Anti-bloat assertions in tests/test_packaged_runtime_requirements.py
+# pin the contract: dev-only packages must not appear here, and
+# facenet-pytorch's --no-deps runtime deps must be listed explicitly.
+
+# Core dependencies
+numpy
+pyyaml
+ruamel.yaml  # comment-preserving YAML round-trips for config writes
+rich         # used implicitly by loguru for traceback formatting
+loguru
+
+# Media I/O (minimal)
+Pillow
+opencv-python-headless  # Headless version is smaller
+pymediainfo  # Indexer video metadata extraction; required by packaged runtime
+
+# EXIF
+# `exifread` is the fallback GPS parser in src/msa_indexer/io/exif.py
+# (used when Pillow's GPS path returns nothing — common for some HEIC and
+# JPEG variants). Imported under try/except, but real test fixtures rely
+# on it; without it, GPS tags from those formats silently disappear.
+exifread
+
+# Embeddings & models (required for runtime)
+# Use CPU-only PyTorch to avoid CUDA libraries (saves ~4GB)
+# Note: Use --extra-index-url when installing (not here in file)
+torch==2.*      # Will use CPU version if installed with --extra-index-url
+open_clip_torch
+
+# Web / API
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+pydantic-settings
+qdrant-client==1.11.3
+
+# Face recognition — must be installed --no-deps after torch in setup scripts
+# to prevent the solver downgrading the torch wheel. The setup scripts pin
+# torch first so the resolver keeps the correct version.
+#
+# When facenet-pytorch is installed --no-deps, its runtime deps must be
+# listed explicitly here so they survive even if upstream packages stop
+# pulling them transitively. facenet-pytorch's deps: numpy, Pillow,
+# requests, torch, torchvision, tqdm. numpy/Pillow/torch are already
+# top-level above; the rest are listed here:
+#   - requests:    used by inception_resnet_v1.py to download weights
+#   - torchvision: model layer imports; today pulled via open_clip_torch
+#   - tqdm:        progress bars during weight download; today pulled via
+#                  huggingface-hub
+facenet-pytorch>=2.6.0
+requests
+torchvision
+tqdm
+
+# Object detection — RT-DETR backend (Apache-2.0, default)
+transformers>=4.42.0
+tokenizers>=0.19.0   # transitive of transformers; pinned here for stability
+accelerate>=0.27.0   # transitive of transformers; needed for device_map at runtime
+scenedetect  # Indexer imports shot detection support at startup; cv2 comes from opencv-python-headless above
+
+# Geo
+reverse-geocoder
+
+# HEIC support
+pillow-heif

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "media-search-agent"
+version = "0.1.0"
+description = "Local media indexer with vector+metadata search"
+readme = "README.md"
+requires-python = ">=3.11"
+
+[project.scripts]
+msa = "msa_cli.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+msa_indexer = ["db/*.sql"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: marks tests as slow (integration/E2E tests that use real services)",
+]

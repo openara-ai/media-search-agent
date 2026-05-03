@@ -1,0 +1,80 @@
+# Full local-dev requirements (notebooks, GUI opencv, all backends).
+# For the packaged-app runtime see requirements-api.txt.
+# For the Windows native CUDA build see requirements-windows.txt.
+
+# core
+numpy
+tqdm   # transitive of HF model downloads; surfaced here so notebooks have it
+pyyaml
+ruamel.yaml  # comment-preserving YAML round-trips for config writes
+rich
+loguru
+
+# media I/O
+Pillow
+opencv-python
+pymediainfo
+
+# exif
+exifread
+
+# embeddings & models
+torch==2.*      # CPU ok; use CUDA build if desired
+open_clip_torch
+facenet-pytorch>=2.6.0  # Face detection + embedding (MIT — MTCNN + InceptionResnetV1 VGGFace2)
+# NOTE: install facenet-pytorch AFTER torch, or use --no-deps, to prevent the
+# solver from downgrading the platform-selected CUDA torch build.
+# When installed --no-deps, facenet-pytorch's runtime dep on `requests`
+# (used by inception_resnet_v1 to download weights) must come from
+# elsewhere — listed explicitly below so the dep doesn't disappear if a
+# previously-pulling top-level package (e.g. jupyterlab) is removed.
+requests
+#
+# InsightFace opt-in (NON-COMMERCIAL weights — see NOTICE):
+#   pip install insightface onnxruntime         (macOS)
+#   pip install insightface onnxruntime-gpu     (Linux/Windows CUDA)
+# Then set face_recognizer_backend: insightface in config.yaml.
+transformers>=4.42.0  # RT-DETR object detection (Apache-2.0, default backend)
+tokenizers>=0.19.0
+accelerate>=0.27.0
+scenedetect[opencv]  # Shot/scene detection for videos
+
+# vector store — faiss is no longer used by the runtime app (see ADR-010);
+# kept here for the dev test suite (tests/conftest.py + porter regression
+# tests) and the one-off internal/scripts/port_faiss_to_sqlite.py.
+faiss-cpu
+
+# geo
+reverse-geocoder  # Offline reverse geocoding (GPS -> place names)
+
+# --- Notebook & visualization ---
+jupyterlab>=4.0
+ipykernel
+ipywidgets
+matplotlib
+scikit-learn
+
+# --- HEIC / image support ---
+pillow-heif
+
+# --- Web / API ---
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+pydantic-settings
+qdrant-client==1.11.3
+
+# Testing
+pytest
+
+# Note: removed packages with no direct imports across src/, scripts/,
+# tests/, internal/scripts/ (audited via internal/scripts/audit_unused_deps.py):
+# - pandas, piexif, pyexiftool, sentence-transformers, sqlite-utils,
+#   python-dateutil, SQLAlchemy, python-dotenv
+#
+# `requests` was on this list but added back: facenet-pytorch's
+# inception_resnet_v1 imports it at module load, and we install
+# facenet-pytorch with --no-deps so its transitive deps must be listed
+# explicitly here. The original audit only checked direct imports in
+# our own source — it didn't account for --no-deps installs whose
+# transitive deps are otherwise invisible.

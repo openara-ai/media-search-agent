@@ -1,0 +1,372 @@
+name: CI
+
+# ── When each job runs ─────────────────────────────────────────────────────
+# pull_request  → test (ubuntu fast) only — cheap, fast feedback on every PR
+# push to main  → test + integration (ubuntu) + windows-test — fuller check
+# workflow_dispatch → all jobs, including macOS and Windows — manual pre-release gate
+# tag push (v*)  → handled entirely by release.yml; ci.yml is skipped
+#
+# Note: windows-test does NOT run on pull_request (only push/workflow_dispatch).
+# This is intentional — Windows runners are slow and expensive. A PR can
+# introduce Windows-specific breakage that only surfaces post-merge on main.
+# The release.yml gate ensures no installer ships if windows-test fails.
+# ──────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [ main ]
+    tags-ignore: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Quick Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-ci-${{ hashFiles('tests/requirements-ci.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-ci-
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg mediainfo
+          ETVER="$(awk -F= '/^EXIFTOOL_VERSION=/{print $2}' scripts/versions.env)"
+          curl -fsSL "https://github.com/exiftool/exiftool/archive/refs/tags/${ETVER}.tar.gz" -o /tmp/exiftool.tgz
+          sudo tar -xzf /tmp/exiftool.tgz -C /opt
+          sudo chmod +x "/opt/exiftool-${ETVER}/exiftool"
+          sudo ln -sf "/opt/exiftool-${ETVER}/exiftool" /usr/local/bin/exiftool
+          exiftool -ver
+
+      - name: Install CI dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Install everything except facenet-pytorch first so torch resolves freely,
+          # then install facenet-pytorch --no-deps to prevent its solver from
+          # downgrading the already-resolved torch.
+          grep -v '^facenet-pytorch' tests/requirements-ci.txt | python -m pip install -r /dev/stdin
+          python -m pip install "facenet-pytorch>=2.6.0" --no-deps
+          # Install project in development mode so imports work
+          python -m pip install -e .
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.19.0'
+          cache: 'npm'
+          cache-dependency-path: src/msa_apps/ui/package-lock.json
+
+      - name: Install UI dependencies
+        run: npm ci --prefix src/msa_apps/ui
+
+      - name: Run Vitest (React component tests)
+        run: npm test --prefix src/msa_apps/ui
+
+      - name: Validate config templates (YAML syntax)
+        run: |
+          python -c "import yaml; yaml.safe_load(open('installer/macos/config.macos.yaml.template'))" \
+            && echo "OK: config.macos.yaml.template"
+          python -c "import yaml; yaml.safe_load(open('installer/windows-native/config.windows.yaml.template'))" \
+            && echo "OK: config.windows.yaml.template"
+
+      - name: Run unit tests only (skip E2E)
+        run: |
+          python -m pytest tests/ -v -m "not slow"
+
+  windows-test:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/windows-test.yml
+
+  integration:
+    name: Full Integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          # Remove unnecessary packages to free up ~10GB
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get clean
+          df -h
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-integration-${{ hashFiles('tests/requirements-integration.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-integration-
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg mediainfo
+          ETVER="$(awk -F= '/^EXIFTOOL_VERSION=/{print $2}' scripts/versions.env)"
+          curl -fsSL "https://github.com/exiftool/exiftool/archive/refs/tags/${ETVER}.tar.gz" -o /tmp/exiftool.tgz
+          sudo tar -xzf /tmp/exiftool.tgz -C /opt
+          sudo chmod +x "/opt/exiftool-${ETVER}/exiftool"
+          sudo ln -sf "/opt/exiftool-${ETVER}/exiftool" /usr/local/bin/exiftool
+          exiftool -ver
+
+      - name: Install all dependencies
+        run: |
+          python -m pip install --upgrade pip
+          grep -v '^facenet-pytorch' tests/requirements-integration.txt | \
+            python -m pip install --no-cache-dir -r /dev/stdin
+          python -m pip install "facenet-pytorch>=2.6.0" --no-deps
+          python -m pip install -e .
+
+      - name: Run all tests (skip E2E without Qdrant)
+        run: |
+          # E2E tests will be skipped if Qdrant is not available
+          python -m pytest tests/ -v
+
+  # ── macOS: fast unit tests (workflow_dispatch / pre-release only) ──────────
+  macos-test:
+    name: macOS Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    if: github.event_name == 'workflow_dispatch'
+    strategy:
+      matrix:
+        os: [macos-14]   # macos-14 = Apple Silicon M1 (macos-13/Intel retired by GitHub)
+      fail-fast: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: ${{ runner.os }}-${{ runner.arch }}-pip-ci-${{ hashFiles('tests/requirements-ci.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-pip-ci-
+
+      - name: Install CI dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Install everything except facenet-pytorch first so torch resolves freely,
+          # then install facenet-pytorch --no-deps to prevent its solver from
+          # downgrading the already-resolved torch.
+          grep -v '^facenet-pytorch' tests/requirements-ci.txt | python -m pip install -r /dev/stdin
+          python -m pip install "facenet-pytorch>=2.6.0" --no-deps
+          python -m pip install -e .
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: src/msa_apps/ui/package-lock.json
+
+      - name: Install UI dependencies
+        run: npm ci --prefix src/msa_apps/ui
+
+      - name: Run Vitest (React component tests)
+        run: npm test --prefix src/msa_apps/ui
+
+      - name: Run unit tests (fast suite)
+        run: |
+          # Exclude object detection tests — YOLO segfaults on macOS CI (no GPU)
+          python -m pytest tests/ -v -m "not slow" \
+            --ignore=tests/test_object_detection.py \
+            --ignore=tests/test_object_detection_integration.py \
+            --ignore=tests/test_object_detection_on_samples.py
+
+  # ── macOS: full setup.sh + API smoke test (workflow_dispatch / pre-release) ─
+  macos-setup:
+    name: macOS Full Setup (macos-14)
+    runs-on: macos-14
+    timeout-minutes: 60
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache uv binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/uv
+          key: macos-arm64-uv-0.5.21
+
+      - name: Cache Python venv
+        uses: actions/cache@v4
+        id: venv-cache
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: macos-arm64-venv-${{ hashFiles('requirements-api.txt', 'requirements.txt', 'pyproject.toml') }}
+          restore-keys: |
+            macos-arm64-venv-
+
+      - name: Cache npm packages
+        uses: actions/cache@v4
+        with:
+          path: src/msa_apps/ui/node_modules
+          key: macos-arm64-npm-${{ hashFiles('src/msa_apps/ui/package-lock.json') }}
+          restore-keys: |
+            macos-arm64-npm-
+
+      - name: Run setup.sh
+        run: bash scripts/setup.sh
+        env:
+          # Suppress interactive prompts — Xcode CLT is pre-installed on GitHub runners
+          CI: true
+
+      - name: Verify key imports
+        run: |
+          source .venv/bin/activate
+          python - <<'EOF'
+          import torch
+          import open_clip
+          import faiss
+          import transformers
+          from transformers import RTDetrForObjectDetection, RTDetrImageProcessor
+          from facenet_pytorch import MTCNN, InceptionResnetV1
+          from msa_settings.config import load_config, detect_device
+          device = detect_device()
+          print(f"torch: {torch.__version__}  device: {device}  mps: {torch.backends.mps.is_available()}")
+          print(f"facenet_pytorch ok  faiss ok  transformers ok  open_clip ok")
+          EOF
+
+      - name: Copy macOS config template
+        run: cp installer/macos/config.macos.yaml.template config.yaml
+
+      - name: Start API (no pre-warm, no browser)
+        run: bash scripts/start.sh --no-prewarm --no-browser
+
+      - name: Smoke test — /health
+        run: |
+          response=$(curl -sf http://localhost:8000/health)
+          echo "$response"
+          echo "$response" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          assert d.get('status') in ('ok', 'ready'), f'Unexpected health response: {d}'
+          print('Health check passed')
+          "
+
+      - name: Smoke test — config and stats endpoints
+        run: |
+          curl -sf http://localhost:8000/config/sources | python3 -m json.tool
+          curl -sf http://localhost:8000/indexer/stats  | python3 -m json.tool
+
+      - name: Smoke test — launch splash route
+        run: |
+          html=$(curl -sf "http://localhost:8000/search?launch=1")
+          echo "$html" | grep -q 'id="root"'
+          asset=$(HTML="$html" python3 - <<'PY'
+          import re
+          import os
+          html = os.environ["HTML"]
+          match = re.search(r'/assets/index-[^"]*\.js', html)
+          if not match:
+              raise SystemExit("Could not find built UI asset in index.html")
+          print(match.group(0))
+          PY
+          )
+          js=$(curl -sf "http://localhost:8000${asset}")
+          echo "$js" | grep -q 'just opened here in your browser tab'
+          echo "$js" | grep -q 'Discover your forgotten moments'
+          echo "$js" | grep -q 'window.location.origin'
+
+      - name: Install test dependencies into venv
+        run: |
+          source .venv/bin/activate
+          # setup.sh already installed facenet-pytorch --no-deps; filter it here
+          # so the solver does not re-evaluate its torch constraints and downgrade.
+          grep -v '^facenet-pytorch' tests/requirements-ci.txt | pip install -r /dev/stdin --quiet
+          pip install "facenet-pytorch>=2.6.0" --no-deps --quiet
+
+      - name: Run fast unit tests against installed venv
+        run: |
+          source .venv/bin/activate
+          # Exclude object detection tests — YOLO segfaults on macOS CI (no GPU)
+          python -m pytest tests/ -v -m "not slow" \
+            --ignore=tests/test_object_detection.py \
+            --ignore=tests/test_object_detection_integration.py \
+            --ignore=tests/test_object_detection_on_samples.py
+
+      - name: Stop API
+        if: always()
+        run: bash scripts/stop.sh || true
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-setup-logs
+          path: |
+            logs/
+            /tmp/msa-*.log
+          if-no-files-found: ignore
+
+  # ── macOS: build .pkg + .dmg installer (workflow_dispatch / pre-release) ───
+  macos-installer:
+    name: macOS Installer (.dmg)
+    runs-on: macos-14
+    timeout-minutes: 30
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: brew install create-dmg
+        # Note: Platypus CLI requires interactive install from within Platypus.app
+        # so we skip it; build.sh falls back to building the .app bundle manually
+
+      - name: Build installer
+        run: bash installer/macos/build.sh --version 1.0.0
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MediaSearchAgent-macOS-Setup
+          path: dist/macos/MediaSearchAgent-*-Setup.dmg
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-installer-build-logs
+          path: |
+            build/macos/
+            /tmp/msa-*.log
+          if-no-files-found: ignore

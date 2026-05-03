@@ -1,0 +1,34 @@
+# Minimal dependencies required for CI test runs (keep this small & fast)
+pytest
+numpy
+# CPU build of torch; pin to a broad compatible range. CI runners will
+# pull the appropriate wheel for the runner OS/Python.
+torch>=2.0
+
+# Required for imports in source code (even for mocked tests)
+pyyaml  # for config.yaml loading
+ruamel.yaml  # comment-preserving YAML round-trips (used by config write endpoints)
+pydantic>=2.0  # for settings
+pydantic-settings  # for get_settings()
+open_clip_torch  # for ClipEmbedder (imported even if mocked)
+Pillow  # for PIL imports
+pillow_heif  # for HEIF image format support
+qdrant-client  # for QdrantStore imports in retrievers
+
+# Required for API tests
+fastapi  # for FastAPI TestClient
+httpx  # for TestClient async support (transitive dep, explicit for safety)
+
+# Required for object detection and video features
+loguru  # for logging in object detection
+pymediainfo  # for video metadata extraction
+transformers>=4.42.0  # for RT-DETR object detection backend (default)
+tokenizers>=0.19.0
+accelerate>=0.27.0
+faiss-cpu  # for FAISS vector store imports
+
+# Required for face recognition
+facenet-pytorch>=2.6.0  # installed --no-deps after torch to avoid torch downgrade
+
+# Required for video processing
+opencv-python  # for cv2 in video processing

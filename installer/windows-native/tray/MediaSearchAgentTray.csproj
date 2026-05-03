@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>MediaSearchAgentTray</AssemblyName>
+    <RootNamespace>MediaSearchAgentTray</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Platforms>x64</Platforms>
+    <ApplicationIcon>../assets/icon.ico</ApplicationIcon>
+    <AssemblyVersion>0.0.0</AssemblyVersion>
+    <FileVersion>0.0.0</FileVersion>
+    <InformationalVersion>dev</InformationalVersion>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <!--
+      Publish settings (used by build-bundle.sh):
+        dotnet publish -r win-x64 -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true -c Release
+      Produces a single self-contained MediaSearchAgentTray.exe (~15 MB).
+      No .NET redistributable required on the user machine.
+    -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Embedded so LoadIcon() can retrieve it from the single-file exe -->
+    <EmbeddedResource Include="../assets/icon.ico" LogicalName="icon.ico" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,351 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # needed to create GitHub Releases and upload assets
+
+jobs:
+  # ── Test gate: all three must pass before any installer is built ────────────
+  test:
+    name: Quick Tests (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-ci-${{ hashFiles('tests/requirements-ci.txt') }}
+          restore-keys: ${{ runner.os }}-pip-ci-
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Strip facenet-pytorch + install with deps, then install
+          # facenet-pytorch --no-deps. Without this, facenet-pytorch's
+          # transitive constraints back-propagate and downgrade torch +
+          # torchvision to a pair transformers 5.x considers too old for
+          # `is_torchvision_available()`. Same pattern used by ci.yml,
+          # dev-setup.sh, and the bundle installers.
+          grep -v '^facenet-pytorch' tests/requirements-ci.txt | \
+            python -m pip install -r /dev/stdin
+          python -m pip install "facenet-pytorch>=2.6.0" --no-deps
+          python -m pip install -e .
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.19.0'
+          cache: npm
+          cache-dependency-path: src/msa_apps/ui/package-lock.json
+      - run: npm ci --prefix src/msa_apps/ui
+      - run: npm test --prefix src/msa_apps/ui
+      - run: python -m pytest tests/ -v -m "not slow"
+
+  integration:
+    name: Full Integration (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get clean
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-integration-${{ hashFiles('tests/requirements-integration.txt') }}
+          restore-keys: ${{ runner.os }}-pip-integration-
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Strip + --no-deps facenet-pytorch (see explanation in the
+          # `test` job's Install dependencies step).
+          grep -v '^facenet-pytorch' tests/requirements-integration.txt | \
+            python -m pip install --no-cache-dir -r /dev/stdin
+          python -m pip install "facenet-pytorch>=2.6.0" --no-deps
+          python -m pip install -e .
+      - run: python -m pytest tests/ -v
+
+  macos-test:
+    name: Unit Tests (macOS)
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+      - uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: ${{ runner.os }}-${{ runner.arch }}-pip-ci-${{ hashFiles('tests/requirements-ci.txt') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-pip-ci-
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Strip + --no-deps facenet-pytorch (see explanation in the
+          # `test` job's Install dependencies step).
+          grep -v '^facenet-pytorch' tests/requirements-ci.txt | \
+            python -m pip install -r /dev/stdin
+          python -m pip install "facenet-pytorch>=2.6.0" --no-deps
+          python -m pip install -e .
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: src/msa_apps/ui/package-lock.json
+      - run: npm ci --prefix src/msa_apps/ui
+      - run: npm test --prefix src/msa_apps/ui
+      - name: Run unit tests (fast suite)
+        run: |
+          python -m pytest tests/ -v -m "not slow" \
+            --ignore=tests/test_object_detection.py \
+            --ignore=tests/test_object_detection_integration.py \
+            --ignore=tests/test_object_detection_on_samples.py
+
+  windows-test:
+    uses: ./.github/workflows/windows-test.yml
+
+  # ── BVT gate: validates bundled tool versions end-to-end ────────────────────
+  bvt:
+    name: BVT (Bundle)
+    needs: [test, integration, macos-test, windows-test]
+    uses: ./.github/workflows/bvt.yml
+
+  # NOTE: Releases ship shell bundles + bootstrap installer scripts (one-line
+  # install). The Windows .exe path (Inno Setup) was removed in 2026-05; the
+  # macOS .dmg path remains opt-in via workflow_dispatch on ci.yml. Restore
+  # the Inno Setup path from git history if it ever needs to come back.
+
+  # ── React UI (shared artifact for shell bundles) ─────────────────────────────
+  build-ui:
+    name: Build React UI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [test, integration, macos-test, windows-test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: src/msa_apps/ui/package-lock.json
+      - run: npm ci --prefix src/msa_apps/ui
+      - run: npm run build --prefix src/msa_apps/ui
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: src/msa_apps/ui/dist
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── macOS shell bundle ────────────────────────────────────────────────────────
+  build-macos-shell-bundle:
+    name: Build macOS Shell Bundle
+    runs-on: macos-14
+    timeout-minutes: 30
+    needs: [build-ui]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download React UI dist
+        uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: src/msa_apps/ui/dist
+
+      - name: Build macOS bundle
+        run: bash installer/macos/shell/build-bundle.sh --version "${{ steps.version.outputs.version }}" --platform macos
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-shell-bundle
+          path: dist/shell/MediaSearchAgent-*-macos-*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── Linux shell bundle ────────────────────────────────────────────────────────
+  build-linux-shell-bundle:
+    name: Build Linux Shell Bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [build-ui]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download React UI dist
+        uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: src/msa_apps/ui/dist
+
+      - name: Build Linux bundle
+        run: bash installer/macos/shell/build-bundle.sh --version "${{ steps.version.outputs.version }}" --platform linux
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-shell-bundle
+          path: dist/shell/MediaSearchAgent-*-linux-*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── Windows shell bundle ──────────────────────────────────────────────────────
+  build-windows-shell-bundle:
+    name: Build Windows Shell Bundle
+    runs-on: windows-latest
+    timeout-minutes: 20
+    needs: [build-ui]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download React UI dist
+        uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: src/msa_apps/ui/dist
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # build-bundle.sh's final step calls `zip`, which isn't on windows-latest
+      # Git Bash by default. Install it via Chocolatey so the script's POSIX
+      # zip path keeps working without a script-side rewrite.
+      - name: Install zip (for build-bundle.sh)
+        run: choco install zip --no-progress -y
+        shell: powershell
+
+      - name: Build Windows bundle
+        shell: bash
+        run: bash installer/windows-native/shell/build-bundle.sh --version "${{ steps.version.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-shell-bundle
+          path: dist/shell/MediaSearchAgent-*-windows-*.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── GitHub Release ────────────────────────────────────────────────────────────
+  release:
+    name: Publish GitHub Release
+    needs: [build-macos-shell-bundle, build-linux-shell-bundle, build-windows-shell-bundle, bvt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download macOS shell bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-shell-bundle
+          path: dist/shell
+
+      - name: Download Linux shell bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-shell-bundle
+          path: dist/shell
+
+      - name: Download Windows shell bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-shell-bundle
+          path: dist/shell
+
+      # Stage the bootstrap installer scripts as top-level release assets so
+      # the GitHub one-liner works:
+      #   curl -fsSL https://github.com/<repo>/releases/latest/download/install.sh | bash
+      #   powershell -c "irm https://github.com/<repo>/releases/latest/download/install.ps1 | iex"
+      - name: Stage bootstrap installer scripts
+        run: |
+          mkdir -p dist/installers
+          cp installer/macos/shell/install.sh         dist/installers/install.sh
+          cp installer/windows-native/shell/install.ps1 dist/installers/install.ps1
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "v${{ steps.version.outputs.version }}"
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: true
+          body: |
+            ## Media Search Agent v${{ steps.version.outputs.version }}
+
+            Local-first semantic photo & video search. Indexes using CLIP embeddings, RT-DETR object detection, and facenet-pytorch face recognition. Fully offline — no cloud.
+
+            ### Install
+
+            One-liner install (recommended). Pulls the matching script from this release.
+
+            **macOS / Linux**
+            ```bash
+            curl -fsSL https://github.com/kumraj/media-search-agent/releases/latest/download/install.sh | bash
+            ```
+
+            **Windows (PowerShell 5.1+)**
+            ```powershell
+            powershell -c "irm https://github.com/kumraj/media-search-agent/releases/latest/download/install.ps1 | iex"
+            ```
+
+            The installer downloads the matching shell bundle for your platform from this release, sets up a Python environment under your user account (no admin / UAC required), and starts the service on <http://localhost:8000>.
+
+            ### Manual download
+
+            If you'd rather download and run the bundle yourself:
+
+            | Platform | Bundle |
+            |---|---|
+            | macOS (Apple Silicon + Intel) | `MediaSearchAgent-${{ steps.version.outputs.version }}-macos-arm64.tar.gz` |
+            | Linux (x86_64) | `MediaSearchAgent-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz` |
+            | Windows (x86_64) | `MediaSearchAgent-${{ steps.version.outputs.version }}-windows-x86_64.zip` |
+
+            Then point the installer at it:
+            ```bash
+            bash install.sh --bundle ./MediaSearchAgent-${{ steps.version.outputs.version }}-<platform>-<arch>.tar.gz
+            ```
+
+            ### Requirements
+
+            - **macOS**: macOS 12 Monterey or later. The installer will prompt you to install Xcode Command Line Tools if needed — click **Install**, wait for it to complete, then re-run the installer.
+            - **Windows**: Windows 10 version 2004+ or Windows 11. No pre-installed Python required — the installer manages a standalone CPython 3.12 via `uv`. WSL2 is **not** required.
+
+            ### Known limitations (v0.x)
+
+            - First launch takes 2–5 minutes while ML models download (~2 GB)
+            - No auto-update — re-run the one-liner to upgrade
+          files: |
+            dist/installers/install.sh
+            dist/installers/install.ps1
+            dist/shell/MediaSearchAgent-*-macos-*.tar.gz
+            dist/shell/MediaSearchAgent-*-linux-*.tar.gz
+            dist/shell/MediaSearchAgent-*-windows-*.zip

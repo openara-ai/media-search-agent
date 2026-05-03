@@ -1,0 +1,117 @@
+Media Search Agent
+Copyright (c) 2024-2026 Kumar Rajeev
+
+This product is licensed under the MIT License (see LICENSE).
+
+-------------------------------------------------------------------------------
+THIRD-PARTY COMPONENTS
+-------------------------------------------------------------------------------
+
+This software includes third-party components under separate licenses.
+Their terms apply to their respective portions of this distribution.
+
+-------------------------------------------------------------------------------
+HuggingFace Transformers / RT-DETR (object detection)
+License: Apache-2.0
+Source:  https://github.com/huggingface/transformers
+Model:   https://huggingface.co/PekingU/rtdetr_r18vd
+
+-------------------------------------------------------------------------------
+facenet-pytorch / VGGFace2 (face detection and recognition)
+Library license: MIT
+Source:          https://github.com/timesler/facenet-pytorch
+Model weights:   https://github.com/timesler/facenet-pytorch (MIT)
+
+The facenet-pytorch library and the bundled VGGFace2 pretrained weights are
+MIT-licensed. The VGGFace2 dataset itself was released by the Visual Geometry
+Group at Oxford University for research purposes, but the serialised weight
+file distributed via facenet-pytorch carries the MIT license of that package.
+
+-------------------------------------------------------------------------------
+OPTIONAL BACKENDS
+-------------------------------------------------------------------------------
+
+If you change the face_recognizer_backend setting in config.yaml to
+"insightface", the application will download InsightFace model weights at
+runtime. Those weights are subject to additional restrictions:
+
+InsightFace pretrained model weights (ArcFace face recognition)
+Library license: MIT
+Model weights:   Non-commercial use only
+Source:          https://github.com/deepinsight/insightface
+
+The InsightFace library is MIT-licensed. However, the pretrained ArcFace model
+weights (e.g., buffalo_l, buffalo_s, antelopev2) are provided by the InsightFace
+project for NON-COMMERCIAL USE ONLY. If you opt in to this backend, do not use
+this software or its face-recognition outputs for commercial purposes.
+
+-------------------------------------------------------------------------------
+OpenCLIP / open_clip_torch (CLIP visual-language embeddings)
+License: MIT
+Source:  https://github.com/mlfoundations/open_clip
+
+-------------------------------------------------------------------------------
+PyTorch
+License: BSD-3-Clause (with additional patent grant)
+Source:  https://github.com/pytorch/pytorch
+
+-------------------------------------------------------------------------------
+FAISS (faiss-cpu)
+License: MIT
+Source:  https://github.com/facebookresearch/faiss
+
+-------------------------------------------------------------------------------
+Qdrant
+License: Apache-2.0
+Source:  https://github.com/qdrant/qdrant-client
+
+-------------------------------------------------------------------------------
+ExifTool
+License: Artistic License or GNU General Public License v1 or later
+Source:  https://exiftool.org/
+Source:  https://github.com/exiftool/exiftool
+
+Media Search Agent invokes ExifTool as a separate command-line tool for local
+metadata extraction. Packaged Linux and macOS bundles include the ExifTool Perl
+script and its supporting Perl modules. Packaged Windows bundles include the
+official Windows executable distribution.
+
+-------------------------------------------------------------------------------
+MediaInfo / MediaInfoLib
+License: BSD-2-Clause
+Source:  https://mediaarea.net/en/MediaInfo
+Source:  https://github.com/MediaArea/MediaInfo
+Source:  https://github.com/MediaArea/MediaInfoLib
+
+Media Search Agent uses MediaInfo through the pymediainfo Python package for
+local video metadata extraction. Packaged macOS and Linux bundles may include
+the MediaInfo CLI binary. Packaged macOS builds also include
+libmediainfo.dylib for pymediainfo's ctypes loader. Windows-native runtime
+relies on pymediainfo's Windows library support instead of a separately bundled
+MediaInfo CLI.
+
+-------------------------------------------------------------------------------
+FastAPI
+License: MIT
+Source:  https://github.com/tiangolo/fastapi
+
+-------------------------------------------------------------------------------
+PRIVACY NOTICE
+-------------------------------------------------------------------------------
+
+This application runs entirely on your local machine. No media files, metadata,
+search queries, face embeddings, or biometric data are transmitted to any
+external server or third party. Face recognition data (embeddings, crop
+thumbnails, assigned labels) is stored locally in the application data
+directory and is used solely to enable the People feature within the app.
+
+You are responsible for ensuring that your use of this software complies with
+applicable privacy laws in your jurisdiction, including any obligations that
+may arise from processing biometric data or images of other individuals.
+
+-------------------------------------------------------------------------------
+NO WARRANTY
+-------------------------------------------------------------------------------
+
+This software is provided "as is", without warranty of any kind. See the MIT
+License for the full disclaimer.

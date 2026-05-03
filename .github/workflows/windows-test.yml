@@ -1,0 +1,77 @@
+name: Windows Unit Tests
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+jobs:
+  windows-test:
+    name: Unit Tests (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+      - uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: ${{ runner.os }}-pip-ci-${{ hashFiles('tests/requirements-ci.txt') }}
+          restore-keys: ${{ runner.os }}-pip-ci-
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r tests/requirements-ci.txt
+          python -m pip install -e .
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.19.0'
+          cache: npm
+          cache-dependency-path: src/msa_apps/ui/package-lock.json
+      - run: npm ci --prefix src/msa_apps/ui
+      - run: npm test --prefix src/msa_apps/ui
+      - name: Install ExifTool
+        shell: powershell
+        run: |
+          $etVer = (Get-Content scripts/versions.env | Where-Object { $_ -match '^EXIFTOOL_VERSION=' }) -replace '^EXIFTOOL_VERSION=',''
+          # Use the standalone Windows .exe distribution — same source as the
+          # Windows bundle installer. A proper .exe lets Python subprocess invoke
+          # it directly (CreateProcess cannot run .bat/.cmd files from a list).
+          $url = "https://sourceforge.net/projects/exiftool/files/exiftool-${etVer}_64.zip/download"
+          $zip = "$env:TEMP\exiftool.zip"
+          $dest = "$env:TEMP\exiftool-bin"
+          # curl.exe follows SourceForge's CDN redirect chain; Invoke-WebRequest cannot
+          curl.exe -L -o $zip $url
+          Expand-Archive $zip -DestinationPath $dest -Force
+          $exe = Get-ChildItem $dest -Filter "exiftool(-k).exe" -Recurse | Select-Object -First 1
+          if (-not $exe) { Write-Error "exiftool(-k).exe not found in archive"; exit 1 }
+          $etDir = $exe.DirectoryName
+          Rename-Item $exe.FullName (Join-Path $etDir "exiftool.exe")
+          Add-Content -Path $env:GITHUB_PATH -Value $etDir
+          & (Join-Path $etDir "exiftool.exe") -ver
+      - name: Run unit tests (fast suite)
+        shell: powershell
+        run: |
+          python -m pytest tests/ -v -m "not slow" `
+            --ignore=tests/test_object_detection.py `
+            --ignore=tests/test_object_detection_integration.py `
+            --ignore=tests/test_object_detection_on_samples.py
+      - name: Lint PowerShell scripts (PSScriptAnalyzer)
+        shell: powershell
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+          $files = Get-ChildItem -Path installer\windows-native -Filter *.ps1 -Recurse
+          if ($files.Count -eq 0) {
+            Write-Error "No .ps1 files found - check installer path"
+            exit 1
+          }
+          $results = $files | ForEach-Object {
+            Invoke-ScriptAnalyzer -Path $_.FullName -Severity Error,Warning
+          }
+          if ($results) {
+            $results | Format-Table -AutoSize
+            exit 1
+          }
+          Write-Host "PSScriptAnalyzer: $($files.Count) .ps1 files passed"

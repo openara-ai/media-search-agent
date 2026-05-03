@@ -1,0 +1,85 @@
+# Media Search Agent — macOS Configuration
+# This file is copied to ~/Library/Application Support/MediaSearchAgent/config.yaml on first install.
+# Edit it to add your media folders, then run the indexer from the menu bar app.
+#
+# Full configuration reference: https://github.com/kumraj/media-search-agent/docs/ARCHITECTURE.md
+#
+# Data directories (index, thumbnails, Qdrant) are resolved automatically to
+# ~/Library/Application Support/MediaSearchAgent/. Override with MSA_DATA_DIR if needed.
+
+# ── Media sources ─────────────────────────────────────────────────────────────
+# Add one entry per folder you want indexed. Paths are macOS-native.
+# read_only: true prevents the indexer from modifying your originals (recommended).
+media_sources: []
+# Examples:
+#   - name: "Photos Library"
+#     path: "/Users/you/Pictures"
+#     read_only: true
+#   - name: "External Drive"
+#     path: "/Volumes/MyDrive/Photos"
+#     read_only: true
+
+# ── CLIP model ────────────────────────────────────────────────────────────────
+# ViT-L-14 gives the best search quality. ViT-B-32 is faster on older hardware.
+model_name: "ViT-L-14"
+pretrained: "openai"
+model_version: "clip-2025-10"
+
+# ── Compute ───────────────────────────────────────────────────────────────────
+# "auto" selects MPS (Apple Silicon) or CPU automatically. Force "cpu" if you
+# see MPS errors on older macOS versions.
+device: "auto"
+batch_size: 32
+num_workers: 4
+
+# ── Object detection ──────────────────────────────────────────────────────────
+# enable_object_detection: auto | true | false
+#   auto  — enabled when MPS/GPU is present, skipped on CPU-only machines
+#   true  — always enabled (expect ~200 ms/image on CPU)
+#   false — disabled entirely
+# object_detector_backend: rtdetr
+# rtdetr variants: PekingU/rtdetr_r18vd (default, 81 MB) | r34vd | r50vd
+enable_object_detection: auto
+object_detector_backend: "rtdetr"
+object_model: "PekingU/rtdetr_r18vd"
+object_confidence_threshold: 0.35
+enable_video_object_detection: true
+video_detection_max_frames: 10
+
+# ── Face recognition ─────────────────────────────────────────────────────────
+# Default backend: facenet_pytorch (MIT — MTCNN + InceptionResnetV1 VGGFace2).
+# Opt-in to InsightFace (non-commercial weights): set face_recognizer_backend: insightface
+# and install insightface + onnxruntime separately.
+enable_face_recognition: true
+face_recognizer_backend: "facenet_pytorch"
+face_model: "vggface2"
+face_confidence_threshold: 0.80
+face_min_size: 20
+face_store_metadata: true
+
+# ── Video shot detection ──────────────────────────────────────────────────────
+enable_video_shot_detection: true
+shot_detection_threshold: 30.0
+min_shot_length_frames: 15
+keyframes_per_shot: 1
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+# Logs are written to ~/Library/Logs/MediaSearchAgent/.
+log_level: "INFO"
+
+# ── Server ────────────────────────────────────────────────────────────────────
+server:
+  qdrant_recreate_collections_on_export: false
+
+# ── Retrieval ─────────────────────────────────────────────────────────────────
+retrieval:
+  top_k_candidates: 200
+  top_k_return: 50
+  search_score_trace: false
+
+# ── API ───────────────────────────────────────────────────────────────────────
+# The UI is served at http://localhost:8000. Change the port here if 8000
+# conflicts with another service on your machine.
+api:
+  host: "127.0.0.1"
+  port: 8000

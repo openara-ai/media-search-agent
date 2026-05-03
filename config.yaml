@@ -1,0 +1,124 @@
+# Media Search Agent — Development Configuration
+# This repo-root config is for local development only.
+#
+# It uses the Linux/WSL2-style layout and keeps the dev-friendly overrides used
+# in this checkout, such as the API port on 8500 and score tracing enabled.
+# End-user installers do not ship this file; they use the platform templates in
+# installer/macos/config.macos.yaml.template and
+# installer/windows-native/config.windows.yaml.template.
+
+# ── Media sources ─────────────────────────────────────────────────────────────
+# Add one entry per folder you want indexed. Use Linux/WSL2 paths here.
+# read_only: true prevents the indexer from modifying your originals
+# (recommended).
+media_sources: []
+# Examples:
+#   - name: "Photos"
+#     path: "/mnt/d/Photos"
+#     read_only: true
+#   - name: "External Drive"
+#     path: "/mnt/e/Archive"
+#     read_only: true
+
+# ── CLIP model ────────────────────────────────────────────────────────────────
+# ViT-L-14 gives the best search quality. ViT-B-32 is faster on older hardware.
+model_name: "ViT-L-14"
+pretrained: "openai"
+model_version: "clip-2025-10"
+
+# ── Compute ───────────────────────────────────────────────────────────────────
+# "auto" selects CUDA (if available) or CPU automatically.
+device: "auto"
+batch_size: 32
+num_workers: 4
+
+# ── Object detection ──────────────────────────────────────────────────────────
+# enable_object_detection: auto   → enabled when GPU present (cuda/mps), skipped on CPU
+#                          true   → always enabled (power-user CPU opt-in; indexing will be slow)
+#                          false  → always disabled
+# object_detector_backend: rtdetr (default, Apache-2.0)
+# object_model: HuggingFace model ID
+#   rtdetr variants:  PekingU/rtdetr_r18vd (default, 81 MB)
+#                     PekingU/rtdetr_r34vd (126 MB, higher quality)
+#                     PekingU/rtdetr_r50vd (172 MB, highest quality)
+enable_object_detection: auto
+object_detector_backend: "rtdetr"
+object_model: "PekingU/rtdetr_r18vd"
+object_confidence_threshold: 0.35
+enable_video_object_detection: true
+video_detection_max_frames: 10
+
+# ── Face recognition ─────────────────────────────────────────────────────────
+# face_recognizer_backend: facenet_pytorch  (default, MIT — MTCNN + InceptionResnetV1 VGGFace2)
+#                          insightface      (opt-in; requires separate install;
+#                                            NON-COMMERCIAL weights — see NOTICE)
+# face_model: vggface2 for facenet_pytorch backend; buffalo_l/buffalo_s for insightface.
+# face_confidence_threshold: 0.80 eliminates false positives on non-face objects
+#   at the facenet_pytorch default (spike-validated; insightface default was 0.70).
+enable_face_recognition: true
+face_recognizer_backend: "facenet_pytorch"
+face_model: "vggface2"
+face_confidence_threshold: 0.80
+face_min_size: 20
+face_store_metadata: true
+
+# ── Face clustering ───────────────────────────────────────────────────────────
+face_clustering_enabled: false
+face_cluster_min_size: 3
+face_cluster_similarity: 0.6
+
+# ── Video shot detection ──────────────────────────────────────────────────────
+enable_video_shot_detection: true
+shot_detection_threshold: 30.0
+min_shot_length_frames: 15
+keyframes_per_shot: 1
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+# In dev mode, relative paths are resolved from the repo root.
+log_level: "INFO"
+log_dir: "logs"
+
+# ── Local storage paths (dev-only) ────────────────────────────────────────────
+# These relative paths keep generated state inside the repo checkout during
+# local development.
+index_dir: "index"
+sqlite_path: "index/media.sqlite"
+faiss_path: "index/image_vec.faiss"
+qdrant_path: "qdrant"
+thumb_dir: "data/thumbnails"
+face_thumb_dir: "data/face_thumbnails"
+models_dir: "models"
+
+# ── Approximate nearest neighbor tuning ───────────────────────────────────────
+ann_method: "ivfflat"
+ann_lists: 100
+
+# ── Server ────────────────────────────────────────────────────────────────────
+server:
+  qdrant_recreate_collections_on_export: false
+
+# ── Retrieval ─────────────────────────────────────────────────────────────────
+# Dev config keeps score tracing enabled for easier debugging.
+retrieval:
+  top_k_candidates: 200
+  top_k_return: 50
+  search_score_trace: true
+
+# ── Qdrant collections ────────────────────────────────────────────────────────
+collections:
+  asr: "asr_emb"
+  caption: "caption_emb"
+  face: "face_emb"
+  image: "image_emb"
+  video: "video_emb"
+
+# ── API ───────────────────────────────────────────────────────────────────────
+# Dev runs use port 8500 so the API can coexist with the packaged app defaults.
+api:
+  host: "127.0.0.1"
+  port: 8500
+
+# ── UI ────────────────────────────────────────────────────────────────────────
+# The dev UI points at the dev API port above.
+ui:
+  api_url: "http://localhost:8500"

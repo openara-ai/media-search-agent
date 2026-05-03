@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Pre-push hook for media-search-agent
+# Blocks pushes directly to main.
+#
+# Install: cp scripts/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+# The installer (setup.sh / wsl-bootstrap.sh) installs this automatically.
+
+set -euo pipefail
+
+red()  { printf '\033[0;31m%s\033[0m\n' "$*"; }
+green(){ printf '\033[0;32m%s\033[0m\n' "$*"; }
+
+REMOTE="$1"      # e.g. origin
+# $2 is the remote URL — not needed here
+
+# Read the refs being pushed from stdin: <local-ref> <local-sha> <remote-ref> <remote-sha>
+while read -r local_ref local_sha remote_ref remote_sha; do
+  if [[ "$remote_ref" == "refs/heads/main" ]]; then
+    red ""
+    red "  Direct push to main is not allowed."
+    red ""
+    red "  You are on:  $local_ref"
+    red "  Pushing to:  $REMOTE/$remote_ref"
+    red ""
+    red "  Open a PR instead:"
+    red "    git push -u origin <your-branch>"
+    red "    gh pr create"
+    red ""
+    red "  To bypass in a genuine emergency: git push --no-verify"
+    red ""
+    exit 1
+  fi
+done
+
+green "  ✓ Push target is not main. Proceeding."
+exit 0

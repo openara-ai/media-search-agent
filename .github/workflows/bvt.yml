@@ -1,0 +1,278 @@
+name: BVT
+
+# Tests real media fixtures against both dev environment tools and bundled
+# installer tools. The bundle jobs are the safety net for tool version drift —
+# they confirm that the pinned versions in versions.env actually work end-to-end.
+#
+# Triggers:
+#   workflow_dispatch — manual run; include_slow_checks opt-in
+#   workflow_call     — release gate (always runs bundle jobs, never slow checks)
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_slow_checks:
+        description: "Run slow model-backed real-media checks (dev-tools job only)"
+        required: false
+        default: true
+        type: boolean
+  workflow_call:
+
+jobs:
+  # ── React UI (built once, shared across all bundle jobs) ─────────────────────
+  build-ui:
+    name: Build React UI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: src/msa_apps/ui/package-lock.json
+
+      - run: npm ci --prefix src/msa_apps/ui
+      - run: npm run build --prefix src/msa_apps/ui
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: src/msa_apps/ui/dist
+          if-no-files-found: error
+          retention-days: 1
+  # ── Dev environment harness ───────────────────────────────────────────────────
+  # Full integration: API + indexer + browser via run-local.sh.
+  # Only meaningful when triggered manually (requires model downloads).
+  # Not part of the release gate.
+  dev-tools:
+    name: Dev Tools — BVT (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    if: github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get clean
+          df -h
+
+      - name: Cache local model artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            models/clip
+            models/facenet_pytorch
+            models/rtdetr
+          key: ${{ runner.os }}-real-data-models-v3
+
+      # BVT installs the dev environment exactly the way a developer would
+      # (`bash scripts/dev-setup.sh`), via the same uv-based path the bundle
+      # installer uses. The --bvt flag narrows scope: tools + Python env +
+      # `pip install -e .` + pytest. Skips Node.js, UI build, git hooks.
+      # See scripts/dev-setup.sh for the canonical install logic.
+      - name: Install dev environment (--bvt)
+        run: bash scripts/dev-setup.sh --bvt
+
+      - name: Preload model artifacts into repo-local cache
+        run: |
+          source .venv/bin/activate
+          export PYTHONPATH="$PWD/src"
+          python - <<'PY'
+          from pathlib import Path
+          from msa_indexer.models.embeddings import ClipEmbedder
+          from msa_indexer.models.faces import FaceRecognizer
+          from msa_indexer.models.objects import ObjectDetector
+          model_root = Path("models")
+          ClipEmbedder("ViT-L-14", "openai", "cpu", cache_dir=model_root)
+          ObjectDetector(model_name="PekingU/rtdetr_r18vd", backend="rtdetr", device="cpu", model_dir=model_root)
+          FaceRecognizer(backend="facenet_pytorch", model_name="vggface2", device="cpu", model_root=model_root)
+          print("Model artifacts ready in", model_root.resolve())
+          PY
+
+      - name: Run real-data harness
+        run: |
+          if [[ "${{ github.event.inputs.include_slow_checks }}" == "true" ]]; then
+            bash tests/real_media/run-local.sh --report-dir .artifacts/real-data --keep-workspace never
+          else
+            bash tests/real_media/run-local.sh --skip-slow-model-checks --report-dir .artifacts/real-data --keep-workspace never
+          fi
+
+      - name: Upload real-data artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-data-report
+          path: .artifacts/real-data/**
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ── Linux shell bundle ────────────────────────────────────────────────────────
+  linux-bundle:
+    name: Linux Bundle — BVT
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    needs: build-ui
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download React UI dist
+        uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: src/msa_apps/ui/dist
+
+      - name: Cache bundle model artifacts
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/msa-linux-home/.cache/MediaSearchAgent
+          key: ${{ runner.os }}-bundle-models-v1
+
+      - name: Build Linux bundle
+        run: bash installer/macos/shell/build-bundle.sh --version 0.0.0-ci --platform linux
+
+      - name: Validate Linux bundle install
+        run: |
+          BUNDLE=$(ls dist/shell/MediaSearchAgent-*-linux-x86_64.tar.gz)
+          bash tests/real_media/scripts/validate-installed-bundle-linux.sh "$BUNDLE"
+
+      - name: Upload Linux bundle runtime artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-bundle-runtime-artifacts
+          path: |
+            ${{ runner.temp }}/msa-linux-home/.config/MediaSearchAgent/config.yaml
+            ${{ runner.temp }}/msa-linux-home/.local/share/MediaSearchAgent/logs/**
+            ${{ runner.temp }}/msa-linux-home/.local/share/MediaSearchAgent/index/**
+            ${{ runner.temp }}/msa-real-media-tests/**
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ── macOS shell bundle ────────────────────────────────────────────────────────
+  macos-bundle:
+    name: macOS Bundle — BVT
+    runs-on: macos-14
+    timeout-minutes: 90
+    needs: build-ui
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download React UI dist
+        uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: src/msa_apps/ui/dist
+
+      - name: Cache bundle model artifacts
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/msa-macos-home/Library/Caches/MediaSearchAgent
+          key: ${{ runner.os }}-${{ runner.arch }}-bundle-models-v1
+
+      - name: Build macOS bundle
+        run: bash installer/macos/shell/build-bundle.sh --version 0.0.0-ci --platform macos
+
+      - name: Validate macOS bundle install
+        run: |
+          BUNDLE=$(ls dist/shell/MediaSearchAgent-*-macos-arm64.tar.gz)
+          bash tests/real_media/scripts/validate-installed-bundle-macos.sh "$BUNDLE"
+
+      - name: Upload macOS bundle runtime artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-bundle-runtime-artifacts
+          path: |
+            ${{ runner.temp }}/msa-macos-home/Library/Application Support/MediaSearchAgent/config.yaml
+            ${{ runner.temp }}/msa-macos-home/Library/Logs/MediaSearchAgent/**
+            ${{ runner.temp }}/msa-macos-home/Library/Application Support/MediaSearchAgent/index/**
+            ${{ runner.temp }}/msa-real-media-tests/**
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ── Windows shell bundle ──────────────────────────────────────────────────────
+  # Build and test run on Windows because the tray app publish needs the
+  # Windows-hosted .NET toolchain.
+  # Test runs on Windows (validates bundled exiftool.exe).
+  windows-bundle-build:
+    name: Windows Bundle — Build
+    runs-on: windows-latest
+    timeout-minutes: 30
+    needs: build-ui
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download React UI dist
+        uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: src/msa_apps/ui/dist
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # build-bundle.sh's final step calls `zip`, which isn't on windows-latest
+      # Git Bash by default. See release.yml for the matching step.
+      - name: Install zip (for build-bundle.sh)
+        run: choco install zip --no-progress -y
+        shell: powershell
+
+      - name: Build Windows bundle
+        shell: bash
+        run: bash installer/windows-native/shell/build-bundle.sh --version 0.0.0-ci
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: msa-windows-bundle-ci
+          path: dist/shell/MediaSearchAgent-*-windows-x86_64.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  windows-bundle-test:
+    name: Windows Bundle — BVT
+    runs-on: windows-latest
+    timeout-minutes: 75
+    needs: windows-bundle-build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: msa-windows-bundle-ci
+          path: dist/shell
+
+      - name: Cache bundle model artifacts
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\msa-app\Cache
+          key: ${{ runner.os }}-bundle-models-v1
+
+      - name: Validate Windows bundle install
+        shell: powershell
+        run: |
+          $zip = Get-ChildItem dist/shell/MediaSearchAgent-*-windows-x86_64.zip | Select-Object -First 1
+          & powershell -ExecutionPolicy Bypass -File tests/real_media/scripts/validate-installed-bundle-windows.ps1 -Bundle $zip.FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload Windows bundle runtime artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-bundle-runtime-artifacts
+          path: |
+            ${{ runner.temp }}\msa-data\config.yaml
+            ${{ runner.temp }}\msa-app\logs\**
+            ${{ runner.temp }}\msa-data\index\**
+            ${{ runner.temp }}\msa-real-media-tests\**
+          if-no-files-found: warn
+          retention-days: 7

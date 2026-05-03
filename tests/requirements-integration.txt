@@ -1,0 +1,53 @@
+# Integration test dependencies (CI optimized — uses CPU packages only).
+# Installed by .github/workflows/ci.yml integration job and the equivalent
+# job in release.yml. Like requirements-api.txt, this overlay assumes the
+# strip-and-`--no-deps facenet-pytorch` install pattern; transitive deps
+# of facenet-pytorch (requests, torchvision, tqdm) are listed explicitly.
+
+# core
+numpy
+tqdm
+pyyaml
+ruamel.yaml  # comment-preserving YAML round-trips for config writes
+rich
+loguru
+
+# media I/O
+Pillow
+opencv-python-headless  # Headless version saves space
+pymediainfo
+
+# exif
+exifread
+
+# embeddings & models
+torch==2.*      # CPU build
+torchvision     # required by transformers RTDetrImageProcessor; not pulled transitively
+open_clip_torch
+facenet-pytorch>=2.6.0  # Face recognition (MIT); installed --no-deps after torch
+transformers>=4.42.0  # RT-DETR object detection backend (default, Apache-2.0)
+tokenizers>=0.19.0
+accelerate>=0.27.0
+scenedetect[opencv]
+
+# vector store — faiss is no longer used by the runtime app (see ADR-010);
+# kept here for the porter regression tests and the one-off
+# internal/scripts/port_faiss_to_sqlite.py.
+faiss-cpu
+
+# HEIC support
+pillow-heif
+
+# Web / API / Serving (for integration tests)
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+pydantic-settings
+qdrant-client==1.11.3
+# `requests` is a runtime dep of facenet-pytorch (its inception_resnet_v1
+# imports it at module load); listed because --no-deps suppresses
+# transitive resolution.
+requests
+
+# Testing
+pytest

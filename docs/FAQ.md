@@ -1,0 +1,148 @@
+# FAQ
+
+If your question isn't here, check the [Quick Start](QUICKSTART.md), the
+[Installation guide](INSTALL.md), or open an issue on
+[GitHub](https://github.com/openara-ai/media-search-agent/issues).
+
+## Privacy
+
+**Does any of my data leave my machine?**
+No. All ML inference (CLIP, object detection, faces) runs locally. The app has
+no telemetry and no analytics. The only network calls are the model downloads
+on first run (or on config changes), after which the app works offline.
+
+**Where is my media stored?**
+On disk, exactly where you put it. The app reads from your library; it never
+copies, moves, or modifies files. Indexes and thumbnails live in a separate
+data directory (see [INSTALL.md](INSTALL.md#what-it-installs-and-where)).
+
+**Does it write to my photo library?**
+No. Sources default to read-only. The app refuses to write back to indexed
+folders.
+
+**What about the model downloads?**
+On first run, the app downloads ~1.5 GB of pre-trained model weights from
+the three upstream projects: CLIP from OpenAI's CDN, RT-DETR from Hugging
+Face, and facenet-pytorch from its project GitHub releases. After download
+they live in per-user cache directories and are loaded locally for every 
+search and index operation. No content from your library is ever sent anywhere.
+
+## Hardware
+
+**What hardware do I need?**
+Minimum: 8 GB RAM, ~3 GB free disk. A reasonably modern CPU is enough for
+search; indexing benefits a lot from a GPU.
+
+**Does it work on Intel Macs?**
+Not via the install one-liner — release bundles are Apple Silicon only
+(`macos-arm64`). Intel Macs may still work from source by cloning the repo
+and running `bash scripts/dev-setup.sh`, but ML inference falls back to CPU
+and is slow. Intel Macs are not a supported target.
+
+**Does it work on Linux?**
+Yes — Ubuntu 22.04 and equivalents. Tested on WSL2.
+NVIDIA GPU optional but highly recommended.
+
+## Formats and media
+
+**Which file formats are supported?**
+Images: JPEG, PNG, HEIC, WebP, TIFF. Videos: MP4, MOV, MKV, AVI. RAW formats
+are not currently indexed.
+
+**Does it index video?**
+Yes. The indexer extracts shot-based keyframes and embeds each one. Search
+results that match a video link directly to the matching moment, not just to
+the file. See [features/video.md](features/video.md).
+
+**Does it read EXIF / GPS / timestamps?**
+Yes. EXIF metadata (camera, lens, date taken, GPS coordinates) is parsed and
+made searchable and filterable. GPS is reverse-geocoded for display.
+
+**Can I add multiple folders?**
+Yes. Add as many media sources as you like from the **Indexer** page; they
+all index into one searchable library.
+
+**Can it follow symlinks?**
+Yes — symlinked directories under a media source are walked normally.
+
+## Indexing
+
+**How long does indexing take?**
+It depends. Per file you'll typically see anywhere from a fraction of a
+second to several seconds, driven by:
+
+- **Hardware** — a discrete NVIDIA GPU is fastest, Apple Silicon (MPS) is
+  next, CPU-only is the slowest by a wide margin.
+- **Media size** — 4K and 50 MP photos take longer than phone-sized JPEGs;
+  long videos take longer than short clips because each shot's keyframes
+  go through the full model pipeline.
+- **What's enabled** — object detection, face recognition, and video shot
+  detection each add cost; turning any of them off in `config.yaml` speeds
+  things up.
+
+The indexer is incremental — re-runs only process new or changed files —
+so the long wait only happens once per library.
+
+**Can I search before it finishes?**
+Not yet. **Browse** is available as soon as the indexer starts writing
+files — you'll see new items appear in the grid as they're processed.
+**Search** requires the Qdrant vector index to be built, which currently
+happens at the end of an indexing run, so semantic queries return empty
+results until the indexer completes. Optimization work to stream
+embeddings into Qdrant during indexing — so search comes online
+incrementally rather than at the end — is in progress.
+
+**What happens when I add new photos?**
+Re-run the indexer manually from the **Indexer** page. It only processes
+new and changed files; existing embeddings are preserved. Automatic
+background re-indexing when new media is added is in progress.
+
+**What if I move my media folder?**
+There's no in-place "edit source path" today — remove the old source on
+the **Indexer** page, add the new path, and re-run. Because media items
+are tracked by content hash, files that re-appear under the new path are
+recognized as already-indexed and aren't re-embedded. Note that removing
+a source only updates `config.yaml`; it does not delete the metadata or
+embeddings for files that were under it. Cleanup of orphaned rows is on
+the roadmap.
+
+## Running the app
+
+**How do I update?**
+Re-run the same install one-liner. The installer detects an existing
+install, upgrades it in place, and preserves your config, index, and
+labeled people.
+
+**How do I uninstall?**
+Run `msa uninstall` on macOS/Linux, or use the Windows uninstaller (see
+[INSTALL.md](INSTALL.md#uninstall)). Your media library is never touched. See
+[INSTALL.md](INSTALL.md#uninstall) for the full path list.
+
+**Can I run it on a different port?**
+Yes — change `port:` under `api:` in `config.yaml`. See
+[CONFIGURATION.md](CONFIGURATION.md).
+
+**Can I run it on a NAS or home server and access it from another device?**
+Yes. Stop the running app from the menu-bar / tray icon, then in a shell
+on the server run `msa api start --bind-host 0.0.0.0`. Visit
+`http://<server-ip>:8000` from another device on your LAN. Treat this as
+a trusted-network setup — there's no auth in front of the API.
+
+**Does it run as a background service?**
+Sort of. The installer registers an auto-start hook (launch agent on
+macOS, Task Scheduler on Windows) so the menu-bar / tray app — and the
+API process it manages — relaunches whenever you log in. It is not yet a
+true headless daemon: there's no service that runs without a logged-in
+user session, and `msa api start` invoked manually runs in the foreground
+of its terminal until you stop it.
+
+## Project
+
+**Is this project open source?**
+Yes — MIT-licensed. See [LICENSE](../LICENSE).
+
+**Where do I report bugs / request features?**
+[GitHub Issues](https://github.com/openara-ai/media-search-agent/issues).
+
+**How do I contribute?**
+See the [Contributing section](../README.md#contributing) in the README.
