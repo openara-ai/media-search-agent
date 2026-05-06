@@ -1,0 +1,101 @@
+name: Promote to Public
+
+# Manual fast-forward promotion of staging's main + a tag to the public repo.
+# Pairs with mirror-staging.yml on the private repo (Phase C.3 of the
+# public-mirror plan).
+#
+# This workflow lives on the STAGING repo because it pushes to public using
+# MIRROR_DEPLOY_KEY_PUBLIC, and that secret should only live in one place.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to push alongside main (e.g. v0.2.0). Leave empty to push only main.'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Dry-run only (validate fast-forward, no push).'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  PUBLIC_REMOTE: git@github.com:openara-ai/media-search-agent.git
+
+jobs:
+  promote:
+    name: Fast-forward staging:main -> public:main
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      MIRROR_DEPLOY_KEY_PUBLIC: ${{ secrets.MIRROR_DEPLOY_KEY_PUBLIC }}
+    steps:
+      - name: Verify deploy key secret is configured
+        run: |
+          if [[ -z "$MIRROR_DEPLOY_KEY_PUBLIC" ]]; then
+            echo "ERROR: MIRROR_DEPLOY_KEY_PUBLIC secret is not configured." >&2
+            exit 1
+          fi
+          echo "Deploy key secret present (length: ${#MIRROR_DEPLOY_KEY_PUBLIC})."
+
+      - name: Checkout staging (full history + tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up SSH for public push
+        run: |
+          SSH_DIR="$RUNNER_TEMP/ssh"
+          mkdir -p "$SSH_DIR" && chmod 700 "$SSH_DIR"
+          KEY_FILE="$SSH_DIR/id_mirror"
+          printf '%s\n' "$MIRROR_DEPLOY_KEY_PUBLIC" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+          echo "GIT_SSH_COMMAND=ssh -i $KEY_FILE -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$SSH_DIR/known_hosts" >> "$GITHUB_ENV"
+
+      - name: Verify tag exists on staging (if specified)
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          if [[ -n "$TAG_INPUT" ]]; then
+            if ! git rev-parse -q --verify "refs/tags/$TAG_INPUT" >/dev/null; then
+              echo "ERROR: tag '$TAG_INPUT' not found on staging." >&2
+              echo "Hint: re-run mirror-staging.yml on the private repo with this tag." >&2
+              exit 1
+            fi
+            echo "Tag '$TAG_INPUT' exists on staging."
+          fi
+
+      - name: Verify fast-forward is possible
+        run: |
+          if git ls-remote --heads "$PUBLIC_REMOTE" main | grep -q main; then
+            git fetch "$PUBLIC_REMOTE" main
+            if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+              echo "Fast-forward valid: public:main is an ancestor of staging:main."
+            else
+              echo "ERROR: staging:main is NOT a descendant of public:main." >&2
+              echo "Promotion would require force-push; aborting." >&2
+              exit 1
+            fi
+          else
+            echo "public:main does not exist yet — first push."
+          fi
+
+      - name: Push main (and tag) to public
+        env:
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+          TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          if [[ "$DRY_RUN_INPUT" == "true" ]]; then
+            echo "DRY RUN — skipping push."
+            exit 0
+          fi
+          git push "$PUBLIC_REMOTE" main
+          if [[ -n "$TAG_INPUT" ]]; then
+            git push "$PUBLIC_REMOTE" "$TAG_INPUT"
+          fi
+          echo "Promotion complete: staging -> public (main${TAG_INPUT:+ + $TAG_INPUT})."
