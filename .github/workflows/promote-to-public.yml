@@ -2,10 +2,19 @@ name: Promote to Public
 
 # Manual fast-forward promotion of staging's main + a tag to the public repo.
 # Pairs with mirror-staging.yml on the private repo (Phase C.3 of the
-# public-mirror plan).
+# public-mirror plan). See internal/docs/runbooks/PUBLIC_MIRROR_PLAN.md.
 #
-# This workflow lives on the STAGING repo because it pushes to public using
-# MIRROR_DEPLOY_KEY_PUBLIC, and that secret should only live in one place.
+# This workflow is intentionally checked into the PRIVATE repo even though
+# it can only execute on the staging repo:
+#   - Single source of truth: every workflow file lives here.
+#   - Survives mirror runs: copied to staging like any other public file.
+#   - Reviewed via normal PR flow on the private repo.
+#
+# The repository-level `if:` guard below ensures the job only runs when the
+# workflow lives on the staging repo. On private and public, every dispatch
+# is skipped immediately. (Even without the guard, public would fail at
+# the deploy-key step because the secret doesn't exist there — the guard
+# just makes the intent explicit.)
 
 on:
   workflow_dispatch:
@@ -28,6 +37,8 @@ env:
 
 jobs:
   promote:
+    # Only execute on the staging repo. Skipped (no-op) on private and public.
+    if: github.repository == 'openara-ai/media-search-agent-public-staging'
     name: Fast-forward staging:main -> public:main
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -36,20 +47,27 @@ jobs:
     steps:
       - name: Verify deploy key secret is configured
         run: |
+          set -euo pipefail
           if [[ -z "$MIRROR_DEPLOY_KEY_PUBLIC" ]]; then
             echo "ERROR: MIRROR_DEPLOY_KEY_PUBLIC secret is not configured." >&2
             exit 1
           fi
           echo "Deploy key secret present (length: ${#MIRROR_DEPLOY_KEY_PUBLIC})."
 
-      - name: Checkout staging (full history + tags)
+      - name: Checkout staging main (full history + tags)
+        # Pin to main regardless of the ref the workflow was dispatched from.
+        # Without this, an operator dispatching from a non-main ref would
+        # validate that ref and then push a different ref than the one
+        # validated (or fail with "src refspec main does not match any").
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
           fetch-tags: true
 
       - name: Set up SSH for public push
         run: |
+          set -euo pipefail
           SSH_DIR="$RUNNER_TEMP/ssh"
           mkdir -p "$SSH_DIR" && chmod 700 "$SSH_DIR"
           KEY_FILE="$SSH_DIR/id_mirror"
@@ -57,22 +75,43 @@ jobs:
           chmod 600 "$KEY_FILE"
           echo "GIT_SSH_COMMAND=ssh -i $KEY_FILE -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$SSH_DIR/known_hosts" >> "$GITHUB_ENV"
 
-      - name: Verify tag exists on staging (if specified)
+      - name: Verify tag exists on staging and points at HEAD (if specified)
         env:
           TAG_INPUT: ${{ inputs.tag }}
         run: |
+          set -euo pipefail
           if [[ -n "$TAG_INPUT" ]]; then
             if ! git rev-parse -q --verify "refs/tags/$TAG_INPUT" >/dev/null; then
               echo "ERROR: tag '$TAG_INPUT' not found on staging." >&2
               echo "Hint: re-run mirror-staging.yml on the private repo with this tag." >&2
               exit 1
             fi
-            echo "Tag '$TAG_INPUT' exists on staging."
+            # Tag must point at the same commit we're promoting. Without this,
+            # a stale or typo'd tag could publish public:main at one commit
+            # while vX.Y.Z points at a different commit — release notes would
+            # disagree with release artifacts.
+            TAG_COMMIT=$(git rev-parse "${TAG_INPUT}^{commit}")
+            HEAD_COMMIT=$(git rev-parse HEAD)
+            if [[ "$TAG_COMMIT" != "$HEAD_COMMIT" ]]; then
+              echo "ERROR: tag '$TAG_INPUT' points at $TAG_COMMIT but staging:main HEAD is $HEAD_COMMIT." >&2
+              echo "Refusing to publish a tag that does not match the commit being promoted." >&2
+              exit 1
+            fi
+            echo "Tag '$TAG_INPUT' exists on staging and points at HEAD ($HEAD_COMMIT)."
           fi
 
       - name: Verify fast-forward is possible
         run: |
-          if git ls-remote --heads "$PUBLIC_REMOTE" main | grep -q main; then
+          set -euo pipefail
+          # Capture ls-remote exit status explicitly. Without this, an
+          # auth/network/repo failure would silently look like "public:main
+          # does not exist" because the broken pipe yields no output and
+          # grep returns 1 — especially misleading for dry-runs.
+          if ! LS_REMOTE_OUTPUT=$(git ls-remote --heads "$PUBLIC_REMOTE" main); then
+            echo "ERROR: ls-remote on $PUBLIC_REMOTE failed (auth, network, or repo issue)." >&2
+            exit 1
+          fi
+          if [[ -n "$LS_REMOTE_OUTPUT" ]]; then
             git fetch "$PUBLIC_REMOTE" main
             if git merge-base --is-ancestor FETCH_HEAD HEAD; then
               echo "Fast-forward valid: public:main is an ancestor of staging:main."
@@ -90,12 +129,16 @@ jobs:
           DRY_RUN_INPUT: ${{ inputs.dry_run }}
           TAG_INPUT: ${{ inputs.tag }}
         run: |
+          set -euo pipefail
           if [[ "$DRY_RUN_INPUT" == "true" ]]; then
             echo "DRY RUN — skipping push."
             exit 0
           fi
-          git push "$PUBLIC_REMOTE" main
+          # Explicit refspecs: ensures we push the validated HEAD to
+          # refs/heads/main (not whatever local 'main' might resolve to)
+          # and that the tag push is unambiguous if a branch shares its name.
+          git push "$PUBLIC_REMOTE" HEAD:refs/heads/main
           if [[ -n "$TAG_INPUT" ]]; then
-            git push "$PUBLIC_REMOTE" "$TAG_INPUT"
+            git push "$PUBLIC_REMOTE" "refs/tags/${TAG_INPUT}:refs/tags/${TAG_INPUT}"
           fi
           echo "Promotion complete: staging -> public (main${TAG_INPUT:+ + $TAG_INPUT})."
