@@ -144,7 +144,7 @@ $StartMenuDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Me
 $ConfigPath = "$DataDir\config.yaml"
 
 $PythonVersion = "3.12"
-$GithubRepo    = "kumraj/media-search-agent"
+$GithubRepo    = "openara-ai/media-search-agent"
 
 # PyTorch CUDA index - cu128 wheels build for Blackwell sm_120 (RTX 5000) and
 # remain compatible with Ampere/Ada. Installing torch from this index *before*

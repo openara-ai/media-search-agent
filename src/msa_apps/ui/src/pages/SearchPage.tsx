@@ -111,7 +111,6 @@ export function SearchPage() {
                     type={item.type}
                     date={item.date}
                     place={item.place}
-                    score={item.score}
                     onClick={() => setSelected(item)}
                   />
                 ))}

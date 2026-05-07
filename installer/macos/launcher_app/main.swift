@@ -306,12 +306,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let cmdFile = URL(fileURLWithPath: NSTemporaryDirectory() + "msa-cli.command")
         let venvBin = paths.venvBin.replacingOccurrences(of: "\"", with: "\\\"")
         let config  = paths.configPath.replacingOccurrences(of: "\"", with: "\\\"")
-        let root    = paths.msaRoot.replacingOccurrences(of: "\"", with: "\\\"")
+        let dataDir = paths.dataDir.replacingOccurrences(of: "\"", with: "\\\"")
+        try? FileManager.default.createDirectory(
+            atPath: paths.dataDir, withIntermediateDirectories: true, attributes: nil)
         let script = """
             #!/bin/bash
             export PATH="\(venvBin):$PATH"
             export MSA_CONFIG_PATH="\(config)"
-            cd "\(root)" 2>/dev/null || true
+            cd "\(dataDir)" 2>/dev/null || true
             clear
             echo '── Media Search Agent CLI ──────────────────────'
             echo '  msa index run                — index your media'

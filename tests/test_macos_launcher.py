@@ -90,6 +90,22 @@ def test_start_sh_validates_uvicorn_ownership_before_stopping_processes():
     assert "xargs kill -9" not in text
 
 
+def test_swift_launcher_cli_opens_in_user_data_folder():
+    """The 'Open CLI' menu must drop the shell into the user data folder
+    (where config.yaml lives), not the .app bundle's Resources directory
+    (which contains bin/, scripts/, src/)."""
+    text = _read(SWIFT_LAUNCHER)
+
+    # launchCLI() builds a .command script that cd's into the user data folder.
+    assert 'let dataDir = paths.dataDir' in text
+    assert 'cd "\\(dataDir)"' in text
+    # The data folder is created if missing so cd cannot fail.
+    assert 'createDirectory(' in text
+    assert 'atPath: paths.dataDir' in text
+    # Regression guard: the old buggy cd-into-msaRoot must not return.
+    assert 'cd "\\(root)"' not in text
+
+
 def test_macos_shell_installer_unloads_launch_agent_by_label():
     text = _read(MACOS_SHELL_INSTALL)
 

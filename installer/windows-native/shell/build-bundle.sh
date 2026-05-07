@@ -162,9 +162,11 @@ EXIFTOOL_FILES_DIR="$EXIFTOOL_SRC_DIR/exiftool_files"
 [[ -d "$EXIFTOOL_FILES_DIR" ]] || { echo "ERROR: exiftool_files/ not found alongside the exe — archive layout may have changed"; exit 1; }
 cp "$EXIFTOOL_EXE" "$BIN_DIR/exiftool.exe"
 cp -r "$EXIFTOOL_FILES_DIR" "$BIN_DIR/exiftool_files"
-# ExifTool zip encodes Windows read-only attributes; macOS unzip honours them.
-# chmod before rm to avoid Permission denied on the extracted exiftool_files/ tree.
+# ExifTool zip encodes Windows read-only attributes; macOS unzip honours them
+# and macOS cp -r preserves directory mode bits. Make both the source tmp and
+# the bundle copy writable so the final cleanup rm at step 5 doesn't fail.
 chmod -R u+w "$TMP"
+chmod -R u+w "$BIN_DIR/exiftool_files"
 
 rm -rf "$TMP"
 

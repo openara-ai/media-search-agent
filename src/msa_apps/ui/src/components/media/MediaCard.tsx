@@ -10,7 +10,6 @@ interface MediaCardProps {
   type?: 'image' | 'video' | null
   date?: string | null
   place?: string | null
-  score?: number | null
   duration?: number | null
   faces?: FaceOnMedia[]
   onClick: () => void
@@ -31,9 +30,8 @@ function formatDate(iso: string | null | undefined): string {
   }
 }
 
-export function MediaCard({ id, path: _path, type, date, place, score, duration, faces, onClick }: MediaCardProps) {
+export function MediaCard({ id, path: _path, type, date, place, duration, faces, onClick }: MediaCardProps) {
   const thumb = thumbnailUrl(id)
-  const scorePct = score != null ? Math.min(100, Math.max(0, Math.round(score * 100))) : null
   return (
     <button
       onClick={onClick}
@@ -58,12 +56,6 @@ export function MediaCard({ id, path: _path, type, date, place, score, duration,
           <div className="absolute top-1.5 left-1.5 flex items-center gap-1 bg-black/70 rounded px-1.5 py-0.5 text-xs text-white">
             <Film size={10} />
             {duration != null ? formatDuration(duration) : 'video'}
-          </div>
-        )}
-        {/* Score badge */}
-        {scorePct != null && (
-          <div className="absolute top-1.5 right-1.5 bg-indigo-600/80 rounded px-1.5 py-0.5 text-xs text-white font-mono">
-            {scorePct}%
           </div>
         )}
       </div>

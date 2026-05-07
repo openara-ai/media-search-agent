@@ -44,8 +44,8 @@ class IndexerConfig:
     enable_face_recognition: bool = False
     face_recognizer_backend: str = "facenet_pytorch"
     face_model: str = "vggface2"
-    face_confidence_threshold: float = 0.80
-    face_min_size: int = 20
+    face_confidence_threshold: float = 0.95
+    face_min_size: int = 60
     face_store_metadata: bool = True
     face_clustering_enabled: bool = False
     face_cluster_min_size: int = 3
@@ -124,8 +124,8 @@ class Config:
     enable_face_recognition: bool = False
     face_recognizer_backend: str = "facenet_pytorch"
     face_model: str = "vggface2"
-    face_confidence_threshold: float = 0.80
-    face_min_size: int = 20
+    face_confidence_threshold: float = 0.95
+    face_min_size: int = 60
     face_store_metadata: bool = True
     face_clustering_enabled: bool = False
     face_cluster_min_size: int = 3

@@ -2,7 +2,7 @@
 # This file is copied to your data folder on first install.
 # Edit it to add your media folders, then run the indexer from the Start Menu.
 #
-# Full configuration reference: https://github.com/kumraj/media-search-agent/docs/ARCHITECTURE.md
+# Full configuration reference: https://github.com/openara-ai/media-search-agent/blob/main/docs/ARCHITECTURE.md
 #
 # Data directories (index, thumbnails, Qdrant) are resolved automatically to
 # %USERPROFILE%\MediaSearchAgent\. Override with MSA_DATA_DIR if needed.
@@ -53,8 +53,8 @@ video_detection_max_frames: 10
 enable_face_recognition: true
 face_recognizer_backend: "facenet_pytorch"
 face_model: "vggface2"
-face_confidence_threshold: 0.80
-face_min_size: 20
+face_confidence_threshold: 0.95
+face_min_size: 60
 face_store_metadata: true
 
 # ── Video shot detection ──────────────────────────────────────────────────────

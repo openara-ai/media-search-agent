@@ -32,28 +32,6 @@ describe('MediaCard', () => {
     })
   })
 
-  describe('score badge', () => {
-    it('shows score badge when score is provided', () => {
-      render(<MediaCard {...baseProps} score={0.73} />)
-      expect(screen.getByText('73%')).toBeInTheDocument()
-    })
-
-    it('rounds score to nearest integer', () => {
-      render(<MediaCard {...baseProps} score={0.856} />)
-      expect(screen.getByText('86%')).toBeInTheDocument()
-    })
-
-    it('does not show score badge when score is null', () => {
-      render(<MediaCard {...baseProps} score={null} />)
-      expect(screen.queryByText(/%/)).toBeNull()
-    })
-
-    it('does not show score badge when score is undefined', () => {
-      render(<MediaCard {...baseProps} />)
-      expect(screen.queryByText(/%/)).toBeNull()
-    })
-  })
-
   describe('video badge', () => {
     it('shows video badge for video type', () => {
       render(<MediaCard {...baseProps} type="video" />)

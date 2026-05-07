@@ -123,6 +123,7 @@ export interface ModelConfigEditable {
   object_model: string
   object_confidence_threshold: number
   enable_face_recognition: boolean
+  face_recognizer_backend: string
   face_model: string
   face_confidence_threshold: number
   face_min_size: number

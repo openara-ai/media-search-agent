@@ -6,7 +6,7 @@
 
 A **local-first semantic search engine** for your personal photo and video library.
 Search by natural language, browse by face, label people — all on your own machine.
-No cloud. No subscription. No data leaves your device.
+No cloud. No subscription.
 
 ## Demo
 
@@ -98,9 +98,7 @@ see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Status
 
-Pre-1.0, experimental, largely vibe-coded with AI assistance. Use at your
-own risk — not intended for production; keep your originals backed up.
-Tested and usable today on macOS, Windows and Linux.
+MediaSearchAgent is pre-1.0, experimental software developed through human-led, AI-assisted agentic coding. Use at your own risk. Keep your original media backed up. It is tested and usable today on macOS, Windows, and Linux, but not intended for production use.
 
 ## Contributing
 

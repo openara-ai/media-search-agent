@@ -308,9 +308,11 @@ internal sealed class TrayApp : ApplicationContext
     {
         string binDir = Path.Combine(_paths.AppDir, "bin");
         string path   = Environment.GetEnvironmentVariable("PATH") ?? "";
+        Directory.CreateDirectory(_paths.DataDir);
         var psi = new ProcessStartInfo("cmd.exe")
         {
             UseShellExecute = false,
+            WorkingDirectory = _paths.DataDir,
         };
         psi.EnvironmentVariables["PATH"]             = $"{binDir};{path}";
         psi.EnvironmentVariables["MSA_DATA_DIR"]     = _paths.DataDir;

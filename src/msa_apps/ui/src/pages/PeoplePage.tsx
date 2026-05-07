@@ -257,7 +257,7 @@ function SimilarFacesView({
   onBack: () => void
 }) {
   const qc = useQueryClient()
-  const [threshold, setThreshold] = useState(0.40)
+  const [threshold, setThreshold] = useState(0.65)
   const [thumbSize, setThumbSize] = useState<ThumbSize>('md')
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [knownCollapsed, setKnownCollapsed] = useState(false)

@@ -94,7 +94,7 @@ export function LaunchBanner({ visible, onDismiss }: LaunchBannerProps) {
               </p>
               <div className="mt-10 h-4" aria-hidden="true" />
               <p className="mt-6 max-w-2xl text-sm leading-8 text-slate-600 dark:text-sky-100/75">
-                No cloud. No subscription. No data leaves your device.
+                No cloud. No subscription.
               </p>
 
               <button

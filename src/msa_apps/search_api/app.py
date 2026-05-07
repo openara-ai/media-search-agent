@@ -1991,8 +1991,8 @@ _MODEL_CONFIG_DEFAULTS: dict = {
     "enable_face_recognition": True,
     "face_recognizer_backend": "facenet_pytorch",
     "face_model": "vggface2",
-    "face_confidence_threshold": 0.80,
-    "face_min_size": 20,
+    "face_confidence_threshold": 0.95,
+    "face_min_size": 60,
     "face_store_metadata": True,
 }
 

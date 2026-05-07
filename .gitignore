@@ -94,3 +94,4 @@ run/
 msa-api.lock
 .codex/
 .artifacts/
+/.claude/settings.json

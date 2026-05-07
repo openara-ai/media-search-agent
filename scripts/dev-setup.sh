@@ -14,7 +14,7 @@
 #                                    # Used only by .github/workflows/bvt.yml.
 #
 # 2-step developer setup:
-#   git clone https://github.com/kumraj/media-search-agent
+#   git clone https://github.com/openara-ai/media-search-agent
 #   bash scripts/dev-setup.sh
 
 set -euo pipefail

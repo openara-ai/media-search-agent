@@ -230,7 +230,7 @@ describe('IndexerPage', () => {
       renderPage()
       await waitFor(() => expect(screen.getByText('photos')).toBeTruthy())
 
-      await userEvent.click(screen.getByText(/add or change sources/i))
+      await userEvent.click(screen.getByText(/^add source$/i))
       await waitFor(() => expect(screen.getByPlaceholderText(/e\.g\. \/home\/user\/photos/i)).toBeTruthy())
       await userEvent.click(screen.getByTitle('Browse folders'))
 

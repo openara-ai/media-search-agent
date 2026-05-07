@@ -52,14 +52,16 @@ video_detection_max_frames: 10
 # face_recognizer_backend: facenet_pytorch  (default, MIT — MTCNN + InceptionResnetV1 VGGFace2)
 #                          insightface      (opt-in; requires separate install;
 #                                            NON-COMMERCIAL weights — see NOTICE)
-# face_model: vggface2 for facenet_pytorch backend; buffalo_l/buffalo_s for insightface.
-# face_confidence_threshold: 0.80 eliminates false positives on non-face objects
-#   at the facenet_pytorch default (spike-validated; insightface default was 0.70).
+# face_model: vggface2 for facenet_pytorch backend; buffalo_s/buffalo_l/antelopev2 for insightface.
+# face_confidence_threshold: 0.95 + face_min_size: 60 keep MTCNN false positives
+#   on patterned textures (foliage, fabric) and tiny crops in check for the
+#   facenet_pytorch backend. Empirically ~5% residual noise on a real library;
+#   loosening either knob produces dramatically more non-face detections.
 enable_face_recognition: true
 face_recognizer_backend: "facenet_pytorch"
 face_model: "vggface2"
-face_confidence_threshold: 0.80
-face_min_size: 20
+face_confidence_threshold: 0.95
+face_min_size: 60
 face_store_metadata: true
 
 # ── Face clustering ───────────────────────────────────────────────────────────

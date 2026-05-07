@@ -91,6 +91,10 @@ function ModelConfigSection() {
   const d = mc.defaults
   const r = mc.readonly
 
+  const faceModelOptions: string[] = e.face_recognizer_backend === 'insightface'
+    ? ['buffalo_s', 'buffalo_l', 'antelopev2']
+    : ['vggface2']
+
   return (
     <div className="bg-slate-100 dark:bg-zinc-800 rounded-lg overflow-hidden">
       <div className="px-4 py-3 border-b border-slate-200 dark:border-zinc-700 flex items-center justify-between gap-3">
@@ -207,14 +211,17 @@ function ModelConfigSection() {
               <div className="flex items-center gap-3">
                 <span className={`${labelCls} w-24 shrink-0`}>Model</span>
                 <select
-                  disabled={!editMode}
+                  disabled={!editMode || (faceModelOptions.length === 1 && faceModelOptions[0] === e.face_model)}
                   className={`${inputCls} w-36`}
                   value={e.face_model}
                   onChange={ev => save({ face_model: ev.target.value })}
                 >
-                  {['buffalo_s','buffalo_l','antelopev2'].map(m => (
+                  {faceModelOptions.map(m => (
                     <option key={m} value={m}>{m}</option>
                   ))}
+                  {!faceModelOptions.includes(e.face_model) && (
+                    <option key={e.face_model} value={e.face_model}>{e.face_model}</option>
+                  )}
                 </select>
                 <span className={`${labelCls}`}>default: {d.face_model}</span>
                 {editMode && e.face_model !== d.face_model && <ResetButton onClick={() => reset('face_model')} />}

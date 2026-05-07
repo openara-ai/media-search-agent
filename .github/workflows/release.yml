@@ -297,7 +297,11 @@ jobs:
           name: "v${{ steps.version.outputs.version }}"
           tag_name: ${{ github.ref_name }}
           draft: false
-          prerelease: true
+          # Tag with a hyphen (vX.Y.Z-rc1, -beta, etc.) is treated as
+          # prerelease; plain semver (vX.Y.Z) is a normal release. Without
+          # this, /releases/latest/ would never resolve to the only release
+          # we have.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
             ## Media Search Agent v${{ steps.version.outputs.version }}
 
@@ -309,12 +313,12 @@ jobs:
 
             **macOS / Linux**
             ```bash
-            curl -fsSL https://github.com/kumraj/media-search-agent/releases/latest/download/install.sh | bash
+            curl -fsSL https://github.com/openara-ai/media-search-agent/releases/download/${{ github.ref_name }}/install.sh | bash
             ```
 
             **Windows (PowerShell 5.1+)**
             ```powershell
-            powershell -c "irm https://github.com/kumraj/media-search-agent/releases/latest/download/install.ps1 | iex"
+            powershell -c "[Net.ServicePointManager]::SecurityProtocol = 'Tls12'; irm https://github.com/openara-ai/media-search-agent/releases/download/${{ github.ref_name }}/install.ps1 | iex"
             ```
 
             The installer downloads the matching shell bundle for your platform from this release, sets up a Python environment under your user account (no admin / UAC required), and starts the service on <http://localhost:8000>.

@@ -363,8 +363,8 @@ def run_index(config, stop_event=None):
         try:
             from .models.faces import FaceRecognizer
             face_model = getattr(config, 'face_model', 'vggface2')
-            face_conf = getattr(config, 'face_confidence_threshold', 0.80)
-            face_min_size = getattr(config, 'face_min_size', 20)
+            face_conf = getattr(config, 'face_confidence_threshold', 0.95)
+            face_min_size = getattr(config, 'face_min_size', 60)
             face_backend = getattr(config, 'face_recognizer_backend', 'facenet_pytorch')
             face_recognizer = FaceRecognizer(
                 model_name=face_model,

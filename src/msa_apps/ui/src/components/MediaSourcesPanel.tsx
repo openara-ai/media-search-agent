@@ -10,7 +10,6 @@ export function MediaSourcesPanel() {
   const [name, setName] = useState('')
   const [path, setPath] = useState('')
   const [description, setDescription] = useState('')
-  const [readOnly, setReadOnly] = useState(true)
   const [addError, setAddError] = useState<string | null>(null)
   const [pickerOpen, setPickerOpen] = useState(false)
   const [formOpen, setFormOpen] = useState(false)
@@ -67,7 +66,7 @@ export function MediaSourcesPanel() {
       name: name.trim(),
       path: path.trim(),
       description: description.trim(),
-      read_only: readOnly,
+      read_only: true,
     })
   }
 
@@ -95,172 +94,142 @@ export function MediaSourcesPanel() {
 
 
   return (
-    <div className="space-y-4">
-      <div className="bg-slate-100 dark:bg-zinc-800 rounded-lg overflow-hidden">
-        <div className="px-4 py-3 border-b border-slate-200 dark:border-zinc-700">
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <div className="text-sm font-medium text-zinc-700 dark:text-zinc-200">Media Sources</div>
-              <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-                {sources.length === 0
-                  ? 'No media sources configured yet. Add at least one folder before running the indexer.'
-                  : `${sources.length} source${sources.length === 1 ? '' : 's'} configured`}
-              </div>
-            </div>
-            {sources.length > 0 && (
-              <button
-                type="button"
-                onClick={() => setFormOpen(open => !open)}
-                className="text-xs text-indigo-600 dark:text-indigo-400 hover:text-indigo-500 dark:hover:text-indigo-300 transition-colors"
-              >
-                {formOpen ? 'Hide source form' : 'Add or change sources'}
-              </button>
-            )}
+    <div className="bg-slate-100 dark:bg-zinc-800 rounded-lg overflow-hidden">
+      {/* Add Source expander (form-on-top) */}
+      <button
+        type="button"
+        onClick={() => setFormOpen(open => !open)}
+        className="w-full flex items-center justify-between px-4 py-3 text-left"
+        aria-expanded={formOpen}
+      >
+        <div>
+          <div className="text-sm font-medium text-zinc-700 dark:text-zinc-200">
+            {sources.length === 0 ? 'Add Your First Source' : 'Add Source'}
+          </div>
+          <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+            {sources.length === 0
+              ? 'Set up a folder for indexing'
+              : 'Add another folder'}
           </div>
         </div>
-
-        {sources.length === 0 ? (
-          <div className="px-4 py-3 text-sm text-zinc-500 dark:text-zinc-400">
-            Add your first photo or video folder to get started.
-          </div>
+        {formOpen ? (
+          <ChevronUp size={16} className="text-zinc-500 dark:text-zinc-400" />
         ) : (
+          <ChevronDown size={16} className="text-zinc-500 dark:text-zinc-400" />
+        )}
+      </button>
+
+      {formOpen && (
+        <form onSubmit={handleAdd} className="border-t border-slate-200 dark:border-zinc-700 px-4 py-4 space-y-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <input
+              placeholder="Name (e.g. photos)"
+              value={name}
+              onChange={e => setName(e.target.value)}
+              required
+              className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded px-3 py-1.5 text-sm text-zinc-700 dark:text-zinc-200 placeholder-zinc-400 dark:placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+            />
+            <div className="flex gap-1">
+              <input
+                placeholder={isWindows ? 'e.g. D:\\Photos' : 'e.g. /home/user/Photos'}
+                value={path}
+                onChange={e => setPath(e.target.value)}
+                required
+                className="flex-1 min-w-0 bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded px-3 py-1.5 text-sm text-zinc-700 dark:text-zinc-200 placeholder-zinc-400 dark:placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              />
+              <button
+                type="button"
+                onClick={() => void handleBrowseClick()}
+                title="Browse folders"
+                className="shrink-0 flex items-center gap-1 px-2.5 py-1.5 border border-slate-200 dark:border-zinc-700 rounded bg-white dark:bg-zinc-900 text-zinc-500 dark:text-zinc-400 hover:text-indigo-600 dark:hover:text-indigo-400 hover:border-indigo-400 transition-colors text-sm"
+              >
+                <FolderSearch size={14} />
+              </button>
+            </div>
+          </div>
+
+          {pickerOpen && (
+            <DirectoryPicker
+              initialPath={path}
+              onSelect={selected => {
+                setPath(selected)
+                setPickerOpen(false)
+              }}
+              onClose={() => setPickerOpen(false)}
+            />
+          )}
+
+          <input
+            placeholder="Description (optional)"
+            value={description}
+            onChange={e => setDescription(e.target.value)}
+            className="w-full bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded px-3 py-1.5 text-sm text-zinc-700 dark:text-zinc-200 placeholder-zinc-400 dark:placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+          />
+
+          {addError && <div className="text-xs text-red-500 dark:text-red-400">{addError}</div>}
+
+          <button
+            type="submit"
+            disabled={addMutation.isPending || !name.trim() || !path.trim()}
+            className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm rounded-md transition-colors disabled:opacity-50"
+          >
+            <Plus size={14} />
+            Add Source
+          </button>
+        </form>
+      )}
+
+      {/* Source list with sub-header */}
+      {sources.length > 0 && (
+        <div className="border-t border-slate-200 dark:border-zinc-700">
+          <div className="px-4 py-3">
+            <div className="text-sm font-medium text-zinc-700 dark:text-zinc-200">Media Sources</div>
+            <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+              {sources.length} source{sources.length === 1 ? '' : 's'} configured
+            </div>
+          </div>
           <ul className="divide-y divide-slate-200 dark:divide-zinc-700">
             {sources.map(source => (
-              <li key={source.name} className="flex items-center gap-3 px-4 py-3">
-                <FolderOpen size={14} className="text-zinc-400 dark:text-zinc-500 shrink-0" />
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2">
-                    <div className="text-sm font-medium text-zinc-700 dark:text-zinc-200">
-                      {source.name}
-                    </div>
-                    {source.read_only && (
-                      <span className="text-[11px] text-zinc-500 dark:text-zinc-400 bg-slate-200 dark:bg-zinc-700 px-1.5 py-0.5 rounded shrink-0">
-                        Read-only
-                      </span>
-                    )}
-                    {!source.enabled && (
-                      <span className="text-[11px] text-zinc-500 dark:text-zinc-400 bg-slate-200 dark:bg-zinc-700 px-1.5 py-0.5 rounded shrink-0">
-                        Disabled
-                      </span>
-                    )}
+            <li key={source.name} className="flex items-center gap-3 px-4 py-3">
+              <FolderOpen size={14} className="text-zinc-400 dark:text-zinc-500 shrink-0" />
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <div className="text-sm font-medium text-zinc-700 dark:text-zinc-200">
+                    {source.name}
                   </div>
-                  <div className="text-xs text-zinc-400 dark:text-zinc-500 truncate">
-                    {source.display_path ?? source.path}
-                  </div>
-                  {source.description && (
-                    <div className="text-xs text-zinc-400 dark:text-zinc-600">{source.description}</div>
+                  {source.read_only && (
+                    <span className="text-[11px] text-zinc-500 dark:text-zinc-400 bg-slate-200 dark:bg-zinc-700 px-1.5 py-0.5 rounded shrink-0">
+                      Read-only
+                    </span>
+                  )}
+                  {!source.enabled && (
+                    <span className="text-[11px] text-zinc-500 dark:text-zinc-400 bg-slate-200 dark:bg-zinc-700 px-1.5 py-0.5 rounded shrink-0">
+                      Disabled
+                    </span>
                   )}
                 </div>
-                <button
-                  type="button"
-                  onClick={() => deleteMutation.mutate(source.name)}
-                  disabled={deleteMutation.isPending}
-                  aria-label={`Remove source ${source.name}`}
-                  title={`Remove source ${source.name}`}
-                  className="text-zinc-400 dark:text-zinc-500 hover:text-red-500 dark:hover:text-red-400 transition-colors shrink-0 disabled:opacity-50"
-                >
-                  <Trash2 size={14} />
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
-
-      <div className="bg-slate-100 dark:bg-zinc-800 rounded-lg overflow-hidden">
-        <button
-          type="button"
-          onClick={() => setFormOpen(open => !open)}
-          className="w-full flex items-center justify-between px-4 py-3 text-left"
-          aria-expanded={formOpen}
-        >
-          <div>
-            <div className="text-sm font-medium text-zinc-700 dark:text-zinc-200">
-              {sources.length === 0 ? 'Add Your First Source' : 'Add Source'}
-            </div>
-            <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-              {sources.length === 0
-                ? 'Set up a folder for indexing'
-                : 'Add another folder or update your source list'}
-            </div>
-          </div>
-          {formOpen ? (
-            <ChevronUp size={16} className="text-zinc-500 dark:text-zinc-400" />
-          ) : (
-            <ChevronDown size={16} className="text-zinc-500 dark:text-zinc-400" />
-          )}
-        </button>
-
-        {formOpen && (
-          <form onSubmit={handleAdd} className="border-t border-slate-200 dark:border-zinc-700 px-4 py-4 space-y-3">
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-              <input
-                placeholder="Name (e.g. photos)"
-                value={name}
-                onChange={e => setName(e.target.value)}
-                required
-                className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded px-3 py-1.5 text-sm text-zinc-700 dark:text-zinc-200 placeholder-zinc-400 dark:placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-              />
-              <div className="flex gap-1">
-                <input
-                  placeholder={isWindows ? 'e.g. D:\\Photos' : 'e.g. /home/user/Photos'}
-                  value={path}
-                  onChange={e => setPath(e.target.value)}
-                  required
-                  className="flex-1 min-w-0 bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded px-3 py-1.5 text-sm text-zinc-700 dark:text-zinc-200 placeholder-zinc-400 dark:placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                />
-                <button
-                  type="button"
-                  onClick={() => void handleBrowseClick()}
-                  title="Browse folders"
-                  className="shrink-0 flex items-center gap-1 px-2.5 py-1.5 border border-slate-200 dark:border-zinc-700 rounded bg-white dark:bg-zinc-900 text-zinc-500 dark:text-zinc-400 hover:text-indigo-600 dark:hover:text-indigo-400 hover:border-indigo-400 transition-colors text-sm"
-                >
-                  <FolderSearch size={14} />
-                </button>
+                <div className="text-xs text-zinc-400 dark:text-zinc-500 truncate">
+                  {source.display_path ?? source.path}
+                </div>
+                {source.description && (
+                  <div className="text-xs text-zinc-400 dark:text-zinc-600">{source.description}</div>
+                )}
               </div>
-            </div>
-
-            {pickerOpen && (
-              <DirectoryPicker
-                initialPath={path}
-                onSelect={selected => {
-                  setPath(selected)
-                  setPickerOpen(false)
-                }}
-                onClose={() => setPickerOpen(false)}
-              />
-            )}
-
-            <input
-              placeholder="Description (optional)"
-              value={description}
-              onChange={e => setDescription(e.target.value)}
-              className="w-full bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded px-3 py-1.5 text-sm text-zinc-700 dark:text-zinc-200 placeholder-zinc-400 dark:placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-            />
-
-            <label className="flex items-center gap-2 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={readOnly}
-                onChange={e => setReadOnly(e.target.checked)}
-                className="w-3.5 h-3.5 accent-indigo-600"
-              />
-              <span className="text-xs text-zinc-500 dark:text-zinc-400">Read-only (recommended)</span>
-            </label>
-
-            {addError && <div className="text-xs text-red-500 dark:text-red-400">{addError}</div>}
-
-            <button
-              type="submit"
-              disabled={addMutation.isPending || !name.trim() || !path.trim()}
-              className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm rounded-md transition-colors disabled:opacity-50"
-            >
-              <Plus size={14} />
-              Add Source
-            </button>
-          </form>
-        )}
-      </div>
+              <button
+                type="button"
+                onClick={() => deleteMutation.mutate(source.name)}
+                disabled={deleteMutation.isPending}
+                aria-label={`Remove source ${source.name}`}
+                title={`Remove source ${source.name}`}
+                className="text-zinc-400 dark:text-zinc-500 hover:text-red-500 dark:hover:text-red-400 transition-colors shrink-0 disabled:opacity-50"
+              >
+                <Trash2 size={14} />
+              </button>
+            </li>
+          ))}
+          </ul>
+        </div>
+      )}
     </div>
   )
 }

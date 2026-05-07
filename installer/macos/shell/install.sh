@@ -680,11 +680,11 @@ main() {
 
   if [[ "$OS" == "macos" && "$ARCH" == "x86_64" ]]; then
     die "Intel Mac (x86_64) is not yet supported. Only Apple Silicon (arm64) bundles are published.
-       Check https://github.com/${GITHUB_REPO:-kumraj/media-search-agent}/releases for updates."
+       Check https://github.com/${GITHUB_REPO:-openara-ai/media-search-agent}/releases for updates."
   fi
   if [[ "$OS" == "linux" && "$ARCH" == "arm64" ]]; then
     die "Linux arm64 is not yet supported. Only Linux x86_64 bundles are published.
-       Check https://github.com/${GITHUB_REPO:-kumraj/media-search-agent}/releases for updates."
+       Check https://github.com/${GITHUB_REPO:-openara-ai/media-search-agent}/releases for updates."
   fi
 
   # ── Platform paths (ADR-009) ──────────────────────────────────────────────
@@ -716,7 +716,7 @@ main() {
   LAUNCHER_DIR="$HOME/.local/bin"
   LAUNCHER="$LAUNCHER_DIR/msa"
   PYTHON_VERSION="3.12.8"
-  GITHUB_REPO="kumraj/media-search-agent"
+  GITHUB_REPO="openara-ai/media-search-agent"
   BUNDLE_CONFIG_TEMPLATE=""
   INSTALL_LOG_FILE=""
   INSTALL_MODE=""

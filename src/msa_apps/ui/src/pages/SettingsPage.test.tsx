@@ -14,9 +14,10 @@ const modelConfigData = {
     object_model: 'PekingU/rtdetr_r18vd',
     object_confidence_threshold: 0.35,
     enable_face_recognition: true,
-    face_model: 'buffalo_l',
-    face_confidence_threshold: 0.7,
-    face_min_size: 20,
+    face_recognizer_backend: 'facenet_pytorch',
+    face_model: 'vggface2',
+    face_confidence_threshold: 0.95,
+    face_min_size: 60,
     face_store_metadata: true,
   },
   defaults: {
@@ -25,9 +26,10 @@ const modelConfigData = {
     object_model: 'PekingU/rtdetr_r18vd',
     object_confidence_threshold: 0.35,
     enable_face_recognition: true,
-    face_model: 'buffalo_l',
-    face_confidence_threshold: 0.7,
-    face_min_size: 20,
+    face_recognizer_backend: 'facenet_pytorch',
+    face_model: 'vggface2',
+    face_confidence_threshold: 0.95,
+    face_min_size: 60,
     face_store_metadata: true,
   },
 }
@@ -174,6 +176,56 @@ describe('SettingsPage', () => {
         '/config/model',
         expect.objectContaining({ method: 'PATCH' }),
       )
+    })
+
+    it('shows all buffalo options when backend is insightface', async () => {
+      const insightfaceConfig = {
+        ...modelConfigData,
+        editable: {
+          ...modelConfigData.editable,
+          face_recognizer_backend: 'insightface',
+          face_model: 'buffalo_l',
+        },
+      }
+      vi.stubGlobal('fetch', vi.fn((url: string, opts?: RequestInit) => {
+        if (url === '/config/model') {
+          if (opts?.method === 'PATCH')
+            return Promise.resolve({ ok: true, json: () => Promise.resolve({ updated: [] }) })
+          return Promise.resolve({ ok: true, json: () => Promise.resolve(insightfaceConfig) })
+        }
+        if (url === '/diagnostics')
+          return Promise.resolve({ ok: true, json: () => Promise.resolve(diagData) })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ status: 'ok' }) })
+      }))
+      renderPage()
+      await waitFor(() => screen.getByText('Model Configuration'))
+      expect(screen.getByRole('option', { name: 'buffalo_s' })).toBeInTheDocument()
+      expect(screen.getByRole('option', { name: 'buffalo_l' })).toBeInTheDocument()
+      expect(screen.getByRole('option', { name: 'antelopev2' })).toBeInTheDocument()
+    })
+
+    it('renders unknown face_model as fallback option and keeps dropdown enabled in edit mode', async () => {
+      const staleConfig = {
+        ...modelConfigData,
+        editable: { ...modelConfigData.editable, face_model: 'unknown_xyz' },
+      }
+      vi.stubGlobal('fetch', vi.fn((url: string, opts?: RequestInit) => {
+        if (url === '/config/model') {
+          if (opts?.method === 'PATCH')
+            return Promise.resolve({ ok: true, json: () => Promise.resolve({ updated: [] }) })
+          return Promise.resolve({ ok: true, json: () => Promise.resolve(staleConfig) })
+        }
+        if (url === '/diagnostics')
+          return Promise.resolve({ ok: true, json: () => Promise.resolve(diagData) })
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ status: 'ok' }) })
+      }))
+      renderPage()
+      await waitFor(() => screen.getByRole('button', { name: 'Edit' }))
+      expect(screen.getByRole('option', { name: 'vggface2' })).toBeInTheDocument()
+      expect(screen.getByRole('option', { name: 'unknown_xyz' })).toBeInTheDocument()
+      await userEvent.click(screen.getByRole('button', { name: 'Edit' }))
+      const faceModelSelect = screen.getByDisplayValue('unknown_xyz')
+      expect(faceModelSelect).not.toBeDisabled()
     })
   })
 })
