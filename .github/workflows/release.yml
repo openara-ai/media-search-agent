@@ -4,14 +4,36 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual escape hatch — useful for re-running a release if artifact upload
+  # fails partway, or for triggering on private when needed. Select the tag
+  # ref in the dispatch UI; dispatching from a branch will produce artifacts
+  # tagged with the branch name (e.g. "MediaSearchAgent-main-..."), which is
+  # rarely what you want.
+  workflow_dispatch:
 
 permissions:
   contents: write   # needed to create GitHub Releases and upload assets
 
 jobs:
+  # ── Repository gate: only auto-run on the staging and public mirrors ────────
+  # Tag-push auto-runs are restricted to the staging and public repos so the
+  # upstream dev repo (and any forks) don't accidentally cut a release.
+  # Manual `workflow_dispatch` is allowed everywhere as an escape hatch.
+  preflight:
+    name: Repository gate
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.repository == 'openara-ai/media-search-agent-public-staging' ||
+      github.repository == 'openara-ai/media-search-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - run: echo "Proceeding on ${{ github.repository }} (event=${{ github.event_name }}, ref=${{ github.ref_name }})"
+
   # ── Test gate: all three must pass before any installer is built ────────────
   test:
     name: Quick Tests (Ubuntu)
+    needs: preflight
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -48,6 +70,7 @@ jobs:
 
   integration:
     name: Full Integration (Ubuntu)
+    needs: preflight
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -77,6 +100,7 @@ jobs:
 
   macos-test:
     name: Unit Tests (macOS)
+    needs: preflight
     runs-on: macos-14
     timeout-minutes: 20
     steps:
@@ -113,6 +137,7 @@ jobs:
             --ignore=tests/test_object_detection_on_samples.py
 
   windows-test:
+    needs: preflight
     uses: ./.github/workflows/windows-test.yml
 
   # ── BVT gate: validates bundled tool versions end-to-end ────────────────────
