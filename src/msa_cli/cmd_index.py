@@ -18,15 +18,13 @@ def register(parent_sp: argparse._SubParsersAction) -> None:
     global _index_parser
     ap = parent_sp.add_parser(
         "index",
-        help="Index media files, export to Qdrant, create backups",
+        help="Index media files, export to Qdrant",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   msa index run                                          # Run indexer with default config.yaml
   msa index run --config custom.yaml                    # Use custom config file
   msa index run --media-source-override /media/path     # Index specific directory
-  msa index run --reprocess-faces                       # Re-run face detection only
-  msa index run --reprocess-all                         # Re-run all processing stages
   msa index run --log-level DEBUG                       # Run with debug logging
   msa index run --no-console-log                        # Disable console output (log to file only)
   msa index run --dry-run                               # Scan files and show stats without processing
@@ -37,8 +35,6 @@ Examples:
   msa index export --recreate                           # Export and recreate Qdrant collections
   msa index export --dry-run                            # Analyse export readiness without exporting
   msa index export --log-level WARNING                  # Export with warning-level logging
-  msa index backup                                      # Backup SQLite and FAISS to ./index_backups
-  msa index backup --output-dir /path/to/backups        # Backup to custom directory
         """,
     )
     _index_parser = ap
@@ -66,16 +62,15 @@ Examples:
     media_type_group.add_argument("--video-only", action="store_true",
                                   help="Process only videos (skip images)")
 
-    run.add_argument("--reprocess-gps", action="store_true",
-                     help="Force re-extract GPS metadata for all media")
-    run.add_argument("--reprocess-objects", action="store_true",
-                     help="Force re-run object detection for all media")
-    run.add_argument("--reprocess-faces", action="store_true",
-                     help="Force re-run face detection for all media")
-    run.add_argument("--reprocess-embeddings", action="store_true",
-                     help="Force re-compute CLIP embeddings for all media")
-    run.add_argument("--reprocess-all", action="store_true",
-                     help="Force reprocess all stages (GPS, objects, faces, embeddings)")
+    # --reprocess-* flags are intentionally hidden from --help: the underlying
+    # stage-rerun paths exist but haven't been validated end-to-end, so we don't
+    # want users discovering them and ending up with an inconsistent index.
+    # Keep the entry points wired so internal/dev runs can still drive them.
+    run.add_argument("--reprocess-gps", action="store_true", help=argparse.SUPPRESS)
+    run.add_argument("--reprocess-objects", action="store_true", help=argparse.SUPPRESS)
+    run.add_argument("--reprocess-faces", action="store_true", help=argparse.SUPPRESS)
+    run.add_argument("--reprocess-embeddings", action="store_true", help=argparse.SUPPRESS)
+    run.add_argument("--reprocess-all", action="store_true", help=argparse.SUPPRESS)
 
     # ── export ─────────────────────────────────────────────────────────────────
     export = sp.add_parser("export", help="Export indexed data to Qdrant")
@@ -90,7 +85,9 @@ Examples:
                         default=None, help="Logging level (default: from config)")
 
     # ── backup ─────────────────────────────────────────────────────────────────
-    backup = sp.add_parser("backup", help="Backup SQLite database and FAISS indexes")
+    # Hidden from --help: backup path hasn't been validated end-to-end. Entry
+    # point kept for internal/dev use.
+    backup = sp.add_parser("backup", help=argparse.SUPPRESS)
     backup.add_argument("--config", required=False, default=None,
                         help="YAML config file (default: ./config.yaml)")
     backup.add_argument("--output-dir", required=False, default=None,

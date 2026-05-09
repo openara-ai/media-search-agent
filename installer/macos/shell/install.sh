@@ -20,11 +20,14 @@ _disable_colors() { BOLD=''; GREEN=''; YELLOW=''; RED=''; DIM=''; NC=''; }
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
-log_info()  { printf "${DIM}·${NC} %s\n" "$*"; }
-log_ok()    { printf "${GREEN}✓${NC} %s\n" "$*"; }
-log_skip()  { printf "${DIM}– %s${NC}\n" "$*"; }
-log_warn()  { printf "${YELLOW}!${NC} %s\n" "$*"; }
-log_bold()  { printf "\n${BOLD}%s${NC}\n" "$*"; }
+# All log_* functions write to stderr so they never pollute stdout in
+# command-substitution contexts (e.g. `version="$(resolve_version)"`).
+# setup_logging redirects stderr to the tee, so file logging still works.
+log_info()  { printf "${DIM}·${NC} %s\n" "$*" >&2; }
+log_ok()    { printf "${GREEN}✓${NC} %s\n" "$*" >&2; }
+log_skip()  { printf "${DIM}– %s${NC}\n" "$*" >&2; }
+log_warn()  { printf "${YELLOW}!${NC} %s\n" "$*" >&2; }
+log_bold()  { printf "\n${BOLD}%s${NC}\n" "$*" >&2; }
 die()       { printf "${RED}✗${NC} %s\n" "$*" >&2; exit 1; }
 
 LAUNCH_AGENT_LABEL="ai.openara.mediasearchagent"

@@ -240,5 +240,31 @@ describe('IndexerPage', () => {
       expect(screen.getByDisplayValue('/Users/test/Pictures')).toBeTruthy()
       expect(screen.queryByText('Select Folder')).toBeNull()
     })
+
+    it('opens the in-app DirectoryPicker on Windows without calling /browse/pick', async () => {
+      // Pin the post-v0.2.5 decision: Windows skips the native picker entirely
+      // (its FolderBrowserDialog hits foreground-window restrictions on locked-
+      // down configurations). The Browse button must render the in-app
+      // DirectoryPicker modal directly — no /browse/pick HTTP round-trip.
+      mockFetch({ '/platform': { platform: 'windows' } })
+      renderPage()
+      await waitFor(() => expect(screen.getByText('photos')).toBeTruthy())
+
+      await userEvent.click(screen.getByText(/^add source$/i))
+      // Windows placeholder confirms the platform-detection branch ran.
+      // String literal: 'e.g. D:\\Photos' is the chars `e.g. D:\Photos` in source.
+      await waitFor(() => expect(screen.getByPlaceholderText('e.g. D:\\Photos')).toBeTruthy())
+      await userEvent.click(screen.getByTitle('Browse folders'))
+
+      // The in-app DirectoryPicker renders a modal with the "Select Folder"
+      // header — its presence is the positive signal that this branch ran.
+      await waitFor(() => expect(screen.getByText('Select Folder')).toBeTruthy())
+
+      // And /browse/pick must NOT have been called. Even a single request to
+      // the (now-405) endpoint is a regression: it would mean the UI is still
+      // round-tripping through nativePick on Windows.
+      const calls = vi.mocked(fetch).mock.calls.map(c => c[0])
+      expect(calls).not.toContain('/browse/pick')
+    })
   })
 })

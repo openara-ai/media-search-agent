@@ -22,7 +22,14 @@ export function MediaSourcesPanel() {
   })
   const platform = platformData?.platform
   const isWindows = platform === 'windows'
-  const prefersNativePicker = platform === 'windows' || platform === 'macos'
+  // Native pickers are only reliable on macOS. Windows FolderBrowserDialog hits
+  // foreground-window restrictions on locked-down configurations, leaving the
+  // dialog stuck behind the browser — see git history for the AttachThreadInput
+  // experiment that didn't fix it consistently. The in-app /browse modal works
+  // identically on every platform; the typeable path field is the escape hatch
+  // for paths the in-app browser doesn't surface (network shares, OneDrive
+  // cloud-only folders, deep paths).
+  const prefersNativePicker = platform === 'macos'
 
   const { data: sourcesData } = useQuery<MediaSource[]>({
     queryKey: ['sources'],

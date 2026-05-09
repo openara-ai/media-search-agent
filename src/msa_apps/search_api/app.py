@@ -1698,9 +1698,13 @@ def platform_info():
 def browse_pick(request: Request = None):
     """Open the native OS folder-picker dialog and return the selected path.
 
-    Windows: PowerShell FolderBrowserDialog (shows This PC / all drives).
-    macOS:   osascript 'choose folder' (standard Finder sheet).
-    Others:  405 — caller should fall back to the server-side browser.
+    macOS: osascript 'choose folder' (standard Finder sheet) — reliable.
+    Other platforms (Windows, Linux, WSL2): 405. The UI falls back to the
+    in-app server-side directory browser at /browse, which is rendered as a
+    web modal and immune to OS-level focus quirks. The path field next to
+    the Browse button also accepts free-text entry, so any path the in-app
+    browser doesn't surface (network shares, OneDrive cloud-only folders,
+    deep paths) can be typed directly.
 
     Restricted to localhost — same policy as /browse.
     """
@@ -1712,45 +1716,7 @@ def browse_pick(request: Request = None):
         if host not in ("localhost", "127.0.0.1", "::1", ""):
             raise HTTPException(status_code=403, detail="Only available from localhost")
 
-    if _sys.platform == "win32":
-        # FolderBrowserDialog opens behind the parent process by default, which
-        # makes /browse/pick look hung until the subprocess timeout fires. Use a
-        # hidden TopMost form as the dialog owner so the dialog is foregrounded.
-        # -STA is required for Windows Forms; CREATE_NO_WINDOW suppresses the
-        # PowerShell console flash that can also steal focus from the dialog.
-        ps_script = (
-            "Add-Type -AssemblyName System.Windows.Forms; "
-            "$owner = New-Object System.Windows.Forms.Form -Property @{TopMost=$true; "
-            "ShowInTaskbar=$false; Opacity=0; Size=New-Object System.Drawing.Size(1,1)}; "
-            "$owner.Show(); $owner.Activate(); "
-            "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
-            "$d.Description = 'Select a media folder'; "
-            "$d.UseDescriptionForTitle = $true; "
-            "$d.RootFolder = 'MyComputer'; "
-            "$res = $d.ShowDialog($owner); "
-            "$owner.Close(); $owner.Dispose(); "
-            "if ($res -eq 'OK') { Write-Output $d.SelectedPath }"
-        )
-        creationflags = getattr(_sp, "CREATE_NO_WINDOW", 0x08000000)
-        try:
-            result = _sp.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-STA", "-Command", ps_script],
-                capture_output=True, text=True, timeout=300,
-                creationflags=creationflags,
-            )
-            selected = result.stdout.strip()
-            if not selected:
-                return {"path": None, "cancelled": True}
-            return {"path": display_path(selected), "cancelled": False}
-        except _sp.TimeoutExpired:
-            raise HTTPException(
-                status_code=504,
-                detail="Folder picker timed out — if a dialog appeared behind the browser, click it next time, or use the in-app browser.",
-            )
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Picker failed: {exc}")
-
-    elif _sys.platform == "darwin":
+    if _sys.platform == "darwin":
         script = 'POSIX path of (choose folder with prompt "Select a media folder")'
         try:
             result = _sp.run(
@@ -1764,8 +1730,7 @@ def browse_pick(request: Request = None):
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Picker failed: {exc}")
 
-    else:
-        raise HTTPException(status_code=405, detail="Native picker not available on this platform")
+    raise HTTPException(status_code=405, detail="Native picker not available on this platform")
 
 
 @app.get("/browse")

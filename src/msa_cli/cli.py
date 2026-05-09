@@ -13,7 +13,7 @@ def main():
         epilog="""
 Commands:
   status      Show install, service, and index status
-  index       Index media files, export to Qdrant, create backups
+  index       Index media files, export to Qdrant
   api         Start, stop, restart, and check the status of the API server
   uninstall   Remove Media Search Agent (installed builds only)
 

@@ -2,7 +2,7 @@
 
 [![CI Status](https://github.com/openara-ai/media-search-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/openara-ai/media-search-agent/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-blue)](#install)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-blue)](#quick-start)
 
 A **local-first semantic search engine** for your personal photo and video library.
 Search by natural language, browse by face, label people — all on your own machine.
@@ -18,37 +18,38 @@ No cloud. No subscription.
 
 - 🖼️ **Natural-language search** — "sunset at the beach", "blue car at night", "kids playing in snow". A vision-language model encodes image and text into the same vector space, so queries find matching frames even without any tags.
 - 🎬 **Video Shot detection** — shot-based keyframe extraction; semantic search jumps to the moment within a clip, not just to the file.
-- 👥 **People browser** — automatic face clustering. Label a person once and browse all their photos and video appearances.
+- 👥 **People browser** — faces are detected during indexing. Label one face and use similarity search to pull in the rest of that person's photos and video appearances.
 - 🏷️ **Object & scene tagging** — object detection across images and video frames; query "show me photos with dogs."
 - 📍 **GPS & metadata** — EXIF location (including GoPro GPS data), camera, lens, timestamp all parsed and searchable.
 - 🔒 **Fully offline** — Apple Silicon MPS, NVIDIA CUDA, or CPU. Nothing phones home.
 - ⚡ **Fast** — embedded Qdrant for vector search, SQLite for metadata. No external services.
 
-## Install
+## Quick start
 
-Use the one-liner install. No admin rights, no git, no Node required.
+Install with a single one-liner. No admin rights, no git, no Node required.
+
+**macOS / Linux (x86_64):**
 
 ```bash
-# macOS / Linux (x86_64)
 curl -fsSL https://github.com/openara-ai/media-search-agent/releases/latest/download/install.sh | bash
+```
 
-# Windows (PowerShell 5.1+)
+**Windows (PowerShell 5.1+):**
+
+```powershell
 powershell -c "irm https://github.com/openara-ai/media-search-agent/releases/latest/download/install.ps1 | iex"
 ```
 
-The installer downloads a pre-built bundle from GitHub Releases, sets up a
-Python environment, and starts the service. Open <http://localhost:8000> in
-your browser.
+The installer downloads a pre-built bundle, creates an **isolated Python
+environment inside the app's own data directory**, and starts the service.
+Any Python you already have on your machine — system Python, Homebrew, conda,
+pyenv, virtualenvs — is left completely untouched, and the app is removed
+cleanly on uninstall. Open <http://localhost:8000>, add a media folder on the
+**Indexer** page, and click **Run**. After the indexer finishes, type "kids
+on a swing" into the search bar and the moments appear.
 
-## Quick start
-
-1. **Install** (above).
-2. **Add a media folder** in the **Indexer** page (e.g. your Photos folder).
-3. **Click "Run Indexer"** — embeddings start generating. You can browse items as they're processed; semantic search comes online once the run completes.
-
-That's it. Type "kids on a swing" into the search bar and the moments appear.
-
-See the [Quick Start guide](docs/QUICKSTART.md) for the full walkthrough with screenshots.
+- Full walkthrough with screenshots: [Quick Start guide](docs/QUICKSTART.md)
+- Platform requirements, troubleshooting, uninstall: [Installation guide](docs/INSTALL.md)
 
 ## How it works
 
@@ -91,6 +92,7 @@ see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - [Installation](docs/INSTALL.md) — full install guide and troubleshooting
 - [Quick Start](docs/QUICKSTART.md) — first-run walkthrough
 - [Configuration](docs/CONFIGURATION.md) — `config.yaml` reference
+- [CLI](docs/CLI.md) — `msa` command-line reference
 - [Search](docs/features/search.md) — scoring, threshold tips
 - [People](docs/features/people.md) — face labeling user guide
 - [Video](docs/features/video.md) — keyframe extraction and video search

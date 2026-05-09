@@ -69,12 +69,16 @@ If you click **Quit**, the icon goes away. To bring it back:
    library).
 5. Click **Save**.
 
+<img src="images/msa-indexer-file-picker.png" alt="Indexer file picker" width="600">
+
 You can add more than one source from the same Indexer page. They all index
 into the same searchable library.
 
 ## 4. Start indexing
 
 Still on the **Indexer** page, click **Run**.
+
+<img src="images/msa-indexer-run.png" alt="Indexer run" width="600">
 
 You'll see live progress — file counts, current stage (CLIP embeddings, object
 detection, faces), and a streaming log. Indexing speed varies a lot with
@@ -106,6 +110,7 @@ that person searchable.
 ## Where to go next
 
 - [Configuration](CONFIGURATION.md) — `config.yaml` reference (models, ports, thresholds)
+- [CLI reference](CLI.md) — drive the indexer and API server from the terminal
 - [Search guide](features/search.md) — how scoring works, query tips
 - [People guide](features/people.md) — face labeling workflow
 - [Video guide](features/video.md) — semantic search across video keyframes

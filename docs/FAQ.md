@@ -56,7 +56,10 @@ the file. See [features/video.md](features/video.md).
 
 **Does it read EXIF / GPS / timestamps?**
 Yes. EXIF metadata (camera, lens, date taken, GPS coordinates) is parsed and
-made searchable and filterable. GPS is reverse-geocoded for display.
+made searchable and filterable. GPS coordinates are reverse-geocoded to a
+place name (city / region / country) using the local `reverse_geocoder`
+Python library, which ships with its own offline dataset — no cloud
+geocoding service is called and your coordinates never leave the machine.
 
 **Can I add multiple folders?**
 Yes. Add as many media sources as you like from the **Indexer** page; they
@@ -78,7 +81,10 @@ second to several seconds, driven by:
   go through the full model pipeline.
 - **What's enabled** — object detection, face recognition, and video shot
   detection each add cost; turning any of them off in `config.yaml` speeds
-  things up.
+  things up. Object detection defaults to `auto`, which **skips it on
+  CPU-only systems** (no NVIDIA CUDA or Apple Silicon MPS detected) because
+  it's prohibitively slow without a GPU. Set `enable_object_detection: true`
+  in `config.yaml` to force it on.
 
 The indexer is incremental — re-runs only process new or changed files —
 so the long wait only happens once per library.
