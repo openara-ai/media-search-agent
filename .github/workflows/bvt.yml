@@ -38,7 +38,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ui-dist
+          name: ui-dist-bvt
           path: src/msa_apps/ui/dist
           if-no-files-found: error
           retention-days: 1
@@ -124,7 +124,7 @@ jobs:
       - name: Download React UI dist
         uses: actions/download-artifact@v4
         with:
-          name: ui-dist
+          name: ui-dist-bvt
           path: src/msa_apps/ui/dist
 
       - name: Cache bundle model artifacts
@@ -153,7 +153,7 @@ jobs:
       - name: Download React UI dist
         uses: actions/download-artifact@v4
         with:
-          name: ui-dist
+          name: ui-dist-bvt
           path: src/msa_apps/ui/dist
 
       - name: Cache bundle model artifacts
@@ -185,7 +185,7 @@ jobs:
       - name: Download React UI dist
         uses: actions/download-artifact@v4
         with:
-          name: ui-dist
+          name: ui-dist-bvt
           path: src/msa_apps/ui/dist
 
       - name: Set up .NET SDK
