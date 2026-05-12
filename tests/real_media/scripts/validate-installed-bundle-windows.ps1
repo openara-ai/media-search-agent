@@ -53,7 +53,7 @@ if ($LASTEXITCODE -ne 0) {
 
 # Step 4: Add the only test-only dep BVT needs (pytest) on top of the
 # bundle venv. The bundle's install.ps1 already produced a venv with the
-# full runtime stack — torch+torchvision were installed explicitly from
+# full runtime stack -- torch+torchvision were installed explicitly from
 # the CUDA index URL and facenet-pytorch was installed --no-deps, so
 # transformers' RT-DETR imports work. Layering tests/requirements-ci.txt
 # on top would re-resolve that tree (with facenet-pytorch as a top-level
@@ -110,7 +110,7 @@ if ($LASTEXITCODE -ne 0) {
 # MSA_CONFIG_PATH is required because this validation passes explicit
 # -AppDir / -DataDir to install.ps1 to keep state under runner.temp. With
 # non-default install paths the runtime's platform default
-# (%USERPROFILE%\MediaSearchAgent\config.yaml) doesn't match — msa.cmd
+# (%USERPROFILE%\MediaSearchAgent\config.yaml) doesn't match -- msa.cmd
 # already exports MSA_CONFIG_PATH at launch, but pytest is invoked
 # directly via venvPy and would miss it. MSA_DEVICE=cpu pins the runner
 # to CPU regardless of any GPU detection on windows-latest.
@@ -126,10 +126,10 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-# Step 7a: Indexer lifecycle stress — interrupted-run clean-exit gate.
+# Step 7a: Indexer lifecycle stress -- interrupted-run clean-exit gate.
 # Start a real `msa index run` against the staged fixtures, wait for the
 # first BATCH_COMMIT line (proves CLIP loaded and a per-file commit landed),
-# then `msa index stop` — which writes the stop sentinel (the only delivery
+# then `msa index stop` -- which writes the stop sentinel (the only delivery
 # path that works on Windows because Intel Fortran's console-control handler
 # hijacks CTRL_BREAK), and blocks with progress until the indexer exits
 # cleanly. Asserts: clean exit (rc=0) and NO "forrtl: error" in the log.
@@ -211,7 +211,7 @@ if ($lifecycleProcess.ExitCode -ne 0) {
 }
 foreach ($logFile in @($lifecycleLog, $lifecycleErrLog)) {
     if ((Test-Path $logFile) -and (Select-String -Path $logFile -Pattern "forrtl: error" -Quiet)) {
-        Write-Host "FAIL: 'forrtl: error' in indexer log — the stop sentinel path"
+        Write-Host "FAIL: 'forrtl: error' in indexer log -- the stop sentinel path"
         Write-Host "      didn't engage. See WIN-006 in BUGS_AND_GOTCHAS.md."
         Get-Content $logFile -Tail 200
         exit 1
@@ -219,7 +219,7 @@ foreach ($logFile in @($lifecycleLog, $lifecycleErrLog)) {
 }
 # Cooperative stop must include Qdrant export of the batches that were
 # durably committed before the stop. Without this, SQLite and Qdrant fall
-# out of sync — the API can return search hits backed by SQLite metadata
+# out of sync -- the API can return search hits backed by SQLite metadata
 # that has no Qdrant vector entry.
 $qdrantExportComplete = $false
 foreach ($logFile in @($lifecycleLog, $lifecycleErrLog)) {
@@ -229,7 +229,7 @@ foreach ($logFile in @($lifecycleLog, $lifecycleErrLog)) {
     }
 }
 if (-not $qdrantExportComplete) {
-    Write-Host "FAIL: cooperative stop did not complete Qdrant export — SQLite"
+    Write-Host "FAIL: cooperative stop did not complete Qdrant export -- SQLite"
     Write-Host "      and Qdrant are now out of sync. The cooperative-stop path"
     Write-Host "      in pipeline.py must run the export on stop_event when files"
     Write-Host "      were committed."
