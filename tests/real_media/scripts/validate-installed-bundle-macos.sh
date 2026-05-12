@@ -104,8 +104,88 @@ export PATH="$APP_DIR/bin:$PATH"
 echo "exiftool: $(which exiftool) - $(exiftool -ver)"
 "$VENV_PY" -m pytest "$TEST_ROOT/test_real_media_fixtures.py" -v -m "not slow"
 
-# Step 8: Run the full installed CLI workflow: index the staged fixtures,
-# expose the generated artifact paths to the runtime tests, and start the API.
+# Step 8a: Indexer lifecycle stress — interrupted-run clean-exit gate.
+# Start a real `msa index run` against the staged fixtures, wait for the
+# first BATCH_COMMIT line (proves CLIP loaded and a per-file commit landed),
+# then `msa index stop` — which writes the stop sentinel and on POSIX also
+# sends SIGTERM, then blocks with progress until the indexer exits cleanly.
+# Asserts: clean exit (rc=0) and NO "forrtl: error" in the log. The forrtl
+# check is the regression gate for the Windows Intel-Fortran abort path the
+# stop sentinel was introduced to avoid (PR #121, WIN-006). See
+# internal/docs/testing/INDEXER_LIFECYCLE_STRESS.md for terminology and
+# per-assertion rationale.
+mkdir -p "$LOG_DIR"
+LIFECYCLE_LOG="$LOG_DIR/indexer-lifecycle.log"
+# Lower the commit-batch threshold so the small fixture set reliably crosses
+# a commit boundary before we issue the stop.
+export MSA_INDEXER_COMMIT_BATCH_FILES=2
+export MSA_INDEXER_COMMIT_BATCH_SECONDS=2
+
+"$MSA_BIN" index run --config "$CONFIG_PATH" --media-source-override "$FIXTURE_ROOT" \
+  >"$LIFECYCLE_LOG" 2>&1 &
+LIFECYCLE_PID=$!
+# Up to 240s for BATCH_COMMIT (cold CLIP load can take 30-60s on CPU runners).
+for _ in $(seq 1 480); do
+  if grep -q "BATCH_COMMIT" "$LIFECYCLE_LOG" 2>/dev/null; then break; fi
+  if ! kill -0 "$LIFECYCLE_PID" 2>/dev/null; then
+    echo "FAIL: indexer exited before BATCH_COMMIT" >&2
+    tail -n 200 "$LIFECYCLE_LOG" >&2 || true
+    exit 1
+  fi
+  sleep 0.5
+done
+if ! grep -q "BATCH_COMMIT" "$LIFECYCLE_LOG" 2>/dev/null; then
+  echo "FAIL: no BATCH_COMMIT within 240s" >&2
+  tail -n 200 "$LIFECYCLE_LOG" >&2 || true
+  kill "$LIFECYCLE_PID" 2>/dev/null || true
+  exit 1
+fi
+
+# Don't let `set -e` kill us with a stray background indexer still running
+# if msa index stop returns non-zero — kill the background process first
+# so subsequent CI steps don't inherit a process holding locks.
+STOP_RC=0
+"$MSA_BIN" index stop --config "$CONFIG_PATH" --wait 60 --require-running || STOP_RC=$?
+if [[ $STOP_RC -ne 0 ]]; then
+  echo "FAIL: msa index stop returned rc=$STOP_RC; killing background indexer (PID $LIFECYCLE_PID)" >&2
+  kill "$LIFECYCLE_PID" 2>/dev/null || true
+  wait "$LIFECYCLE_PID" 2>/dev/null || true
+  tail -n 200 "$LIFECYCLE_LOG" >&2
+  exit 1
+fi
+LIFECYCLE_RC=0
+wait "$LIFECYCLE_PID" || LIFECYCLE_RC=$?
+if [[ $LIFECYCLE_RC -ne 0 ]]; then
+  echo "FAIL: indexer did not exit cleanly after \`msa index stop\` (rc=$LIFECYCLE_RC)" >&2
+  tail -n 200 "$LIFECYCLE_LOG" >&2
+  exit 1
+fi
+if grep -q "forrtl: error" "$LIFECYCLE_LOG"; then
+  echo "FAIL: 'forrtl: error' in indexer log — the stop sentinel path didn't" >&2
+  echo "      engage. See WIN-006 in BUGS_AND_GOTCHAS.md." >&2
+  tail -n 200 "$LIFECYCLE_LOG" >&2
+  exit 1
+fi
+# Cooperative stop must include Qdrant export of the batches that were
+# durably committed before the stop. The indexer's pipeline.run_index
+# finalisation runs the export when stop_event is set AND files were
+# committed. Without this, SQLite and Qdrant fall out of sync — the API
+# can return search hits backed by SQLite metadata that has no Qdrant
+# vector entry.
+if ! grep -q "Qdrant image/video export complete" "$LIFECYCLE_LOG"; then
+  echo "FAIL: cooperative stop did not complete Qdrant export — SQLite and" >&2
+  echo "      Qdrant are now out of sync. The cooperative-stop path in" >&2
+  echo "      pipeline.py must run the export on stop_event with local changes." >&2
+  tail -n 200 "$LIFECYCLE_LOG" >&2
+  exit 1
+fi
+unset MSA_INDEXER_COMMIT_BATCH_FILES
+unset MSA_INDEXER_COMMIT_BATCH_SECONDS
+
+# Step 8b: Resume the indexer to finish the remaining fixtures and export to
+# Qdrant. Per-batch durability from Step 8a means rows committed before the
+# stop are now skipped. The runtime tests in Step 9 then assert the indexed
+# state and API contracts.
 "$MSA_BIN" index run --config "$CONFIG_PATH" --media-source-override "$FIXTURE_ROOT" --export-to-qdrant
 
 export MSA_REALDATA_WORKSPACE="$DATA_DIR"

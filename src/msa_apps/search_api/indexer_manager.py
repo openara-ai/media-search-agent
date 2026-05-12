@@ -9,6 +9,7 @@ State is persisted to run/indexer.pid so that:
 """
 import os
 import signal
+import sys
 import threading
 import uuid
 import json
@@ -30,6 +31,12 @@ _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _LOG_DIR = os.getenv("MSA_LOG_DIR")
 _RUN_DIR = Path(_LOG_DIR) / "run" if _LOG_DIR else Path(os.getcwd()) / "run"
 _INDEXER_PID_FILE = _RUN_DIR / "indexer.pid"
+# Cooperative-stop sentinel. Created by stop() and watched by the indexer
+# subprocess so we never have to rely on CTRL_BREAK_EVENT on Windows, where
+# Intel Fortran runtime (linked via NumPy/SciPy/sklearn) installs its own
+# console-control handler that aborts the process before Python's signal
+# handler can run. Removed by _monitor() after the process exits.
+_INDEXER_STOP_FILE = _RUN_DIR / "indexer.stop"
 
 
 def _write_pid(pid: int) -> None:
@@ -44,7 +51,70 @@ def _clear_pid() -> None:
         pass
 
 
+def _write_stop_sentinel(run_id: Optional[str]) -> bool:
+    """Write the stop sentinel. Returns True on success, False on any failure.
+
+    On Windows the sentinel is the *only* stop mechanism (CTRL_BREAK is
+    hijacked by Intel Fortran runtime — see WIN-006). A silent write failure
+    would leave the user with a stop request the indexer never observes, so
+    the caller must check the return and surface failures.
+    """
+    try:
+        _RUN_DIR.mkdir(parents=True, exist_ok=True)
+        _INDEXER_STOP_FILE.write_text(run_id or "")
+        return True
+    except Exception as exc:
+        logger.error("Could not write stop sentinel: {}", exc)
+        return False
+
+
+def _clear_stop_sentinel() -> None:
+    try:
+        _INDEXER_STOP_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+if sys.platform == "win32":
+    # Windows liveness check. os.kill(pid, 0) is not a POSIX-style existence
+    # check on Windows — it calls TerminateProcess via OpenProcess, and as
+    # long as any handle to the (already-exited) process is still open (e.g.,
+    # the subprocess.Popen that spawned it), OpenProcess succeeds and reports
+    # the PID as alive. Use GetExitCodeProcess on a query-only handle and
+    # treat anything other than STILL_ACTIVE as dead.
+    #
+    # ctypes defaults function restype to c_int, but a Windows HANDLE is
+    # pointer-sized — on 64-bit Python the handle gets truncated/sign-
+    # mangled before we hand it to GetExitCodeProcess/CloseHandle. Declare
+    # argtypes/restype explicitly. Use a private WinDLL instance instead of
+    # the cached windll.kernel32 proxy so we don't change signatures other
+    # code in the process might rely on.
+    import ctypes
+    from ctypes import wintypes
+
+    _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    _STILL_ACTIVE = 259
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    _kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+
+
 def _pid_alive(pid: int) -> bool:
+    if sys.platform == "win32":
+        handle = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = wintypes.DWORD()
+            if not _kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == _STILL_ACTIVE
+        finally:
+            _kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True
@@ -66,6 +136,11 @@ class IndexerManager:
         self._summary: Optional[Dict[str, Any]] = None
         self._log_position: int = 0
         self._log_start_position: int = 0
+        # Set True when stop() is called so _monitor classifies the resulting
+        # exit as "stopped" rather than "error", regardless of the subprocess
+        # return code (Windows ML libraries can abort with rc!=0 even after a
+        # cooperative shutdown request).
+        self._stop_requested: bool = False
 
         # Restore state if an indexer was running before this API instance started
         self._restore_from_pid_file()
@@ -86,8 +161,7 @@ class IndexerManager:
             except Exception:
                 log_path = Path(config_path).parent / "logs" / "msa.log"
 
-            import sys as _sys
-            script_name = "msa.exe" if _sys.platform == "win32" else "msa"
+            script_name = "msa.exe" if sys.platform == "win32" else "msa"
             cmd = [
                 str(Path(venv_bin) / script_name),
                 "index", "run",
@@ -104,7 +178,6 @@ class IndexerManager:
             except Exception as exc:
                 logger.warning("Could not close shared Qdrant client: {}", exc)
 
-            import sys as _sys
             # Redirect subprocess stderr to msa.log so crash tracebacks are visible.
             # stdout stays DEVNULL — the indexer uses loguru (not print) for all output.
             stderr_dest: Any = subprocess.DEVNULL
@@ -122,14 +195,30 @@ class IndexerManager:
             # codepage (cp1252) and uses backslashreplace, turning 📂 into \U0001f4c2.
             sub_env = os.environ.copy()
             sub_env["PYTHONIOENCODING"] = "utf-8"
+            # Tell the indexer where to watch for a cooperative-stop sentinel.
+            sub_env["MSA_INDEXER_STOP_FILE"] = str(_INDEXER_STOP_FILE)
+
+            # Clear any leftover sentinel from a previous run and reset the
+            # stop-requested flag so this run starts clean.
+            _clear_stop_sentinel()
+            self._stop_requested = False
 
             popen_kwargs: Dict[str, Any] = {
                 "stdout": subprocess.DEVNULL,
                 "stderr": stderr_dest,
                 "env": sub_env,
             }
-            if _sys.platform == "win32":
-                # CREATE_NEW_PROCESS_GROUP lets us send CTRL_BREAK_EVENT to stop it
+            if sys.platform == "win32":
+                # CREATE_NEW_PROCESS_GROUP isolates the indexer from console-
+                # control events targeted at the API. We no longer send
+                # CTRL_BREAK_EVENT to stop it — the sentinel file is the stop
+                # path (see stop() and WIN-006 in BUGS_AND_GOTCHAS.md). The
+                # flag still matters in dev mode: without it, Ctrl-C in the
+                # API's terminal broadcasts CTRL_C_EVENT to every process in
+                # the console group, including the indexer, where Intel
+                # Fortran's console-control handler would abort the process
+                # with "forrtl: error (200)" — the exact failure the sentinel
+                # path was designed to avoid.
                 popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
             else:
                 popen_kwargs["start_new_session"] = True
@@ -169,20 +258,53 @@ class IndexerManager:
         with self._lock:
             if self._status != "running":
                 return {"status": self._status, "message": "Indexer is not running"}
+
+            # If the subprocess has already exited but _monitor hasn't observed
+            # it yet, do NOT flip _stop_requested. Otherwise a late stop arriving
+            # in the race window between exit and classification would overwrite
+            # a real crash (rc!=0) with a user-stop label, hiding the failure.
+            # Let _monitor classify based on the actual return code.
             pid = self._process.pid if self._process else self._read_pid_file()
-            if pid:
+            if pid and not _pid_alive(pid):
+                logger.info(
+                    "stop() called but indexer PID {} is already dead — "
+                    "deferring to _monitor's rc-based classification",
+                    pid,
+                )
+                return {"status": self._status, "message": "Indexer already exited"}
+
+            # Write the cooperative-stop sentinel BEFORE flipping intent, so a
+            # write failure leaves the system in a consistent state (no flag set,
+            # no sentinel, no claim of "stopping").
+            #
+            # On Windows this is the only stop path — if it fails the indexer
+            # will never observe the stop request, so surface the failure to
+            # the caller. On POSIX the SIGTERM below would still work, but it's
+            # simpler to fail loudly than to half-stop.
+            if not _write_stop_sentinel(self._run_id):
+                return {
+                    "status": "error",
+                    "detail": (
+                        "Could not write stop sentinel. The indexer was not "
+                        "asked to stop. Check disk space and permissions on "
+                        f"{_RUN_DIR}, then try again."
+                    ),
+                }
+            self._stop_requested = True
+            logger.info(f"Wrote stop sentinel for indexer run {self._run_id}")
+
+            # On POSIX, send SIGTERM as well for fast shutdown — the indexer's
+            # SIGTERM handler does the same thing as the sentinel watcher.
+            #
+            # On Windows we deliberately do NOT send CTRL_BREAK_EVENT: when the
+            # indexer has Intel Fortran runtime loaded (NumPy/SciPy/sklearn via
+            # PySceneDetect, CLIP, FaceNet, etc.), the runtime installs its own
+            # console-control handler that aborts the process before Python's
+            # signal handler can run. The sentinel above is the Windows path.
+            if pid and sys.platform != "win32":
                 try:
-                    import sys as _sys
-                    if _sys.platform == "win32":
-                        # CTRL_BREAK_EVENT works on a process group created with
-                        # CREATE_NEW_PROCESS_GROUP; fall back to SIGTERM if unavailable
-                        try:
-                            os.kill(pid, signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
-                        except (AttributeError, OSError):
-                            os.kill(pid, signal.SIGTERM)
-                    else:
-                        os.killpg(os.getpgid(pid), signal.SIGTERM)
-                    logger.info(f"Sent stop signal to indexer PID {pid} (run {self._run_id})")
+                    os.killpg(os.getpgid(pid), signal.SIGTERM)
+                    logger.info(f"Sent SIGTERM to indexer PID {pid} (run {self._run_id})")
                 except (ProcessLookupError, OSError):
                     pass
             # Do NOT clear the PID file here — _monitor/_monitor_pid does it
@@ -198,10 +320,14 @@ class IndexerManager:
                 self._refresh_summary_from_log_locked()
                 pid = self._process.pid if self._process else self._read_pid_file()
                 if pid and not _pid_alive(pid):
-                    # Process died without our monitor catching it (e.g. after API restart)
-                    self._status = "complete"
+                    # Process died without our monitor catching it (e.g. after
+                    # API restart, or status polled in the window between exit
+                    # and _monitor_pid running). Respect the stop-requested
+                    # contract here so a user stop never reports as "complete".
+                    self._status = "stopped" if self._stop_requested else "complete"
                     self._finished_at = datetime.now()
                     _clear_pid()
+                    _clear_stop_sentinel()
 
             elapsed: Optional[int] = None
             if self._started_at:
@@ -246,6 +372,7 @@ class IndexerManager:
             return
         rc = proc.wait()
         _clear_pid()
+        _clear_stop_sentinel()
         # Close the stderr file handle now that the subprocess has exited.
         fh = self._stderr_fh
         self._stderr_fh = None
@@ -258,7 +385,14 @@ class IndexerManager:
             self._refresh_summary_from_log_locked()
             self._return_code = rc
             self._finished_at = datetime.now()
-            self._status = "complete" if rc == 0 else "error"
+            # If the user pressed Stop, call it "stopped" even on non-zero
+            # exit — they asked for it, it's not a crash from their POV.
+            if self._stop_requested:
+                self._status = "stopped"
+            elif rc == 0:
+                self._status = "complete"
+            else:
+                self._status = "error"
             logger.info(
                 f"Indexer run {self._run_id} finished — "
                 f"status={self._status} rc={rc}"
@@ -331,6 +465,10 @@ class IndexerManager:
             self._status = "running"
             self._run_id = "restored"
             self._summary = {"phase": "counting"}
+            # If a stop sentinel survived an API restart, preserve the intent
+            # so we classify the eventual exit as "stopped" rather than "complete".
+            if _INDEXER_STOP_FILE.exists():
+                self._stop_requested = True
             try:
                 from msa_settings import load_config as _lc
                 self._log_path = Path(_lc().log_dir) / "msa.log"
@@ -356,6 +494,7 @@ class IndexerManager:
             t.start()
         else:
             _clear_pid()
+            _clear_stop_sentinel()
 
     def _monitor_pid(self, pid: int) -> None:
         """Monitor a PID we don't own a Popen handle for (restored from pid file)."""
@@ -365,11 +504,16 @@ class IndexerManager:
                 self._refresh_summary_from_log_locked()
             time.sleep(2)
         _clear_pid()
+        _clear_stop_sentinel()
         with self._lock:
             self._refresh_summary_from_log_locked()
             self._finished_at = datetime.now()
-            self._status = "complete"
-            logger.info(f"Restored indexer PID {pid} has finished")
+            # Without a Popen handle we can't read the real exit code on POSIX
+            # (waitpid only works for direct children). If stop was requested
+            # via this API instance, record that intent; otherwise assume the
+            # restored run completed on its own.
+            self._status = "stopped" if self._stop_requested else "complete"
+            logger.info(f"Restored indexer PID {pid} has finished — status={self._status}")
 
     @staticmethod
     def _read_pid_file() -> Optional[int]:

@@ -110,7 +110,7 @@ jobs:
           name: real-data-report
           path: .artifacts/real-data/**
           if-no-files-found: warn
-          retention-days: 14
+          retention-days: 1
 
   # ── Linux shell bundle ────────────────────────────────────────────────────────
   linux-bundle:
@@ -141,19 +141,6 @@ jobs:
           BUNDLE=$(ls dist/shell/MediaSearchAgent-*-linux-x86_64.tar.gz)
           bash tests/real_media/scripts/validate-installed-bundle-linux.sh "$BUNDLE"
 
-      - name: Upload Linux bundle runtime artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-bundle-runtime-artifacts
-          path: |
-            ${{ runner.temp }}/msa-linux-home/.config/MediaSearchAgent/config.yaml
-            ${{ runner.temp }}/msa-linux-home/.local/share/MediaSearchAgent/logs/**
-            ${{ runner.temp }}/msa-linux-home/.local/share/MediaSearchAgent/index/**
-            ${{ runner.temp }}/msa-real-media-tests/**
-          if-no-files-found: warn
-          retention-days: 7
-
   # ── macOS shell bundle ────────────────────────────────────────────────────────
   macos-bundle:
     name: macOS Bundle — BVT
@@ -182,19 +169,6 @@ jobs:
         run: |
           BUNDLE=$(ls dist/shell/MediaSearchAgent-*-macos-arm64.tar.gz)
           bash tests/real_media/scripts/validate-installed-bundle-macos.sh "$BUNDLE"
-
-      - name: Upload macOS bundle runtime artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-bundle-runtime-artifacts
-          path: |
-            ${{ runner.temp }}/msa-macos-home/Library/Application Support/MediaSearchAgent/config.yaml
-            ${{ runner.temp }}/msa-macos-home/Library/Logs/MediaSearchAgent/**
-            ${{ runner.temp }}/msa-macos-home/Library/Application Support/MediaSearchAgent/index/**
-            ${{ runner.temp }}/msa-real-media-tests/**
-          if-no-files-found: warn
-          retention-days: 7
 
   # ── Windows shell bundle ──────────────────────────────────────────────────────
   # Build and test run on Windows because the tray app publish needs the
@@ -263,16 +237,3 @@ jobs:
           $zip = Get-ChildItem dist/shell/MediaSearchAgent-*-windows-x86_64.zip | Select-Object -First 1
           & powershell -ExecutionPolicy Bypass -File tests/real_media/scripts/validate-installed-bundle-windows.ps1 -Bundle $zip.FullName
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Upload Windows bundle runtime artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-bundle-runtime-artifacts
-          path: |
-            ${{ runner.temp }}\msa-data\config.yaml
-            ${{ runner.temp }}\msa-app\logs\**
-            ${{ runner.temp }}\msa-data\index\**
-            ${{ runner.temp }}\msa-real-media-tests\**
-          if-no-files-found: warn
-          retention-days: 7

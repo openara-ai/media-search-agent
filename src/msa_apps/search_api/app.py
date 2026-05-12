@@ -1564,13 +1564,23 @@ def indexer_start(request: Request):
 
 @app.post("/indexer/stop")
 def indexer_stop():
-    """Send SIGTERM to the running indexer subprocess."""
-    return indexer_manager.stop()
+    """Request a cooperative stop of the running indexer subprocess.
+
+    Writes a sentinel file the indexer polls between files; on POSIX also
+    sends SIGTERM for fast shutdown. On Windows the sentinel is the only
+    path (CTRL_BREAK is hijacked by Intel Fortran runtime — see WIN-006).
+    Returns 500 if the sentinel cannot be written — on Windows that means
+    the indexer was not asked to stop.
+    """
+    result = indexer_manager.stop()
+    if result.get("status") == "error":
+        raise HTTPException(status_code=500, detail=result.get("detail", "stop failed"))
+    return result
 
 
 @app.get("/indexer/status")
 def indexer_status():
-    """Return current indexer state: idle | running | complete | error."""
+    """Return current indexer state: idle | running | complete | stopped | error."""
     return indexer_manager.get_status()
 
 

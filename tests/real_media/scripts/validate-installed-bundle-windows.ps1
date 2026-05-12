@@ -126,8 +126,125 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-# Step 7: Run the full installed CLI workflow: index the staged fixtures,
-# expose the generated artifact paths to the runtime tests, and start the API.
+# Step 7a: Indexer lifecycle stress — interrupted-run clean-exit gate.
+# Start a real `msa index run` against the staged fixtures, wait for the
+# first BATCH_COMMIT line (proves CLIP loaded and a per-file commit landed),
+# then `msa index stop` — which writes the stop sentinel (the only delivery
+# path that works on Windows because Intel Fortran's console-control handler
+# hijacks CTRL_BREAK), and blocks with progress until the indexer exits
+# cleanly. Asserts: clean exit (rc=0) and NO "forrtl: error" in the log.
+# The forrtl check is the regression gate for the Intel-Fortran abort path
+# the stop sentinel was introduced to avoid (PR #121, WIN-006). See
+# internal/docs/testing/INDEXER_LIFECYCLE_STRESS.md for terminology and
+# per-assertion rationale.
+$logsDir = Join-Path $appDir "logs"
+if (-not (Test-Path $logsDir)) {
+    New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
+}
+$lifecycleLog    = Join-Path $logsDir "indexer-lifecycle.out.log"
+$lifecycleErrLog = Join-Path $logsDir "indexer-lifecycle.err.log"
+# Lower commit-batch so the small fixture set reliably crosses a commit
+# boundary before we issue the stop.
+$env:MSA_INDEXER_COMMIT_BATCH_FILES = "2"
+$env:MSA_INDEXER_COMMIT_BATCH_SECONDS = "2"
+
+$lifecycleProcess = Start-Process -FilePath $msaCmd `
+    -ArgumentList @("index", "run", "--config", $configPath,
+                    "--media-source-override", $fixtureRoot) `
+    -RedirectStandardOutput $lifecycleLog `
+    -RedirectStandardError $lifecycleErrLog `
+    -PassThru
+
+# Up to 240s for BATCH_COMMIT (cold CLIP load can take 30-60s on CPU runners).
+$batchCommitSeen = $false
+for ($i = 0; $i -lt 480; $i++) {
+    if ($lifecycleProcess.HasExited) {
+        Write-Host "FAIL: indexer exited before BATCH_COMMIT (rc=$($lifecycleProcess.ExitCode))"
+        if (Test-Path $lifecycleLog)    { Write-Host "--- stdout (tail) ---"; Get-Content $lifecycleLog    -Tail 200 }
+        if (Test-Path $lifecycleErrLog) { Write-Host "--- stderr (tail) ---"; Get-Content $lifecycleErrLog -Tail 200 }
+        exit 1
+    }
+    foreach ($logFile in @($lifecycleLog, $lifecycleErrLog)) {
+        if ((Test-Path $logFile) -and (Select-String -Path $logFile -Pattern "BATCH_COMMIT" -Quiet)) {
+            $batchCommitSeen = $true
+            break
+        }
+    }
+    if ($batchCommitSeen) { break }
+    Start-Sleep -Milliseconds 500
+}
+if (-not $batchCommitSeen) {
+    Write-Host "FAIL: no BATCH_COMMIT within 240s"
+    if (Test-Path $lifecycleLog)    { Get-Content $lifecycleLog    -Tail 200 }
+    if (Test-Path $lifecycleErrLog) { Get-Content $lifecycleErrLog -Tail 200 }
+    try { $lifecycleProcess.Kill() } catch { }
+    exit 1
+}
+
+& $msaCmd index stop --config $configPath --wait 60 --require-running
+$stopRc = $LASTEXITCODE
+if ($stopRc -ne 0) {
+    Write-Host "FAIL: msa index stop returned exit code $stopRc; killing background indexer (PID $($lifecycleProcess.Id))"
+    # Don't leave the Start-Process-launched indexer running for later CI
+    # steps to trip over (holds locks, blocks subsequent msa invocations).
+    if (-not $lifecycleProcess.HasExited) {
+        try { $lifecycleProcess.Kill() } catch { }
+        try { $lifecycleProcess.WaitForExit(10000) | Out-Null } catch { }
+    }
+    if (Test-Path $lifecycleLog)    { Get-Content $lifecycleLog    -Tail 200 }
+    if (Test-Path $lifecycleErrLog) { Get-Content $lifecycleErrLog -Tail 200 }
+    exit 1
+}
+
+# msa index stop already waited for the subprocess to exit; this final check
+# guards against PID-race oddities and surfaces the actual rc.
+if (-not $lifecycleProcess.WaitForExit(60000)) {
+    Write-Host "FAIL: indexer process still alive after msa index stop returned"
+    try { $lifecycleProcess.Kill() } catch { }
+    exit 1
+}
+if ($lifecycleProcess.ExitCode -ne 0) {
+    Write-Host "FAIL: indexer did not exit cleanly after ``msa index stop`` (rc=$($lifecycleProcess.ExitCode))"
+    if (Test-Path $lifecycleLog)    { Get-Content $lifecycleLog    -Tail 200 }
+    if (Test-Path $lifecycleErrLog) { Get-Content $lifecycleErrLog -Tail 200 }
+    exit 1
+}
+foreach ($logFile in @($lifecycleLog, $lifecycleErrLog)) {
+    if ((Test-Path $logFile) -and (Select-String -Path $logFile -Pattern "forrtl: error" -Quiet)) {
+        Write-Host "FAIL: 'forrtl: error' in indexer log — the stop sentinel path"
+        Write-Host "      didn't engage. See WIN-006 in BUGS_AND_GOTCHAS.md."
+        Get-Content $logFile -Tail 200
+        exit 1
+    }
+}
+# Cooperative stop must include Qdrant export of the batches that were
+# durably committed before the stop. Without this, SQLite and Qdrant fall
+# out of sync — the API can return search hits backed by SQLite metadata
+# that has no Qdrant vector entry.
+$qdrantExportComplete = $false
+foreach ($logFile in @($lifecycleLog, $lifecycleErrLog)) {
+    if ((Test-Path $logFile) -and (Select-String -Path $logFile -Pattern "Qdrant image/video export complete" -Quiet)) {
+        $qdrantExportComplete = $true
+        break
+    }
+}
+if (-not $qdrantExportComplete) {
+    Write-Host "FAIL: cooperative stop did not complete Qdrant export — SQLite"
+    Write-Host "      and Qdrant are now out of sync. The cooperative-stop path"
+    Write-Host "      in pipeline.py must run the export on stop_event when files"
+    Write-Host "      were committed."
+    if (Test-Path $lifecycleLog)    { Get-Content $lifecycleLog    -Tail 200 }
+    if (Test-Path $lifecycleErrLog) { Get-Content $lifecycleErrLog -Tail 200 }
+    exit 1
+}
+
+Remove-Item Env:MSA_INDEXER_COMMIT_BATCH_FILES   -ErrorAction SilentlyContinue
+Remove-Item Env:MSA_INDEXER_COMMIT_BATCH_SECONDS -ErrorAction SilentlyContinue
+
+# Step 7b: Resume the indexer to finish the remaining fixtures and export to
+# Qdrant. Per-batch durability from Step 7a means rows committed before the
+# stop are now skipped. The runtime tests in Step 9 then assert the indexed
+# state and API contracts.
 & $msaCmd index run --config $configPath --media-source-override $fixtureRoot --export-to-qdrant
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE

@@ -46,7 +46,7 @@ jobs:
           name: ui-dist
           path: src/msa_apps/ui/dist
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 1
 
   # ── macOS bundle (arm64) — requires macOS runner for hdiutil / lipo / brew ───
   build-macos-bundle:
@@ -74,7 +74,7 @@ jobs:
           name: macos-shell-bundle
           path: dist/shell/MediaSearchAgent-*-macos-*.tar.gz
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 1
 
   # ── Linux bundle (x86_64) ────────────────────────────────────────────────────
   build-linux-bundle:
@@ -102,7 +102,7 @@ jobs:
           name: linux-shell-bundle
           path: dist/shell/MediaSearchAgent-*-linux-*.tar.gz
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 1
 
   # ── Windows bundle (x86_64) — build on Windows so the tray app has native .NET ─
   build-windows-bundle:
@@ -141,7 +141,7 @@ jobs:
           name: windows-shell-bundle
           path: dist/shell/MediaSearchAgent-*-windows-*.zip
           if-no-files-found: error
-          retention-days: 3
+          retention-days: 1
 
   # ── Summary ───────────────────────────────────────────────────────────────────
   summary:

@@ -691,25 +691,60 @@ function SimilarFacesView({
 function FaceCard({
   face,
   size,
+  expandLoading,
   onLabel,
   onSimilar,
+  onExpand,
 }: {
   face: Face
   size: ThumbSize
+  expandLoading: boolean
   onLabel: (face: Face) => void
   onSimilar: (face: Face) => void
+  onExpand: (face: Face) => void
 }) {
   const thumb = face.thumbnail ?? faceThumbnailUrl(face.face_id)
+  const canExpand = face.media_id != null
 
   return (
     <div className="group flex flex-col items-center gap-1 select-none">
-      <div className={cn('relative rounded-xl overflow-hidden bg-slate-200 dark:bg-zinc-800', SIZE_CLASS[size])}>
+      <div
+        onClick={canExpand ? () => onExpand(face) : undefined}
+        onKeyDown={canExpand ? (e) => {
+          // Only react when focus is on the container itself — not on the
+          // nested Label / Find-similar buttons (their Enter/Space bubbles).
+          if (e.target !== e.currentTarget) return
+          // Held keys (auto-repeat) would otherwise fire one expand per repeat
+          // tick — debounce at the keyboard layer to match button semantics.
+          if (e.repeat) return
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault()
+            onExpand(face)
+          }
+        } : undefined}
+        role={canExpand ? 'button' : undefined}
+        tabIndex={canExpand ? 0 : undefined}
+        aria-label={canExpand ? 'Expand face' : undefined}
+        className={cn(
+          'relative rounded-xl overflow-hidden bg-slate-200 dark:bg-zinc-800',
+          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500',
+          SIZE_CLASS[size],
+          canExpand && 'cursor-pointer',
+        )}
+      >
         <img
           src={thumb}
           alt={face.person_name ?? 'face'}
           className="w-full h-full object-cover"
           onError={e => { (e.target as HTMLImageElement).style.visibility = 'hidden' }}
         />
+        {canExpand && (
+          <div className="pointer-events-none absolute inset-0 bg-black/0 group-hover:bg-black/30 transition-colors flex items-center justify-center">
+            {expandLoading
+              ? <Loader2 className="animate-spin text-white" size={16} />
+              : <Expand size={16} className="text-white opacity-0 group-hover:opacity-100 transition-opacity" />}
+          </div>
+        )}
         <div className="absolute inset-x-0 bottom-0 flex opacity-0 group-hover:opacity-100 transition-opacity">
           <button
             title="Label"
@@ -751,7 +786,39 @@ function BrowseView({
   const [filter, setFilter] = useState<Filter>('unknown')
   const [thumbSize, setThumbSize] = useState<ThumbSize>('md')
   const [labelTarget, setLabelTarget] = useState<Face | null>(null)
+  const [drawerItem, setDrawerItem] = useState<MediaInfo | null>(null)
+  // Track only the latest expand-target's media id (drawer is last-click-wins
+  // anyway). Using a Set risked clearing the spinner too early when the same
+  // face was clicked twice in succession: the first request's finally would
+  // remove the id while the second was still in flight.
+  const [loadingMediaId, setLoadingMediaId] = useState<string | null>(null)
   const loaderRef = useRef<HTMLDivElement>(null)
+  // Monotonic token so only the latest expand-click's response wins if the
+  // user clicks several faces in quick succession — and so an in-flight
+  // request can be invalidated when the drawer is explicitly closed.
+  const expandReqRef = useRef(0)
+
+  const handleExpand = async (face: Face) => {
+    if (!face.media_id) return
+    const mid = face.media_id
+    const reqId = ++expandReqRef.current
+    setLoadingMediaId(mid)
+    try {
+      const info = await getMediaInfo(mid)
+      if (reqId === expandReqRef.current) setDrawerItem(info)
+    } catch { /* ignore */ }
+    finally {
+      if (reqId === expandReqRef.current) setLoadingMediaId(null)
+    }
+  }
+
+  // Closing the drawer must cancel any in-flight expand request, otherwise a
+  // late /media/{id}/info response would reopen the drawer after the user
+  // dismissed it.
+  const closeDrawer = () => {
+    expandReqRef.current++
+    setDrawerItem(null)
+  }
 
   const { data, fetchNextPage, hasNextPage, isFetchingNextPage, isLoading } = useInfiniteQuery({
     queryKey: ['faces', filter],
@@ -873,8 +940,10 @@ function BrowseView({
                 key={face.face_id}
                 face={face}
                 size={thumbSize}
+                expandLoading={face.media_id != null && face.media_id === loadingMediaId}
                 onLabel={setLabelTarget}
                 onSimilar={onSimilar}
+                onExpand={handleExpand}
               />
             ))}
           </div>
@@ -893,6 +962,8 @@ function BrowseView({
           onClose={() => setLabelTarget(null)}
         />
       )}
+
+      <MediaDetailDrawer item={drawerItem} onClose={closeDrawer} />
     </div>
   )
 }

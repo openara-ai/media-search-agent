@@ -334,6 +334,7 @@ jobs:
             logs/
             /tmp/msa-*.log
           if-no-files-found: ignore
+          retention-days: 1
 
   # ── macOS: build .pkg + .dmg installer (workflow_dispatch / pre-release) ───
   macos-installer:
@@ -359,7 +360,7 @@ jobs:
           name: MediaSearchAgent-macOS-Setup
           path: dist/macos/MediaSearchAgent-*-Setup.dmg
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 1
 
       - name: Upload build logs on failure
         if: failure()
@@ -370,3 +371,4 @@ jobs:
             build/macos/
             /tmp/msa-*.log
           if-no-files-found: ignore
+          retention-days: 1

@@ -246,4 +246,4 @@ jobs:
         with:
           name: macos-shell-installer-logs
           path: /tmp/msa-install-log/
-          retention-days: 7
+          retention-days: 1

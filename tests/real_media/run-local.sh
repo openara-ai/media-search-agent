@@ -279,7 +279,7 @@ copy_reports() {
   [[ -n "$REPORT_DIR" ]] || return 0
   mkdir -p "$REPORT_COPY_DIR"
   cp -f "$ARTIFACTS_DIR"/summary.md "$REPORT_COPY_DIR"/
-  for log_file in indexer.log api.log pytest-fast.log pytest-runtime.log pytest-slow.log; do
+  for log_file in indexer.log api.log pytest-fast.log pytest-runtime.log pytest-slow.log pytest-lifecycle.log; do
     if [[ -f "$ARTIFACTS_DIR/$log_file" ]]; then
       cp -f "$ARTIFACTS_DIR/$log_file" "$REPORT_COPY_DIR"/
     fi
@@ -655,10 +655,34 @@ if [[ $SKIP_SLOW_MODEL_CHECKS -eq 0 ]]; then
     export MSA_CONFIG_PATH PYTHONPATH="$WORKSPACE_PYTHONPATH" HF_HUB_OFFLINE
     exec bash scripts/dev-cli.sh pytest tests/real_media/test_real_media_fixtures.py -v -m "slow"
   ) >"$ARTIFACTS_DIR/pytest-slow.log" 2>&1; then
-    SLOW_STATUS="PASSED"
+    :  # success; SLOW_STATUS is set to PASSED below only if the lifecycle
+       # block also succeeds.
   else
     phase_fail slow "Slow model-backed checks failed. See $ARTIFACTS_DIR/pytest-slow.log"
   fi
+
+  # Indexer lifecycle stress tests — these spawn the real msa binary in
+  # their own isolated tmp_path workspaces, so they don't touch the
+  # indexed state from the steps above. They cover:
+  #   • cooperative-stop end-to-end (PID published, msa index stop drives
+  #     a clean rc=0 exit, no forrtl: error)
+  #   • Qdrant export ran during the cooperative-stop finalisation
+  #   • non-cooperative kill (SIGKILL/TerminateProcess) recovers on
+  #     subsequent msa index run
+  # See internal/docs/testing/INDEXER_LIFECYCLE_STRESS.md.
+  log "Running indexer lifecycle stress tests"
+  if (
+    cd "$WORKSPACE_PATH"
+    export MSA_CONFIG_PATH PYTHONPATH="$WORKSPACE_PYTHONPATH" HF_HUB_OFFLINE
+    exec bash scripts/dev-cli.sh pytest tests/test_cmd_index_stop.py -v -m "slow"
+  ) >"$ARTIFACTS_DIR/pytest-lifecycle.log" 2>&1; then
+    :  # success
+  else
+    phase_fail slow "Lifecycle stress tests failed. See $ARTIFACTS_DIR/pytest-lifecycle.log"
+  fi
+
+  # Mark slow phase passed only if neither block called phase_fail above.
+  [[ "$SLOW_STATUS" == "RUNNING" ]] && SLOW_STATUS="PASSED"
 else
   SLOW_STATUS="SKIPPED"
 fi

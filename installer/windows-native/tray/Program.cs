@@ -15,6 +15,7 @@
 using System.Diagnostics;
 using System.Net.Http;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 internal static class Program
@@ -192,10 +193,20 @@ internal sealed class TrayApp : ApplicationContext
 
         _tray = new NotifyIcon
         {
-            Icon             = LoadIcon(),
-            Text             = "Media Search Agent",
-            Visible          = true,
-            ContextMenuStrip = menu
+            Icon    = LoadIcon(),
+            Text    = "Media Search Agent",
+            Visible = true,
+        };
+
+        // Drive the context menu manually instead of assigning ContextMenuStrip.
+        // The auto-show path relies on internal foreground-window activation that
+        // fails under RDP/mstsc — the menu pops and is dismissed on the same
+        // frame. SetForegroundWindow on the menu's own handle fixes it.
+        _tray.MouseUp += (_, e) =>
+        {
+            if (e.Button != MouseButtons.Right) return;
+            SetForegroundWindow(menu.Handle);
+            menu.Show(Cursor.Position);
         };
 
         _pollTimer = new System.Windows.Forms.Timer { Interval = PollIntervalMs };
@@ -486,6 +497,10 @@ internal sealed class TrayApp : ApplicationContext
 
     private static void OpenUrl(string target) =>
         Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
 
     // ── Icon + version ────────────────────────────────────────────────────────
 

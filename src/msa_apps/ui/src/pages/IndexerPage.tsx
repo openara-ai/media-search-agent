@@ -89,7 +89,7 @@ export function IndexerPage() {
     const prev = prevStatusRef.current
     const curr = statusInfo?.status ?? null
     if (prev === 'running' && curr !== 'running') {
-      if (curr === 'complete') refetchStats()
+      if (curr === 'complete' || curr === 'stopped') refetchStats()
       startMutation.reset()
     }
     prevStatusRef.current = curr
@@ -164,6 +164,7 @@ export function IndexerPage() {
               status === 'idle'     && 'bg-zinc-400 dark:bg-zinc-500',
               status === 'running'  && 'bg-green-500 animate-pulse',
               status === 'complete' && 'bg-indigo-500 dark:bg-indigo-400',
+              status === 'stopped'  && 'bg-amber-500 dark:bg-amber-400',
               status === 'error'    && 'bg-red-500 dark:bg-red-400',
             )} />
             <div>
@@ -171,6 +172,7 @@ export function IndexerPage() {
                 {status === 'idle'     && 'Ready'}
                 {status === 'running'  && 'Running…'}
                 {status === 'complete' && 'Complete'}
+                {status === 'stopped'  && 'Stopped'}
                 {status === 'error'    && 'Error'}
               </div>
               {elapsed != null && (
@@ -325,6 +327,11 @@ export function IndexerPage() {
         {/* Start error (e.g. 409 already running) */}
         {startMutation.error && (
           <div className="text-xs text-red-500 dark:text-red-400">{String(startMutation.error)}</div>
+        )}
+
+        {/* Stop error (e.g. sentinel write failed on Windows — indexer was not asked to stop) */}
+        {stopMutation.error && (
+          <div className="text-xs text-red-500 dark:text-red-400">{String(stopMutation.error)}</div>
         )}
       </div>
 
