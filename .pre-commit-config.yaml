@@ -15,3 +15,10 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+
+      - id: check-ps1-ascii
+        name: .ps1 files must be ASCII + LF (PowerShell 5.1 compatibility)
+        entry: python scripts/check_ps1_ascii.py
+        language: system
+        files: \.ps1$
+        pass_filenames: true
