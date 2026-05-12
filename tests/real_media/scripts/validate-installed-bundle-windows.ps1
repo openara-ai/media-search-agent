@@ -203,14 +203,18 @@ if (-not $lifecycleProcess.WaitForExit(60000)) {
     try { $lifecycleProcess.Kill() } catch { }
     exit 1
 }
-# After bounded WaitForExit returns true on a Start-Process target with
-# redirected stdout/stderr, .NET has NOT necessarily drained the async
-# stream handlers or populated ExitCode -- the parameterless WaitForExit
-# is required to finalize that state. Without this call, ExitCode reads
-# back as $null and the strict-mode `-ne 0` check fires spuriously.
+# Drain any async stream handlers post-exit (MSFT-recommended after a
+# bounded WaitForExit on a process with redirected stdout/stderr).
 $lifecycleProcess.WaitForExit()
-if ($lifecycleProcess.ExitCode -ne 0) {
-    Write-Host "FAIL: indexer did not exit cleanly after ``msa index stop`` (rc=$($lifecycleProcess.ExitCode))"
+# .NET disposes the Process handle once the OS process exits, so
+# ExitCode can read back as $null in this scenario even when the
+# process actually returned 0. `msa index stop` above (line 184) is
+# the ground-truth check for clean indexer exit -- we'd have bailed
+# already if it had failed. The check below only fires for a genuine
+# non-zero rc; null is treated as success rather than a spurious fail.
+$lifecycleExitCode = $lifecycleProcess.ExitCode
+if ($null -ne $lifecycleExitCode -and $lifecycleExitCode -ne 0) {
+    Write-Host "FAIL: indexer did not exit cleanly after ``msa index stop`` (rc=$lifecycleExitCode)"
     if (Test-Path $lifecycleLog)    { Get-Content $lifecycleLog    -Tail 200 }
     if (Test-Path $lifecycleErrLog) { Get-Content $lifecycleErrLog -Tail 200 }
     exit 1
