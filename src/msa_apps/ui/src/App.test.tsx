@@ -8,10 +8,12 @@ vi.mock('./hooks/useSetupWS', () => ({
   useSetupWS: vi.fn(() => ({ models: null, complete: false })),
 }))
 
+// Label format mirrors the backend's MODEL_META in setup_models.py:
+// purpose-first, technical name in parens.
 const INITIAL_MODELS = [
-  { id: 'clip',        label: 'CLIP ViT-L-14',        size_mb: 850, present: false, integrity_hint: 'sha256:9ce2e8a8ebff' },
-  { id: 'rtdetr',     label: 'RT-DETR r18vd',         size_mb: 81,  present: false, integrity_hint: 'rev:ac77a11ff017' },
-  { id: 'insightface', label: 'InsightFace buffalo_l', size_mb: 500, present: false, integrity_hint: 'sha256:5838f7fe0536' },
+  { id: 'clip',            label: 'Semantic search model (CLIP ViT-L-14)',    size_mb: 850, present: false, integrity_hint: 'sha256:9ce2e8a8ebff', source: 'huggingface.co/timm/vit_large_patch14_clip_224.openai' },
+  { id: 'rtdetr',          label: 'Object detection model (RT-DETR r18vd)',   size_mb: 81,  present: false, integrity_hint: 'rev:ac77a11ff017',  source: 'huggingface.co/PekingU/rtdetr_r18vd' },
+  { id: 'facenet_pytorch', label: 'Face detection model (facenet-pytorch)',   size_mb: 108, present: false, integrity_hint: '',                  source: 'github.com/timesler/facenet-pytorch' },
 ]
 
 describe('App launch flow', () => {

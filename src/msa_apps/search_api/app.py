@@ -2053,6 +2053,8 @@ def get_setup_status(request: Request):
 
         SHA-256-verified models: 'sha256:<first 12 chars>'
         Revision-pinned models:  'rev:<first 12 chars>'
+        Torch-hub-verified models: 'torch-hub'
+        Otherwise: '' (UI must skip rendering — see SetupPage.tsx)
         """
         if "sha256" in meta:
             h = meta["sha256"]
@@ -2062,6 +2064,12 @@ def get_setup_status(request: Request):
             return "sha256:" + h[:12]
         if "revision" in meta:
             return "rev:" + meta["revision"][:12]
+        # Models verified by torch.hub's own integrity check (no separate
+        # sha256/revision maintained here) — currently facenet-pytorch.
+        # Surface the provenance so the UI doesn't render a lone ellipsis
+        # next to the "Verified" status line.
+        if meta.get("source", "").startswith("github.com/"):
+            return "torch-hub"
         return ""
 
     models_out = [
@@ -2071,6 +2079,7 @@ def get_setup_status(request: Request):
             "size_mb":        meta["size_mb"],
             "present":        present[mid],
             "integrity_hint": _integrity_hint(meta),
+            "source":         meta.get("source", ""),
         }
         for mid, meta in _setup_models.MODEL_META.items()
     ]

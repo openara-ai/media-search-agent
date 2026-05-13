@@ -41,25 +41,35 @@ RTDETR_DEFAULT_REVISION = "ac77a11ff0170a41b771c03264987f8ce2b0d753"
 
 MODEL_META = {
     "clip": {
-        "label":   "CLIP ViT-L-14",
+        # User-facing label: lead with the purpose ("Semantic search"), keep
+        # the technical name in parens for diagnosis. Same pattern for the
+        # other two below. Bare technical names like "CLIP ViT-L-14" were
+        # opaque to non-ML users seeing the first-launch download page.
+        "label":   "Semantic search model (CLIP ViT-L-14)",
         "size_mb": 850,
         # SHA-256 of open_clip_model.safetensors (timm/vit_large_patch14_clip_224.openai)
         "sha256":  "9ce2e8a8ebfff3793d7d375ad6d3c35cb9aebf3de7ace0fc7308accab7cd207e",
+        # Download origin surfaced to the UI as a trust signal. Format is
+        # "<host>/<org>/<repo>" with no scheme — short enough to fit a row,
+        # specific enough to verify against the actual network traffic.
+        "source":  "huggingface.co/timm/vit_large_patch14_clip_224.openai",
     },
     "rtdetr": {
-        "label":    "RT-DETR r18vd",
+        "label":    "Object detection model (RT-DETR r18vd)",
         "size_mb":  81,
         # No sha256 — integrity guaranteed by HuggingFace hub blob-level verification.
         # Revision pinned via RTDETR_DEFAULT_REVISION for reproducible installs.
         "revision": RTDETR_DEFAULT_REVISION,
+        "source":   "huggingface.co/PekingU/rtdetr_r18vd",
     },
     "facenet_pytorch": {
-        "label":   "facenet-pytorch VGGFace2",
+        "label":   "Face detection model (facenet-pytorch)",
         "size_mb": 108,
         # Weights downloaded by torch hub; no separate hash maintained here.
         # MTCNN weights (~1 MB) are bundled in the facenet-pytorch package itself.
         # InceptionResnetV1 VGGFace2 weights (~107 MB) are fetched from the
         # timesler/facenet-pytorch GitHub release assets by torch hub on first use.
+        "source":  "github.com/timesler/facenet-pytorch",
     },
 }
 
@@ -314,6 +324,24 @@ class SetupManager:
         else:
             self._set("facenet_pytorch", "downloading")
             try:
+                # facenet-pytorch downloads VGGFace2 weights through torch.hub,
+                # which calls urllib.request.urlopen() directly. urllib on Windows
+                # doesn't read the Windows certificate store and doesn't load
+                # certifi unless SSL_CERT_FILE is set, so fresh VMs fail with
+                # "[SSL: CERTIFICATE_VERIFY_FAILED] unable to get local issuer
+                # certificate". truststore bridges Python's stdlib SSL to the OS
+                # trust store (Schannel on Windows, Security framework on macOS,
+                # OpenSSL defaults on Linux). The other two model downloads
+                # (CLIP, RT-DETR) go through huggingface_hub/requests/certifi and
+                # aren't affected.
+                try:
+                    import truststore  # type: ignore[import]
+                    truststore.inject_into_ssl()
+                except Exception as ts_exc:
+                    logger.warning(
+                        "setup_models: truststore.inject_into_ssl() failed — {}; "
+                        "torch.hub may fail with SSL errors on Windows VMs", ts_exc,
+                    )
                 import torch  # type: ignore[import]
                 # Redirect torch hub to models_dir so weights stay under the
                 # application data directory rather than ~/.cache/torch/hub/.

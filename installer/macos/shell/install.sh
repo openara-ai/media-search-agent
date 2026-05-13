@@ -95,6 +95,10 @@ detect_install_mode() {
 }
 
 setup_logging() {
+  # Set up the tee-to-logfile only; do NOT print anything here. The visible
+  # log/mode/markers/reason lines are printed by print_banner *after* the
+  # banner header so the user's first console line is the installer title,
+  # not implementation chatter.
   local mode="$1"
   local timestamp
   timestamp="$(date '+%Y-%m-%d_%H%M%S')"
@@ -106,11 +110,6 @@ setup_logging() {
   # repair runs are diagnosable after the terminal session is gone. Strip ANSI
   # escapes from the file copy so the saved log stays readable in plain editors.
   exec > >(tee >(sed -E $'s/\x1B\\[[0-9;]*[[:alpha:]]//g' >> "$INSTALL_LOG_FILE")) 2>&1
-
-  log_info "Log: $INSTALL_LOG_FILE"
-  log_info "Mode: $mode"
-  log_info "Mode markers: ${INSTALL_MODE_MARKERS:-none}"
-  log_info "Mode reason: ${INSTALL_MODE_REASON:-unknown}"
 }
 
 # ── Usage ─────────────────────────────────────────────────────────────────────
@@ -139,6 +138,9 @@ ${BOLD}Options${NC}
                            Also settable via env: MSA_DIR=/path
 
       --skip-autostart     Skip LaunchAgent (macOS) / systemd service (Linux) registration
+
+      --allow-downgrade    Allow installing an older version over a newer one
+                           (default: refuse — downgrades can corrupt the index)
 
       --no-color           Disable colour output
                            Also settable via env: NO_COLOR=1
@@ -176,6 +178,7 @@ OPT_VERSION="${MSA_VERSION:-}"
 OPT_BUNDLE=""
 OPT_DIR="${MSA_DIR:-}"
 OPT_SKIP_AUTOSTART=""
+OPT_ALLOW_DOWNGRADE=""
 
 parse_args() {
   while [[ $# -gt 0 ]]; do
@@ -188,6 +191,7 @@ parse_args() {
       --dir)                OPT_DIR="${2:?'--dir requires a path'}"; shift 2 ;;
       --dir=*)              OPT_DIR="${1#*=}"; shift ;;
       --skip-autostart)     OPT_SKIP_AUTOSTART=1; shift ;;
+      --allow-downgrade)    OPT_ALLOW_DOWNGRADE=1; shift ;;
       --no-color)           NO_COLOR=1; _disable_colors; shift ;;
       *) die "Unknown argument: $1  (run with --help for usage)" ;;
     esac
@@ -212,18 +216,77 @@ detect_arch() {
   esac
 }
 
+# OS version floor + disk space + RAM. Called once from main() after OS and
+# arch have been resolved. macOS gets a hard OS-version floor; disk space is
+# fatal on both; RAM is best-effort warning only.
+check_system_requirements() {
+  # macOS 12 (Monterey) is the floor - first version with reliable arm64
+  # Python wheels for our stack. Linux is skipped: glibc 2.28+ is required
+  # by torch wheels, but every distro from 2019+ satisfies this and checking
+  # glibc reliably across distros is more code than it's worth.
+  if [[ "$OS" == "macos" ]]; then
+    local mac_ver mac_major
+    mac_ver="$(sw_vers -productVersion 2>/dev/null || echo 0)"
+    mac_major="${mac_ver%%.*}"
+    if [[ "${mac_major:-0}" -lt 12 ]]; then
+      die "macOS 12 (Monterey) or newer required. Detected: $mac_ver"
+    fi
+  fi
+
+  # Free disk: bundle + venv + torch wheels + scratch. 5 GB is the
+  # comfortable floor; under that, pip can fail mid-resolve with cryptic
+  # disk errors.
+  local target="$APP_CODE_DIR"
+  [[ ! -d "$target" ]] && target="$(dirname "$target")"
+  [[ ! -d "$target" ]] && target="$HOME"
+  local free_kb free_gb
+  free_kb="$(df -k "$target" 2>/dev/null | awk 'NR==2 {print $4}')"
+  if [[ -n "$free_kb" && "$free_kb" =~ ^[0-9]+$ ]]; then
+    free_gb=$(( free_kb / 1024 / 1024 ))
+    if [[ "$free_gb" -lt 5 ]]; then
+      die "Need at least 5 GB free at $target for the install. Available: ${free_gb} GB."
+    fi
+  fi
+
+  # RAM warning - small libraries index fine on less, so we don't block.
+  local ram_gb=0
+  if [[ "$OS" == "macos" ]]; then
+    local ram_bytes
+    ram_bytes="$(sysctl -n hw.memsize 2>/dev/null || echo 0)"
+    [[ "$ram_bytes" =~ ^[0-9]+$ ]] && ram_gb=$(( ram_bytes / 1024 / 1024 / 1024 ))
+  elif [[ -r /proc/meminfo ]]; then
+    local ram_kb
+    ram_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    [[ "$ram_kb" =~ ^[0-9]+$ ]] && ram_gb=$(( ram_kb / 1024 / 1024 ))
+  fi
+  if [[ "$ram_gb" -gt 0 && "$ram_gb" -lt 8 ]]; then
+    log_warn "Only ${ram_gb} GB RAM detected. 8+ GB recommended; indexing large libraries (10k+ items) may OOM."
+  fi
+}
+
 # ── Banner ────────────────────────────────────────────────────────────────────
 
 print_banner() {
+  # The banner header must be the very first thing the user sees; install
+  # log path + mode/markers/reason follow as part of the context block so
+  # they look like context for the install, not preamble before the
+  # installer announces itself.
   printf "\n${BOLD}  Media Search Agent Installer${NC}\n"
   printf "${DIM}  Local-first semantic search for your photos and videos${NC}\n\n"
-  log_info "OS:   $OS / $ARCH"
+  log_info "OS:    $OS / $ARCH"
   if [[ "$OS" == "macos" ]]; then
-    log_info "App:  $APP_BUNDLE"
+    log_info "App:   $APP_BUNDLE"
   else
-    log_info "Code: $APP_CODE_DIR"
+    log_info "Code:  $APP_CODE_DIR"
   fi
-  log_info "Data: $APP_SUPPORT_DIR"
+  log_info "Data:  $APP_SUPPORT_DIR"
+  log_info "Scope: current user only (other accounts on this machine need their own install)"
+  if [[ -n "${INSTALL_LOG_FILE:-}" ]]; then
+    log_info "Log:     $INSTALL_LOG_FILE"
+    log_info "Mode:    ${INSTALL_MODE:-unknown}"
+    log_info "Markers: ${INSTALL_MODE_MARKERS:-none}"
+    log_info "Reason:  ${INSTALL_MODE_REASON:-unknown}"
+  fi
 }
 
 # ── Download helper ───────────────────────────────────────────────────────────
@@ -241,6 +304,97 @@ download() {
   else
     die "curl or wget is required"
   fi
+}
+
+# Verify the downloaded bundle against SHA256SUMS.txt published alongside the
+# release. Closes the obvious supply-chain hole on an unsigned installer: a
+# hijacked / MITM'd / corrupted bundle now fails before tar -xzf instead of
+# getting installed and run.
+#
+# Skipped for local --bundle installs (caller handles trust). If
+# SHA256SUMS.txt is missing from the release (older releases predate this
+# file), warn rather than fail so existing releases still install.
+verify_bundle_sha256() {
+  local bundle_file="$1"
+  local bundle_name="$2"
+  local release_base_url="$3"
+
+  local sums_url="${release_base_url}/SHA256SUMS.txt"
+  local sums_file; sums_file="$(mktemp)"
+
+  # Fetch SHA256SUMS.txt directly with curl/wget rather than going through
+  # download() because download() dies on 404. Older releases predate
+  # SHA256SUMS.txt and we want to warn-and-continue on that specific case.
+  #
+  # IMPORTANT: distinguish "HTTP 404" (the legacy-release fallback path)
+  # from any other failure (transient TLS / proxy / 5xx / connection
+  # reset). Treating every fetch failure as "release predates checksums"
+  # silently bypasses the supply-chain guard whenever the network has a
+  # bad moment - exactly the failure mode this verification was added to
+  # prevent. The legacy fallback warns and proceeds; everything else
+  # hard-fails so the user can retry / use --bundle instead.
+  local sums_http="000"
+  if command -v curl &>/dev/null; then
+    sums_http="$(curl -sSL --proto '=https' --tlsv1.2 --retry 2 \
+      --write-out '%{http_code}' --output "$sums_file" "$sums_url" 2>/dev/null || echo "000")"
+  elif command -v wget &>/dev/null; then
+    # wget is the fallback when curl isn't available. --server-response
+    # writes status lines to stderr; parse the last 3-digit code seen.
+    local wget_err
+    wget_err="$(wget -q --https-only --tries=2 --server-response \
+      -O "$sums_file" "$sums_url" 2>&1 || true)"
+    sums_http="$(printf '%s\n' "$wget_err" \
+      | awk '/HTTP\/[0-9.]+[[:space:]]+[0-9]{3}/ {code=$2} END {print code+0}')"
+    [[ -z "$sums_http" || "$sums_http" == "0" ]] && sums_http="000"
+  else
+    rm -f "$sums_file"
+    log_warn "Neither curl nor wget found - skipping integrity check."
+    return
+  fi
+
+  if [[ "$sums_http" == "404" ]]; then
+    rm -f "$sums_file"
+    log_warn "SHA256SUMS.txt not found (HTTP 404) at $sums_url - skipping integrity check. The release may predate signed checksums."
+    return
+  fi
+  if [[ "$sums_http" != "200" ]]; then
+    rm -f "$sums_file"
+    die "Could not fetch SHA256SUMS.txt from $sums_url (HTTP $sums_http). Refusing to install an unverified bundle - retry once the network is healthy, or pass --bundle <local-path> to install a copy you've verified yourself."
+  fi
+
+  # SHA256SUMS.txt format is `<hash>  <filename>` (two spaces between).
+  # Files may be prefixed with `*` (shasum -b) or `./` - strip both.
+  local expected
+  expected="$(awk -v name="$bundle_name" '
+    /^[[:space:]]*$/ || /^#/ { next }
+    {
+      hash=$1
+      sub(/^[*\.\/]+/, "", $2)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+      if ($2 == name) { print tolower(hash); exit }
+    }
+  ' "$sums_file")"
+  rm -f "$sums_file"
+
+  if [[ -z "$expected" ]]; then
+    log_warn "$bundle_name not listed in SHA256SUMS.txt - skipping integrity check."
+    return
+  fi
+
+  local actual
+  if command -v shasum &>/dev/null; then
+    actual="$(shasum -a 256 "$bundle_file" | awk '{print tolower($1)}')"
+  elif command -v sha256sum &>/dev/null; then
+    actual="$(sha256sum "$bundle_file" | awk '{print tolower($1)}')"
+  else
+    log_warn "Neither shasum nor sha256sum found - skipping integrity check."
+    return
+  fi
+
+  if [[ "$actual" != "$expected" ]]; then
+    die "Bundle SHA256 mismatch for ${bundle_name}: expected $expected, got $actual. The download may be corrupted or tampered with - aborting before extract."
+  fi
+  log_ok "Bundle SHA256 verified (${expected:0:12}...)"
 }
 
 # ── Version resolution ────────────────────────────────────────────────────────
@@ -263,6 +417,80 @@ resolve_version() {
   echo "$version"
 }
 
+# Portable version comparator. Returns 0 (true) iff $1 < $2 in dotted-numeric
+# semver order, 1 otherwise. Both args must be the output of parse_msa_version
+# (already stripped of `v` prefix and pre-release suffix).
+#
+# This used to be `sort -V | head -1` which works on macOS 12+ and Linux with
+# GNU coreutils but isn't reliably available on older BSDs / minimal Linux
+# containers. Replacing it with a pure-bash comparator removes the dependency
+# entirely - safer under `set -euo pipefail`.
+version_lt() {
+  [[ "$1" == "$2" ]] && return 1
+  local i x y
+  local -a a b
+  IFS='.' read -ra a <<<"$1"
+  IFS='.' read -ra b <<<"$2"
+  for ((i=0; i<${#a[@]} || i<${#b[@]}; i++)); do
+    x=${a[i]:-0}
+    y=${b[i]:-0}
+    # Guard against non-numeric components (would crash arithmetic compare)
+    # by treating them as 0. parse_msa_version should produce pure numerics
+    # but defence in depth costs nothing here.
+    [[ "$x" =~ ^[0-9]+$ ]] || x=0
+    [[ "$y" =~ ^[0-9]+$ ]] || y=0
+    (( x < y )) && return 0
+    (( x > y )) && return 1
+  done
+  return 1
+}
+
+# Strip the `v` prefix and any `-prerelease` suffix from a tag, returning just
+# the numeric `X.Y.Z` portion. Used for the downgrade guard - pre-release
+# differences (e.g. v0.7.3-test6 vs v0.7.3-test7) intentionally compare equal
+# because the schema risk lives in the X.Y.Z portion.
+parse_msa_version() {
+  local tag="${1#v}"
+  echo "${tag%%-*}"
+}
+
+# Refuse to install an older version on top of a newer one unless the user
+# passed --allow-downgrade. Silent no-op for fresh installs and for legacy
+# installs where the version file is missing.
+check_version_downgrade() {
+  local new_tag="$1"
+  local version_file="$2"
+
+  # Local-bundle installs don't reliably know their version; skip.
+  [[ "$new_tag" == "(local bundle)" ]] && return 0
+  [[ -f "$version_file" ]] || return 0
+
+  local existing_tag
+  existing_tag="$(head -1 "$version_file" 2>/dev/null | tr -d '[:space:]' || true)"
+  [[ -n "$existing_tag" ]] || return 0
+
+  local new_num existing_num
+  new_num="$(parse_msa_version "$new_tag")"
+  existing_num="$(parse_msa_version "$existing_tag")"
+  if [[ -z "$new_num" || -z "$existing_num" ]]; then
+    log_warn "Could not parse versions (new=$new_tag, existing=$existing_tag); skipping downgrade check"
+    return 0
+  fi
+
+  # Pure-bash dotted-numeric comparison via version_lt; avoids the sort -V
+  # dependency that isn't portable to minimal BSDs / older macOS / stripped
+  # Linux containers.
+  if version_lt "$new_num" "$existing_num"; then
+    if [[ -n "$OPT_ALLOW_DOWNGRADE" ]]; then
+      log_warn "Downgrading from $existing_tag to $new_tag (forced by --allow-downgrade)"
+    else
+      die "Refusing to downgrade from $existing_tag to $new_tag. Re-run with --allow-downgrade to force. Downgrades can corrupt index/media.sqlite if the schema moved forward between versions."
+    fi
+  elif version_lt "$existing_num" "$new_num"; then
+    log_info "Upgrading from $existing_tag to $new_tag"
+  fi
+}
+
 # ── Bundle download + extract ─────────────────────────────────────────────────
 
 install_bundle() {
@@ -274,11 +502,14 @@ install_bundle() {
     [[ -f "$OPT_BUNDLE" ]] || die "Bundle file not found: $OPT_BUNDLE"
     bundle_archive="$OPT_BUNDLE"
     log_info "Using local bundle: $OPT_BUNDLE"
+    # Local --bundle path: skip SHA256 verification. Caller is trusted.
   else
     local bundle_name="MediaSearchAgent-${version#v}-${OS}-${ARCH}"
-    local bundle_url="https://github.com/${GITHUB_REPO}/releases/download/${version}/${bundle_name}.tar.gz"
+    local bundle_base="https://github.com/${GITHUB_REPO}/releases/download/${version}"
+    local bundle_url="${bundle_base}/${bundle_name}.tar.gz"
     download "$bundle_url" "$tmp/bundle.tar.gz" "bundle $version ($OS-$ARCH)"
     bundle_archive="$tmp/bundle.tar.gz"
+    verify_bundle_sha256 "$bundle_archive" "${bundle_name}.tar.gz" "$bundle_base"
   fi
 
   log_info "Extracting bundle..."
@@ -466,14 +697,82 @@ should_launch_app_after_install() {
   return 0
 }
 
-print_post_install_message() {
-  if should_launch_app_after_install; then
-    printf "  ${BOLD}Launching…${NC}\n"
-    printf "  ${DIM}Look for the search icon in your menu bar.${NC}\n"
-    printf "  ${DIM}The app will start the service and open the browser automatically.${NC}\n\n"
-  else
-    printf "  ${DIM}Launch the app from %s when you're ready.${NC}\n\n" "$APP_BUNDLE"
-  fi
+# Parse the API port from config.yaml (best-effort; defaults to 8000 if
+# the config doesn't exist yet or doesn't declare a port). Mirrors the
+# same parser used by Stop-RunningServices on the Windows side.
+get_configured_api_port() {
+  local default_port=8000
+  [[ -f "$CONFIG_PATH" ]] || { echo "$default_port"; return; }
+  # IMPORTANT: this awk runs on whatever `awk` ships on the host. macOS
+  # default is BSD awk, which (per POSIX) treats `\b` inside a regex as
+  # the backspace character, NOT a word-boundary. The previous pattern
+  # `\bapi[[:space:]]*:...` therefore never matched a real `api:` line
+  # on macOS and the function always returned the 8000 default, which
+  # made wait_for_api_ready poll the wrong port whenever a user had
+  # customised api.port in config.yaml. Anchored `^[[:space:]]*api...`
+  # is POSIX-clean and matches both top-level and nested stanza headers.
+  awk -v def="$default_port" '
+    BEGIN { in_api = 0 }
+    /^[[:space:]]*api[[:space:]]*:[[:space:]]*$/ { in_api = 1; next }
+    in_api && /^[^[:space:]]/ { exit }
+    in_api && /^[[:space:]]*port[[:space:]]*:[[:space:]]*[0-9]+/ {
+      sub(/^[[:space:]]*port[[:space:]]*:[[:space:]]*/, "")
+      print $1; exit
+    }
+    END { if (NR == 0) print def }
+  ' "$CONFIG_PATH" 2>/dev/null | grep -E '^[0-9]+$' || echo "$default_port"
+}
+
+# Bridge the gap between "the .app process is running" (pgrep success)
+# and "the browser tab is open" (Swift launcher's own /health poll). On
+# a fresh first launch the API can take 10-30 s to bind the port, and
+# the installer used to exit during that wait - leaving the user staring
+# at a returned shell prompt with no idea what's happening. Two-stage
+# end output: "installed" success line, then "Starting the app..." with
+# live dots until /health responds, then "started" success line. The
+# .app's own /health poll fires in parallel; by the time we see ready,
+# the browser is opening within a second or two.
+wait_for_api_ready() {
+  local timeout="${1:-90}"
+  local port
+  port="$(get_configured_api_port)"
+  local start_ts; start_ts="$(date +%s)"
+  printf "  ${DIM}Starting the app${NC}"
+  # Probe 127.0.0.1 explicitly rather than `localhost` for parity with
+  # the Windows installer (PS 5.1's Invoke-WebRequest resolves
+  # `localhost` to ::1 first and waits for IPv6 to time out before
+  # falling back to IPv4). curl on macOS is normally robust here, but
+  # using 127.0.0.1 across both platforms removes one DNS / dual-stack
+  # variable and makes the poll behaviour identical. --max-time 3
+  # gives breathing room over the previous 1 s, which was tight when
+  # the API is still binding the port.
+  #
+  # Track WALL-CLOCK elapsed time, not iteration count. Each iteration
+  # blocks for up to `curl --max-time 3` plus `sleep 1`, so an
+  # iteration-counted timeout of 90 could spend ~360 s on a failure
+  # path - and the warning saying "didn't respond within ${timeout}s"
+  # would be wildly misleading. date(1) is POSIX and cheap.
+  while [[ $(( $(date +%s) - start_ts )) -lt $timeout ]]; do
+    if curl -fsS --max-time 3 "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
+      printf "\n\n${GREEN}${BOLD}  ✓ Media Search Agent started!${NC}\n"
+      printf "  ${DIM}Your browser will open at http://localhost:${port}${NC}\n\n"
+      # Give the .app's parallel /health poll ~2s to fire and open the
+      # browser tab before this installer exits. Without this pause the
+      # shell prompt can return BEFORE the browser opens (because the
+      # installer's poll won the race by a fraction of a second), and
+      # the user sees "✓ Started!" → prompt → confusing silence → tab.
+      # 2s is empirically enough on every Mac we've tested; if the .app
+      # is slower, the tab still opens shortly afterward - the sleep
+      # just trades a deterministic 2s for the perceived discontinuity.
+      sleep 2
+      return 0
+    fi
+    printf "."
+    sleep 1
+  done
+  printf "\n"
+  log_warn "API didn't respond on http://localhost:${port}/health within ${timeout}s. Check the menu bar app and the launcher log under $LOG_DIR/launch-*.log."
+  return 1
 }
 
 install_packages() {
@@ -682,6 +981,15 @@ main() {
   ARCH="$(detect_arch)"
 
   if [[ "$OS" == "macos" && "$ARCH" == "x86_64" ]]; then
+    # Distinguish "real Intel Mac" from "Apple Silicon running under Rosetta".
+    # uname -m reports x86_64 in both cases, so without this branch an M-series
+    # user who happens to launch the installer from an x86_64-translated shell
+    # gets the wrong error.
+    if [[ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" == "1" ]]; then
+      die "Running under Rosetta (x86_64) on an Apple Silicon Mac. Re-run from a native arm64 shell, e.g.:
+       arch -arm64 bash -c \"\$(curl -fsSL https://openara.ai/install.sh)\"
+       Or open Terminal.app's Get Info and uncheck 'Open using Rosetta', then re-run."
+    fi
     die "Intel Mac (x86_64) is not yet supported. Only Apple Silicon (arm64) bundles are published.
        Check https://github.com/${GITHUB_REPO:-openara-ai/media-search-agent}/releases for updates."
   fi
@@ -720,6 +1028,9 @@ main() {
   LAUNCHER="$LAUNCHER_DIR/msa"
   PYTHON_VERSION="3.12.8"
   GITHUB_REPO="openara-ai/media-search-agent"
+  # Written at the end of a successful install; read at the top of the next
+  # install run to detect (and refuse) version downgrades.
+  VERSION_FILE="$APP_CODE_DIR/version.txt"
   BUNDLE_CONFIG_TEMPLATE=""
   INSTALL_LOG_FILE=""
   INSTALL_MODE=""
@@ -731,6 +1042,11 @@ main() {
 
   print_banner
 
+  # Pre-flight: OS version floor, free disk space, RAM warning. Runs after
+  # paths are resolved (so the disk check knows the target drive) but
+  # before any network IO so failure exits cheaply.
+  check_system_requirements
+
   local version=""
   if [[ -n "$OPT_BUNDLE" ]]; then
     version="${OPT_VERSION:-}"
@@ -738,6 +1054,13 @@ main() {
   else
     version="$(resolve_version)"
     log_info "Version: $version"
+  fi
+
+  # Downgrade guard - silent no-op for fresh installs and for legacy installs
+  # without a version file. Runs whenever an existing install is detected,
+  # whether marker state is complete (upgrade) or partial (repair).
+  if [[ ( "$INSTALL_MODE" == "upgrade" || "$INSTALL_MODE" == "repair" ) && -n "$version" ]]; then
+    check_version_downgrade "$version" "$VERSION_FILE"
   fi
 
   log_bold "[1/6] Previous install"
@@ -760,48 +1083,50 @@ main() {
   install_launch_agent
   install_systemd_service
 
-  printf "\n${GREEN}${BOLD}✓ Media Search Agent installed!${NC}\n\n"
+  # Record the installed version so the next install can guard against
+  # downgrades. Written only after all steps above succeeded - if anything
+  # failed, the previous version marker stays in place.
+  if [[ "$version" != "(local bundle)" && -n "$version" ]]; then
+    mkdir -p "$(dirname "$VERSION_FILE")"
+    echo "$version" > "$VERSION_FILE"
+  fi
 
-  if should_launch_app_after_install; then
+  # Two-stage end output:
+  #   1. "installed" success line (install steps are complete)
+  #   2. Launch the .app + poll /health with live dots ("Starting the
+  #      app........") until it responds
+  #   3. "started" success line + browser-opening hint
+  # Bridges the silent gap users used to see between install completing
+  # and the browser opening - on a fresh first launch the API can take
+  # 10-30 s to come up, during which the installer used to exit and
+  # leave a returned shell prompt with no indication of what was
+  # happening.
+  printf "\n${GREEN}${BOLD}  ✓ Media Search Agent installed!${NC}\n\n"
+
+  if [[ "$OS" == "macos" ]] && should_launch_app_after_install; then
     if ! open "$APP_BUNDLE" 2>/dev/null; then
       log_warn "Could not launch app (Gatekeeper may have blocked it). Try: open \"$APP_BUNDLE\""
     else
-      # open returns before the app process is running — wait briefly then verify
       local waited=0
       while [[ $waited -lt 10 ]]; do
         sleep 1; waited=$((waited + 1))
         pgrep -f "$APP_BUNDLE/Contents/MacOS/MediaSearchAgent" >/dev/null 2>&1 && break
       done
       if pgrep -f "$APP_BUNDLE/Contents/MacOS/MediaSearchAgent" >/dev/null 2>&1; then
-        log_ok "App launched — look for the search icon in your menu bar"
+        # The .app process is alive; poll /health for the API readiness
+        # (which is what actually triggers the browser to open). The
+        # .app's own /health poll fires in parallel; the two polls race
+        # harmlessly and the browser opens within a second or two of
+        # our "started" announcement.
+        wait_for_api_ready 90
       else
-        log_warn "App did not appear within ${waited}s after launch."
-        log_warn "Check for errors in: $LOG_DIR/launch-*.log"
-        log_warn "Or run manually: open \"$APP_BUNDLE\""
+        log_warn "App did not appear within ${waited}s; check $LOG_DIR/launch-*.log or run: open \"$APP_BUNDLE\""
       fi
     fi
+  elif [[ "$OS" != "macos" ]]; then
+    # Linux: no auto-launch; user runs `msa api start` themselves.
+    printf "  ${DIM}Start with: msa api start  →  then open http://localhost:8000${NC}\n\n"
   fi
-
-  if [[ "$OS" == "macos" ]]; then
-    print_post_install_message
-  fi
-
-  if [[ "$OS" == "macos" ]]; then
-    printf "  ${BOLD}Next steps${NC}\n"
-    printf "  ${DIM}1. Use the Media Search Agent menu bar app to open the browser and manage the service.${NC}\n"
-    printf "  ${DIM}2. Add your media folders on the Indexer page, then run the indexer.${NC}\n"
-  else
-    printf "  ${BOLD}Next steps${NC}\n"
-    printf "  ${DIM}1. Add your media folders on the Indexer page, then run the indexer.${NC}\n"
-    printf "  ${DIM}2. Or use the CLI:${NC}\n"
-    printf "     ${DIM}msa api start | stop | restart${NC}\n"
-    printf "     ${DIM}msa index run --help${NC}\n"
-    printf "     ${DIM}msa uninstall${NC}\n"
-  fi
-  printf "\n"
-  printf "  ${DIM}Config: %s${NC}\n" "$CONFIG_PATH"
-  printf "  ${DIM}Logs:   %s${NC}\n" "$LOG_DIR"
-  printf "\n"
 }
 
 main "$@"

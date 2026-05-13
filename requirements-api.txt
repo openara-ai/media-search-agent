@@ -61,6 +61,12 @@ facenet-pytorch>=2.6.0
 requests
 torchvision
 tqdm
+# truststore bridges Python's stdlib SSL (used by torch.hub for the
+# facenet-pytorch VGGFace2 download) to the OS trust store. Without it,
+# fresh Windows VMs fail the facenet download with CERTIFICATE_VERIFY_FAILED
+# because urllib doesn't read the Windows certificate store and doesn't
+# load certifi by default. See src/msa_apps/search_api/setup_models.py.
+truststore
 
 # Object detection — RT-DETR backend (Apache-2.0, default)
 transformers>=4.42.0

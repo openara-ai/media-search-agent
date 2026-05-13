@@ -144,11 +144,26 @@ export function SetupPage({ initialModels, onComplete }: Props) {
                   ) : (
                     <p className={`mt-0.5 text-xs ${statusColor(model.status)}`}>
                       {statusLabel(model.status)}
-                      {model.status === 'done' && (
+                      {/* integrity_hint is optional - some models (facenet-pytorch
+                          historically, any future model verified by its loader's
+                          own hash check) return an empty string. Render the
+                          ellipsis suffix only when there's actual content,
+                          otherwise the "Verified" line shows a lone "…". */}
+                      {model.status === 'done' && model.integrity_hint && (
                         <span className="ml-1.5 font-mono text-[10px] text-emerald-600/70">
                           {model.integrity_hint}…
                         </span>
                       )}
+                    </p>
+                  )}
+                  {/* Source line — trust signal so users can see where bytes
+                      are coming from (huggingface.co, github.com) before they
+                      arrive. Hidden once the model is done (the integrity
+                      hint on the status line is the relevant artifact then)
+                      and on error (the error message takes priority). */}
+                  {model.source && model.status !== 'done' && !model.error && (
+                    <p className="mt-0.5 truncate font-mono text-[10px] text-slate-500" title={model.source}>
+                      from {model.source}
                     </p>
                   )}
                 </div>
@@ -164,15 +179,41 @@ export function SetupPage({ initialModels, onComplete }: Props) {
             </p>
           </div>
 
-          {/* Retry button — shown only when all downloads are settled and some failed */}
+          {/* Retry + Continue buttons — shown only when all downloads are settled and some failed.
+              Continue lets the user reach the main app even with failed models; affected features
+              (e.g. face recognition when facenet-pytorch fails) will be unavailable, but the rest
+              of the app (search, browse, object detection) still works. Without this escape hatch
+              the setup screen is a dead end on networks where one model host is unreachable
+              (e.g. GitHub release assets blocked by a proxy).
+
+              KNOWN LIMITATIONS — tracked in https://github.com/kumraj/media-search-agent/issues/131:
+                (a) the dismissal is in-memory only; reloading the page re-traps the user on this
+                    setup screen because /api/setup/status still returns ready: false.
+                (b) the helper text below says "retry from Settings later", but the Settings page
+                    has no setup-retry control today. The follow-up issue plans a persisted skip
+                    flag (localStorage) + a recheck affordance in the main app. Deferred from the
+                    fix/installer-p1-guards branch because the persistence + UI work is larger
+                    than the original P1 scope. */}
           {hasErrors && complete && (
-            <button
-              type="button"
-              onClick={() => window.location.reload()}
-              className="mt-4 w-full rounded-xl border border-red-500/40 bg-red-900/20 px-4 py-2.5 text-sm font-medium text-red-300 transition-colors hover:bg-red-900/30 hover:text-red-200"
-            >
-              Retry failed downloads
-            </button>
+            <>
+              <button
+                type="button"
+                onClick={() => window.location.reload()}
+                className="mt-4 w-full rounded-xl border border-red-500/40 bg-red-900/20 px-4 py-2.5 text-sm font-medium text-red-300 transition-colors hover:bg-red-900/30 hover:text-red-200"
+              >
+                Retry failed downloads
+              </button>
+              <button
+                type="button"
+                onClick={onComplete}
+                className="mt-2 w-full rounded-xl border border-slate-600/50 bg-slate-800/40 px-4 py-2.5 text-sm font-medium text-slate-300 transition-colors hover:bg-slate-800/70 hover:text-slate-100"
+              >
+                Continue anyway
+              </button>
+              <p className="mt-2 text-center text-xs text-slate-500">
+                Affected features may not work. Reload this page to retry the downloads later.
+              </p>
+            </>
           )}
         </div>
       </div>

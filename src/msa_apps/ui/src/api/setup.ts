@@ -6,6 +6,10 @@ export interface ModelInfo {
   size_mb: number
   present: boolean
   integrity_hint: string
+  // Download origin host + path (e.g. "huggingface.co/PekingU/rtdetr_r18vd").
+  // Shown on the first-launch setup page as a trust signal so users can see
+  // bytes are coming from a known model host rather than a random URL.
+  source: string
 }
 
 export interface SetupStatus {

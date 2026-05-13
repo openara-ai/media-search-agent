@@ -202,9 +202,14 @@ internal sealed class TrayApp : ApplicationContext
         // The auto-show path relies on internal foreground-window activation that
         // fails under RDP/mstsc — the menu pops and is dismissed on the same
         // frame. SetForegroundWindow on the menu's own handle fixes it.
+        //
+        // Left-click also shows the menu. The Windows default of "left-click
+        // does nothing, right-click shows menu" is confusing for new users
+        // who discover the icon in the overflow tray and naturally click it.
+        // Both buttons now produce the same menu - lowest-friction discovery.
         _tray.MouseUp += (_, e) =>
         {
-            if (e.Button != MouseButtons.Right) return;
+            if (e.Button != MouseButtons.Left && e.Button != MouseButtons.Right) return;
             SetForegroundWindow(menu.Handle);
             menu.Show(Cursor.Position);
         };
@@ -284,23 +289,58 @@ internal sealed class TrayApp : ApplicationContext
 
         if (alreadyRunning) return;
 
-        _tray.BalloonTipTitle = "Media Search Agent";
-        _tray.BalloonTipText  = "Starting up\u2026 your browser will open shortly.";
-        _tray.BalloonTipIcon  = ToolTipIcon.Info;
-        _tray.ShowBalloonTip(4_000);
+        ShowBalloon(
+            "Starting up\u2026 your browser will open shortly.",
+            ToolTipIcon.Info);
 
         RunLauncher("api start");
-        await WaitForReadyAsync();
-        OpenUrl(_launchUrl);
+        bool ready = await WaitForReadyAsync();
+        if (ready)
+        {
+            // Replace the in-flight "starting" balloon with confirmation.
+            // ShowBalloonTip swaps the current balloon for the new one
+            // automatically - no explicit dismiss needed.
+            ShowBalloon(
+                "Ready. Opening your browser\u2026",
+                ToolTipIcon.Info);
+            OpenUrl(_launchUrl);
+        }
+        else
+        {
+            // Real startup failure: the API did not respond to /health
+            // within ReadyTimeoutSec seconds. Don't open the browser to a
+            // failing connection - point the user at the logs instead.
+            ShowBalloon(
+                $"Did not start within {ReadyTimeoutSec}s. Right-click this icon \u2192 More \u2192 View Logs to investigate.",
+                ToolTipIcon.Warning);
+        }
     }
 
-    private async Task WaitForReadyAsync()
+    // Centralised balloon helper. Keeps the title and timeout consistent
+    // across the three first-launch states (starting / ready / failed) so
+    // future contributors can't drift them apart.
+    //
+    // 30s duration: gives a new user time to actually notice the icon in
+    // the overflow tray and drag it into the always-visible row. Windows
+    // dismisses the balloon as soon as the user clicks anywhere outside,
+    // so the long duration is upper-bound only - no risk of overstaying.
+    private const int BalloonDurationMs = 30_000;
+    private void ShowBalloon(string text, ToolTipIcon icon)
+    {
+        _tray.BalloonTipTitle = "Media Search Agent";
+        _tray.BalloonTipText  = text;
+        _tray.BalloonTipIcon  = icon;
+        _tray.ShowBalloonTip(BalloonDurationMs);
+    }
+
+    private async Task<bool> WaitForReadyAsync()
     {
         for (int i = 0; i < ReadyTimeoutSec; i++)
         {
             await Task.Delay(1_000);
-            if (await IsHealthyAsync()) { ApplyStatus(true); return; }
+            if (await IsHealthyAsync()) { ApplyStatus(true); return true; }
         }
+        return false;
     }
 
     // ── Menu actions ──────────────────────────────────────────────────────────
@@ -309,8 +349,19 @@ internal sealed class TrayApp : ApplicationContext
     {
         if (_running) { OpenUrl(_launchUrl); return; }
         RunLauncher("api start");
-        await WaitForReadyAsync();
-        OpenUrl(_launchUrl);
+        bool ready = await WaitForReadyAsync();
+        if (ready)
+        {
+            OpenUrl(_launchUrl);
+        }
+        else
+        {
+            // Menu-initiated retry of startup also surfaces the failure -
+            // the user expected the browser to open and it didn't.
+            ShowBalloon(
+                $"Did not start within {ReadyTimeoutSec}s. Right-click this icon → More → View Logs to investigate.",
+                ToolTipIcon.Warning);
+        }
     }
 
     private void OnStop() => RunLauncher("api stop");

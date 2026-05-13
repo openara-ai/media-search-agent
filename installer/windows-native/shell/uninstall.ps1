@@ -50,12 +50,34 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Continue'
 
+# Strip trailing backslashes on the user-overridable paths so subsequent
+# `-like "$AppDir\*"` checks (the Tier-1 stop-API ownership check) work
+# regardless of whether the caller passed `-AppDir C:\MSA` or `C:\MSA\`.
+# Without this, the trailing slash produces a `C:\MSA\\*` pattern that
+# never matches real process paths and uninstall would skip terminating
+# its own API process. Symmetric fix to install.ps1; caught by Codex on PR #132.
+#
+# Drive-root guard: leave `C:\`, `D:\`, etc. as-is. Trimming would turn
+# `C:\` into `C:` and the subsequent `-like "C:\*"` ownership check
+# would spuriously match anything on the drive. Caught by Copilot on PR #133.
+if ($AppDir -notmatch '^[A-Za-z]:\\$') { $AppDir = $AppDir.TrimEnd('\') }
+if ($DataDir -notmatch '^[A-Za-z]:\\$') { $DataDir = $DataDir.TrimEnd('\') }
+
 # -- Logging ------------------------------------------------------------------
 
 function Write-Step { param([string]$Msg) Write-Host "`n==> $Msg" -ForegroundColor Cyan }
 function Write-Ok   { param([string]$Msg) Write-Host "    + $Msg" -ForegroundColor Green }
 function Write-Skip { param([string]$Msg) Write-Host "    - $Msg" -ForegroundColor DarkGray }
 function Write-Warn { param([string]$Msg) Write-Host "    ! $Msg" -ForegroundColor Yellow }
+function Write-Fail {
+    # Hard abort: refuse to proceed with destructive uninstall steps when the
+    # API kill failed. Half-deleting the venv around a live python is what
+    # produced the "port held outside AppDir - skipping" deadlock on
+    # re-install, so failing fast here is the safe path.
+    param([string]$Msg)
+    Write-Host "    x $Msg" -ForegroundColor Red
+    exit 1
+}
 
 function Stop-UninstallLogging {
     if ($script:TranscriptStarted) {
@@ -175,11 +197,60 @@ try {
                 $procPath = ''
             }
 
-            if ($procPath -and ($procPath -notlike "$AppDir*") -and ($proc.ProcessName -notmatch '^(python|uvicorn)(\.exe)?$')) {
+            # Kill if EITHER:
+            #   (a) the exe path is resolvable AND lives under $AppDir
+            #       (strong signal: this is our process); OR
+            #   (b) the exe path is unresolvable AND the process name is
+            #       python/pythonw/uvicorn (recovery case for half-deleted
+            #       venv orphans where $proc.Path comes back null because
+            #       the file was removed under a still-running process).
+            #
+            # The previous code OR'd the name check unconditionally, which
+            # would terminate UNRELATED dev python on port 8000 (Django /
+            # FastAPI dev / Jupyter on alternate port). Guarding the name
+            # fallback behind "$procPath is empty" protects external dev
+            # processes whose paths are fully resolvable while keeping the
+            # orphan-recovery path intact. `$AppDir\*` (with the backslash)
+            # matches "<AppDir>\subdir\..." but not "<AppDir>Neighbor\..." -
+            # the bare `$AppDir*` (no backslash) the old code used would
+            # spuriously match sibling directories.
+            $isMsaApi = ($procPath -and ($procPath -like "$AppDir\*")) -or
+                        ((-not $procPath) -and ($proc.ProcessName -match '^(python|pythonw|uvicorn)(\.exe)?$'))
+            if (-not $isMsaApi) {
                 Write-Warn "Refusing to stop unexpected process on port ${port}: $($proc.Name) ($procPath)"
             } else {
-                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-                Write-Ok "Stopped $($proc.Name) (PID $($proc.Id)) on port $port"
+                # Nested try/catch so an unexpected exception during kill
+                # verification (e.g. WaitForExit throwing) is FATAL via
+                # Write-Fail rather than downgraded to Write-Warn by the
+                # outer catch. The outer catch is meant for environmental
+                # oddities (Get-NetTCPConnection / Get-Process quirks);
+                # failure to verify a kill we initiated is a different beast
+                # - it can leave us deleting the venv around a still-running
+                # python, which is exactly what this guard exists to prevent.
+                try {
+                    $killErr = $null
+                    try {
+                        Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+                    } catch {
+                        # Could be "no such process" (benign race: died on its own),
+                        # "access denied" (AV/elevated), etc. WaitForExit below is
+                        # the source of truth - if the process is actually gone the
+                        # benign race doesn't matter.
+                        $killErr = $_.Exception.Message
+                    }
+                    # Stop-Process is fire-and-forget. Without WaitForExit it can
+                    # return cleanly while the process is still alive (anti-virus
+                    # blocking termination, kernel-mode handle, etc.); we then
+                    # delete the venv around it and ship a deadlock to the next
+                    # install run. Verify before continuing.
+                    if (-not $proc.WaitForExit(5000)) {
+                        $detail = if ($killErr) { "Stop-Process raised: $killErr" } else { "process did not exit within 5s" }
+                        Write-Fail "Could not stop PID $($proc.Id) holding port ${port} ($detail).`n      Open an Administrator cmd and run:  taskkill /F /PID $($proc.Id)`n      Then re-run uninstall."
+                    }
+                    Write-Ok "Stopped $($proc.Name) (PID $($proc.Id)) on port $port"
+                } catch {
+                    Write-Fail "Process-stop verification failed for PID $($proc.Id) ($($_.Exception.Message)). Cannot confirm the API process is gone; refusing to proceed with destructive uninstall steps.`n      Open an Administrator cmd and run:  taskkill /F /PID $($proc.Id)`n      Then re-run uninstall."
+                }
             }
         } else {
             Write-Warn "Found listener on port $port, but could not resolve the owning process"
@@ -228,8 +299,23 @@ if (Get-ItemProperty -Path $runKeyPath -Name $taskName -ErrorAction SilentlyCont
 Write-Step "Tier 1 - Removing launcher"
 
 if (Test-Path $Launcher) {
-    Remove-Item $Launcher -Force -ErrorAction SilentlyContinue
-    Write-Ok "Launcher removed: $Launcher"
+    # `msa uninstall` invokes the launcher (msa.cmd), which runs `powershell
+    # -File uninstall.ps1`. cmd.exe streams batch files and seeks ahead at
+    # block boundaries - when PowerShell returns it still needs to read the
+    # next lines of msa.cmd ("exit /b %ERRORLEVEL%", the closing ")", etc.).
+    # Deleting msa.cmd inline produces "The batch file cannot be found"
+    # output (typically twice, once per cmd.exe read attempt) at the very
+    # end of an otherwise-successful uninstall run.
+    #
+    # Defer the delete via a detached cmd that waits a few seconds, so the
+    # parent cmd.exe finishes reading the script before the file disappears.
+    # `timeout /nobreak > nul` is the standard Windows sleep that survives
+    # being detached (Start-Sleep would die with our PowerShell session).
+    $deferDelete = "timeout /t 3 /nobreak > nul & del /q `"$Launcher`""
+    Start-Process -FilePath "cmd.exe" `
+        -ArgumentList "/c", $deferDelete `
+        -WindowStyle Hidden -ErrorAction SilentlyContinue | Out-Null
+    Write-Ok "Launcher scheduled for removal: $Launcher (deferred a few seconds)"
 }
 if (Test-Path $LauncherDir) {
     # Remove LauncherDir from user PATH if it is there
