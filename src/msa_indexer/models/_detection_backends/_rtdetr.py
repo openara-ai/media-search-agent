@@ -10,7 +10,7 @@ KNOWN_REVISIONS: dict[str, str | None] = {
     "PekingU/rtdetr_r50vd": None,
 }
 
-# tvmonitor → tv keeps labels consistent with the historical YOLO vocabulary.
+# tvmonitor → tv normalizes COCO label spelling for display.
 _LABEL_NORM: dict[str, str] = {
     "tvmonitor": "tv",
     "pottedplant": "potted plant",

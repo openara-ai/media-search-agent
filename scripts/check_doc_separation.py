@@ -24,6 +24,13 @@ INTERNAL_REF_RE = re.compile(
     r"(?:^|[\s(\[\"'`])(?:\.{1,2}/)*internal/", re.MULTILINE
 )
 
+# Internal paths that public docs are allowed to name. The agent instruction
+# files (CLAUDE.md, AGENTS.md) must spell out internal/docs/CLAUDE-private.md
+# verbatim so the next session can load it. Any other internal/ reference in
+# a public doc still fails the check.
+INTERNAL_PATH_RE = re.compile(r"internal/[^\s)\]\"'`]*")
+ALLOWED_INTERNAL_PATHS = {"internal/docs/CLAUDE-private.md"}
+
 
 def load_patterns() -> tuple[list[str], list[str]]:
     includes: list[str] = []
@@ -87,6 +94,9 @@ def scan_for_internal_refs(files: list[Path]) -> list[tuple[Path, int, str]]:
             continue
         for lineno, line in enumerate(text.splitlines(), start=1):
             if INTERNAL_REF_RE.search(line):
+                paths = INTERNAL_PATH_RE.findall(line)
+                if paths and all(p in ALLOWED_INTERNAL_PATHS for p in paths):
+                    continue
                 issues.append((f, lineno, line.strip()))
     return issues
 

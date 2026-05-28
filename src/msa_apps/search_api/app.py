@@ -372,14 +372,19 @@ def list_media(
                 params.append(len(people_list))
                 params.append(len(people_list))
             else:
+                # "any" mode — match media that has at least one face for any
+                # of the named people. Use IN (SELECT ...) rather than a
+                # correlated EXISTS so SQLite resolves the inner set once
+                # (driven by idx_face_person and the implicit UNIQUE index on
+                # person.name) instead of re-evaluating per outer media row.
+                # See internal/docs/search/BROWSE_FILTER_PERFORMANCE_LESSON.md.
                 where.append(
                     f"""
-                    EXISTS (
-                        SELECT 1
+                    m.media_id IN (
+                        SELECT f.media_id
                         FROM face f
                         JOIN person p ON p.person_id = f.person_id
-                        WHERE f.media_id = m.media_id
-                          AND p.name IN ({placeholders})
+                        WHERE p.name IN ({placeholders})
                     )
                     """
                 )

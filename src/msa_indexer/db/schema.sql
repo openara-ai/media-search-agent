@@ -25,6 +25,9 @@ CREATE TABLE IF NOT EXISTS media (
 );
 -- Optional index to accelerate lookups by (source_name, rel_path)
 CREATE INDEX IF NOT EXISTS idx_media_source_rel ON media(source_name, rel_path);
+-- Browse default sort: ORDER BY ts_utc DESC, plus date-range filters.
+-- Without this, every paginated /media call sorts every matched row.
+CREATE INDEX IF NOT EXISTS idx_media_ts ON media(ts_utc);
 CREATE TABLE IF NOT EXISTS tag (
   tag_id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT UNIQUE

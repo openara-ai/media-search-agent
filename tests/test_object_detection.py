@@ -147,7 +147,7 @@ def test_convenience_function():
 def test_config_migration_warns_on_pt_model(caplog):
     import logging
     from msa_settings.config import Config
-    cfg = Config(object_model="yolov8s.pt", object_detector_backend="rtdetr")
+    cfg = Config(object_model="model.pt", object_detector_backend="rtdetr")
     with caplog.at_level(logging.WARNING, logger="msa_settings.config"):
         if cfg.object_model.endswith(".pt"):
             cfg.object_model = "PekingU/rtdetr_r18vd"
@@ -157,7 +157,7 @@ def test_config_migration_warns_on_pt_model(caplog):
 def test_config_migration_warns_on_legacy_backend(caplog):
     import logging
     from msa_settings.config import Config
-    cfg = Config(object_detector_backend="ultralytics")
+    cfg = Config(object_detector_backend="legacy")
     with caplog.at_level(logging.WARNING, logger="msa_settings.config"):
         if cfg.object_detector_backend != "rtdetr":
             cfg.object_detector_backend = "rtdetr"

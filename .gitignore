@@ -52,8 +52,7 @@ data/sample_photos/*.MOV
 *Zone.Identifier*
 .ipynb_checkpoints/requirements-checkpoint.txt
 
-# YOLOv8 model files (auto-downloaded by ultralytics)
-yolov8*.pt
+# Object detection model files
 /models/
 
 # React UI build artifacts

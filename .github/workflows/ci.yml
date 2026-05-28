@@ -203,7 +203,7 @@ jobs:
 
       - name: Run unit tests (fast suite)
         run: |
-          # Exclude object detection tests — YOLO segfaults on macOS CI (no GPU)
+          # Exclude object detection tests — slow/unreliable on macOS CI (no GPU)
           python -m pytest tests/ -v -m "not slow" \
             --ignore=tests/test_object_detection.py \
             --ignore=tests/test_object_detection_integration.py \
@@ -318,7 +318,7 @@ jobs:
       - name: Run fast unit tests against installed venv
         run: |
           source .venv/bin/activate
-          # Exclude object detection tests — YOLO segfaults on macOS CI (no GPU)
+          # Exclude object detection tests — slow/unreliable on macOS CI (no GPU)
           python -m pytest tests/ -v -m "not slow" \
             --ignore=tests/test_object_detection.py \
             --ignore=tests/test_object_detection_integration.py \

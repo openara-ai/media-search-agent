@@ -3,7 +3,7 @@
 # One pattern per line. `**` matches recursively, `*` matches a single
 # path segment. Lines starting with `#` are comments. Lines starting with
 # `!` exclude paths matched by an earlier pattern. Anything not matched
-# stays private by default (CLAUDE.md, AGENTS.md, internal/, etc.).
+# stays private by default (internal/, etc.).
 #
 # This file is the single source of truth for the public migration script
 # and for scripts/check_doc_separation.py.
@@ -14,6 +14,9 @@ LICENSE
 NOTICE
 CHANGELOG.md
 SECURITY.md
+CONTRIBUTING.md
+CLAUDE.md
+AGENTS.md
 .gitignore
 .pre-commit-config.yaml
 .public-paths

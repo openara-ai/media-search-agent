@@ -35,7 +35,7 @@ def _load_backend(name: str) -> type:
 
 
 class ObjectDetector:
-    """Backend-neutral object detector. Public API is unchanged from the YOLO era."""
+    """Backend-neutral object detector."""
 
     def __init__(
         self,

@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows%20%7C%20Linux-blue)](#quick-start)
 
-A **local-first semantic search engine** for your personal photo and video library.
+A **local-first semantic search engine** for your personal photo and video library developed using [Agentic Engineering](#How-this-was-built).
 Search by natural language, browse by face, label people — all on your own machine.
 No cloud. No subscription.
 
@@ -13,6 +13,11 @@ No cloud. No subscription.
 ![Media Search Agent demo — search, browse, people, video](docs/images/demo.gif)
 
 *Sharper, smaller version: [docs/images/demo.mp4](docs/images/demo.mp4) (1.5 MB, 720p).*
+
+## How this was built
+
+This project was developed using agentic workflow with AI coding agents as code authors. See [AGENTIC_DEVELOPMENT.md](docs/AGENTIC_DEVELOPMENT.md) for the playbook: spikes, ADRs, multi-agent code review, guardrails, per-agent instruction files.
+
 
 ## Highlights
 
@@ -61,17 +66,21 @@ graph LR
     I -->|face detection| S
     I -->|Video shot detection| S
     I -->|GPS/Geo decoding| S
-    Q[Natural-language query] --> A[FastAPI + React UI]
-    A --> S
-    S -->|ranked results| A
+    Q[Natural-language query] --> U[React UI]
+    U --> A[FastAPI]
+    A --> SE[Search engine<br/>encode · ANN · rank]
+    SE --> S
+    S -->|ranked results| U
 ```
 
 The indexer runs over your library when you start it from Indexer page. A
 vision-language model encodes images and text into a shared vector space, so a
 query like "rainy street at night" finds matching frames without any manual
 tagging. SQLite is the canonical store for metadata and embeddings; Qdrant
-powers fast vector search at runtime. The React UI talks to a single FastAPI
-process at port 8000.
+powers fast vector search at runtime. At query time, the same model encodes
+your text into a vector, Qdrant returns the nearest neighbors, and the search
+engine ranks them by similarity and metadata filters before they reach the
+UI. The React UI talks to a single FastAPI process at port 8000.
 
 For the full design — schema, dataflow, indexing pipeline, search ranking —
 see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -88,6 +97,8 @@ see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Documentation
 
+### User guides
+
 - [Architecture](docs/ARCHITECTURE.md) — system design, dataflow, schema
 - [Installation](docs/INSTALL.md) — full install guide and troubleshooting
 - [Quick Start](docs/QUICKSTART.md) — first-run walkthrough
@@ -98,20 +109,21 @@ see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - [Video](docs/features/video.md) — keyframe extraction and video search
 - [FAQ](docs/FAQ.md)
 
+### Engineering references
+
+- [Agentic Development](docs/AGENTIC_DEVELOPMENT.md) — how this project was built: spikes, ADRs, multi-agent review, guardrails
+- [Architecture Decision Records](docs/decisions/) — the 10 ADRs governing this codebase
+- [Spikes](docs/spikes/) — time-boxed investigations that fed the ADRs
+
+
 ## Status
 
 MediaSearchAgent is pre-1.0, experimental software developed through human-led, AI-assisted agentic coding. Use at your own risk. Keep your original media backed up. It is tested and usable today on macOS, Windows, and Linux, but not intended for production use.
 
 ## Contributing
 
-Pull requests and bug reports are welcome. Please open an issue before
-starting large changes.
-
-Dev environments are **macOS** and **WSL2 / Linux** (no Windows-native dev
-path — Windows contributors should work inside a WSL2 Ubuntu shell). Clone
-the repo and run `bash scripts/dev-setup.sh`. Run tests with
-`bash scripts/run-tests.sh`. Branch from `main`, open a PR — CI runs the
-full test matrix.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for full guidelines, including a note on
+AI-assisted contributions and the dev environment setup.
 
 ## License
 

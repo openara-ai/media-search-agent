@@ -235,7 +235,6 @@ describe('SetupPage', () => {
         complete: false,
         models: {
           clip:        { status: 'done',    error: null },
-          yolo:        { status: 'pending', error: null },
           insightface: { status: 'pending', error: null },
         },
       })
