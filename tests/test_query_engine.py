@@ -276,6 +276,22 @@ class TestQueryEngineNegative:
             # If it raises KeyError, that's a bug but test documents it
             pytest.fail("QueryEngine should handle missing fields gracefully")
 
+    def test_reranker_feature_failure_does_not_break_search(self, query_engine, monkeypatch):
+        """INV-9: a runtime reranker-feature error disables features for this search
+        (→ None) but must never turn search into a 500."""
+        import msa_query.query_engine.engine as eng
+
+        if eng._ranker_features is None:
+            pytest.skip("msa_ranker not installed")
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("extractor blew up at runtime")
+
+        monkeypatch.setattr(eng._ranker_features, "feature_dict", _boom)
+        results = query_engine.search("beach sunset")  # must not raise
+        assert len(results) > 0
+        assert all(r.get("features") is None for r in results)
+
 
 class TestQueryEngineIntegration:
     """Integration-style tests that verify component interaction."""

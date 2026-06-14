@@ -45,11 +45,13 @@ while [[ $# -gt 0 ]]; do
     --platform)   PLATFORM="${2:?'--platform requires a value'}"; shift 2 ;;
     --platform=*) PLATFORM="${1#*=}"; shift ;;
     --dirty)      DIRTY=1; shift ;;
-    *) echo "ERROR: unknown argument: $1"; echo "Usage: $0 --version X.Y.Z [--platform macos|linux] [--dirty]"; exit 1 ;;
+    --msa-ranker-wheel)   RANKER_WHEEL="${2:?'--msa-ranker-wheel requires a value'}"; shift 2 ;;
+    --msa-ranker-wheel=*) RANKER_WHEEL="${1#*=}"; shift ;;
+    *) echo "ERROR: unknown argument: $1"; echo "Usage: $0 --version X.Y.Z [--platform macos|linux] [--dirty] [--msa-ranker-wheel PATH]"; exit 1 ;;
   esac
 done
 
-[[ -z "$VERSION" ]] && { echo "Usage: $0 --version X.Y.Z [--platform macos|linux] [--dirty]"; exit 1; }
+[[ -z "$VERSION" ]] && { echo "Usage: $0 --version X.Y.Z [--platform macos|linux] [--dirty] [--msa-ranker-wheel PATH]"; exit 1; }
 
 if [[ -z "$PLATFORM" ]]; then
   case "$(uname -s)" in
@@ -126,6 +128,28 @@ fi
 PKG_VERSION=$(pep440_version "$VERSION")
 sed -i.bak "s/^version = .*/version = \"$PKG_VERSION\"/" "$BUNDLE_DIR/pyproject.toml" \
   && rm -f "$BUNDLE_DIR/pyproject.toml.bak"
+
+# Vendored msa_ranker wheel (the learned-reranker serving library). Self-contained:
+# the zero-dependency serving lib ships INSIDE the bundle so the installed venv has it
+# with NO install-time network fetch. install.sh installs it after the runtime deps.
+# Absent ⇒ the reranker is simply unavailable (MSA's import is guarded — INV-9).
+# Auto-detects installer/wheels/msa_ranker-*.whl; --msa-ranker-wheel overrides.
+if [[ -z "${RANKER_WHEEL:-}" ]]; then
+  _whls=("$REPO_ROOT"/installer/wheels/msa_ranker-*.whl)
+  if [[ ${#_whls[@]} -gt 1 ]]; then
+    echo "ERROR: multiple msa_ranker wheels in installer/wheels/ — remove stale ones:"
+    printf '         %s\n' "${_whls[@]}"; exit 1
+  fi
+  [[ -f "${_whls[0]}" ]] && RANKER_WHEEL="${_whls[0]}"
+fi
+if [[ -n "${RANKER_WHEEL:-}" ]]; then
+  [[ -f "$RANKER_WHEEL" ]] || { echo "ERROR: --msa-ranker-wheel not found: $RANKER_WHEEL"; exit 1; }
+  mkdir -p "$BUNDLE_DIR/wheels"
+  cp "$RANKER_WHEEL" "$BUNDLE_DIR/wheels/"
+  echo "    Bundled msa_ranker wheel: $(basename "$RANKER_WHEEL")"
+else
+  echo "    (no msa_ranker wheel found — bundle runs on the heuristic only)"
+fi
 
 # ── 2. React UI dist (must be pre-built before running this script) ───────────
 

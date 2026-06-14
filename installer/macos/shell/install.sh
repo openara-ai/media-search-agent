@@ -554,7 +554,7 @@ install_bundle() {
     # bundle ships requirements-api.txt; the conditional `mv` skips it).
     # Without this, dev machines with older test installs would carry a
     # stale requirements.txt forward through upgrade.
-    for item in src scripts pyproject.toml requirements.txt requirements-api.txt LICENSE NOTICE uninstall.sh bin; do
+    for item in src scripts pyproject.toml requirements.txt requirements-api.txt LICENSE NOTICE uninstall.sh bin wheels; do
       rm -rf "$APP_CODE_DIR/$item"
       [[ -e "$bundle_dir/$item" ]] && mv "$bundle_dir/$item" "$APP_CODE_DIR/$item"
     done
@@ -563,7 +563,7 @@ install_bundle() {
     # (APP_CODE_DIR == APP_SUPPORT_DIR on Linux).
     mkdir -p "$APP_CODE_DIR"
     # `requirements.txt`: pure-cleanup entry — see macOS branch above.
-    for item in src scripts pyproject.toml requirements.txt requirements-api.txt LICENSE NOTICE uninstall.sh bin; do
+    for item in src scripts pyproject.toml requirements.txt requirements-api.txt LICENSE NOTICE uninstall.sh bin wheels; do
       rm -rf "$APP_CODE_DIR/$item"
       [[ -e "$bundle_dir/$item" ]] && mv "$bundle_dir/$item" "$APP_CODE_DIR/$item"
     done
@@ -796,13 +796,17 @@ install_packages() {
       /^[[:space:]]*numpy([[:space:]\[<>=!~]|$)/                 { next }
       /^[[:space:]]*torch([[:space:]\[<>=!~]|$)/                 { next }
       /^[[:space:]]*facenet-pytorch([[:space:]\[<>=!~]|$)/       { next }
+      /^[[:space:]]*msa[-_]ranker([[:space:]\[<>=!~@]|$)/        { next }
       { print }
     ' "$reqs" > "$tmp_reqs"
     printf 'numpy<2\ntorch>=2.4,<2.7\n' >> "$tmp_reqs"
   else
-    # Linux: strip facenet-pytorch for the same --no-deps reason.
+    # Linux: strip facenet-pytorch for the same --no-deps reason. msa-ranker is
+    # also stripped so the ranker is installed only by the explicit branch below
+    # (wheel-or-pin, always --no-deps).
     awk '
       /^[[:space:]]*facenet-pytorch([[:space:]\[<>=!~]|$)/ { next }
+      /^[[:space:]]*msa[-_]ranker([[:space:]\[<>=!~@]|$)/  { next }
       { print }
     ' "$reqs" > "$tmp_reqs"
   fi
@@ -812,6 +816,40 @@ install_packages() {
   # from downgrading the torch wheel that was just placed above.
   "$uv_bin" pip install --python "$VENV_DIR/bin/python" --no-deps "facenet-pytorch>=2.6.0"
   "$uv_bin" pip install --python "$VENV_DIR/bin/python" --no-deps "$APP_CODE_DIR"
+  # Learned-reranker serving library (zero-dependency, installed --no-deps). Resolved
+  # in two ways, wheel-first; absent both ⇒ MSA runs on the heuristic exactly as before
+  # (the import is guarded — INV-9). The ranker line was stripped from $tmp_reqs above so
+  # it is installed only here, never by the bulk `-r` step.
+  local ranker_whl ranker_pin
+  ranker_whl=$(ls "$APP_CODE_DIR"/wheels/msa_ranker-*.whl 2>/dev/null | head -1 || true)
+  # The venv is reused across upgrades, so ALWAYS clear any prior msa-ranker first, then
+  # (re)install from the configured source if one is present. Uninstall-first keeps the
+  # venv's ranker state matching the requirements in every case — a deactivated pin, or a
+  # pin whose PEP 508 marker evaluates false on this platform (uv installs nothing) — both
+  # end heuristic (INV-9; app.py logs whenever msa_ranker imports). No-op on a fresh venv
+  # (uv exits 0 when the package is absent).
+  "$uv_bin" pip uninstall --python "$VENV_DIR/bin/python" msa-ranker >/dev/null 2>&1 || true
+  if [[ -n "$ranker_whl" ]]; then
+    # Offline path: the vendored wheel ships only with private bundles.
+    "$uv_bin" pip install --python "$VENV_DIR/bin/python" --no-deps "$ranker_whl"
+    log_ok "Learned reranker installed ($(basename "$ranker_whl"))"
+  elif ranker_pin=$(awk '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*msa[-_]ranker([[:space:]]*==|[[:space:]]*@)/ {
+          # Drop a trailing inline comment ( #... preceded by space) — pip rejects it
+          # on the command line, unlike in a -r file. The leading-space requirement
+          # preserves a "#fragment" inside a URL/wheel spec (no preceding space).
+          sub(/[[:space:]]+#.*$/, ""); sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+$/, ""); print; exit
+        }
+      ' "$reqs") && [[ -n "$ranker_pin" ]]; then
+    # Online path (the public mirror ships no vendored wheel): install whichever single
+    # msa-ranker spec is uncommented in the runtime requirements — a PyPI ==pin, a GitHub
+    # release-asset URL, or a git+ ref. ADR-011 keeps that version == the wheel's. If the
+    # spec carries a marker that is false here, uv installs nothing → stays heuristic
+    # (the uninstall above already cleared any stale copy).
+    "$uv_bin" pip install --python "$VENV_DIR/bin/python" --no-deps "$ranker_pin"
+    log_ok "Learned reranker installed from requirements pin ($ranker_pin)"
+  fi
   rm -f "$tmp_reqs"
   log_ok "Python packages installed"
 }

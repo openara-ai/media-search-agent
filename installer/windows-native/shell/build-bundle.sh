@@ -37,7 +37,7 @@ VERSION=""
 DIRTY=0
 
 usage() {
-  echo "Usage: $0 --version X.Y.Z [--dirty]"
+  echo "Usage: $0 --version X.Y.Z [--dirty] [--msa-ranker-wheel PATH]"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -45,6 +45,8 @@ while [[ $# -gt 0 ]]; do
     --version)   VERSION="${2:?'--version requires a value'}"; shift 2 ;;
     --version=*) VERSION="${1#*=}"; shift ;;
     --dirty)     DIRTY=1; shift ;;
+    --msa-ranker-wheel)   RANKER_WHEEL="${2:?'--msa-ranker-wheel requires a value'}"; shift 2 ;;
+    --msa-ranker-wheel=*) RANKER_WHEEL="${1#*=}"; shift ;;
     *) echo "ERROR: unknown argument: $1"; usage; exit 1 ;;
   esac
 done
@@ -106,6 +108,26 @@ sed -i.bak "s/^version = .*/version = \"$PKG_VERSION\"/" "$BUNDLE_DIR/pyproject.
 # Copy Windows-specific requirements file directly — onnxruntime-gpu is no
 # longer in requirements.txt so no sed substitution is needed.
 cp "$REPO_ROOT/requirements-windows.txt" "$BUNDLE_DIR/requirements-windows.txt"
+
+# Vendored msa_ranker wheel (zero-dependency serving library) — shipped inside the
+# bundle so install.ps1 installs it offline. Absent ⇒ reranker unavailable (guarded).
+# Auto-detects installer/wheels/msa_ranker-*.whl; --msa-ranker-wheel overrides.
+if [[ -z "${RANKER_WHEEL:-}" ]]; then
+  _whls=("$REPO_ROOT"/installer/wheels/msa_ranker-*.whl)
+  if [[ ${#_whls[@]} -gt 1 ]]; then
+    echo "ERROR: multiple msa_ranker wheels in installer/wheels/ — remove stale ones:"
+    printf '         %s\n' "${_whls[@]}"; exit 1
+  fi
+  [[ -f "${_whls[0]}" ]] && RANKER_WHEEL="${_whls[0]}"
+fi
+if [[ -n "${RANKER_WHEEL:-}" ]]; then
+  [[ -f "$RANKER_WHEEL" ]] || { echo "ERROR: --msa-ranker-wheel not found: $RANKER_WHEEL"; exit 1; }
+  mkdir -p "$BUNDLE_DIR/wheels"
+  cp "$RANKER_WHEEL" "$BUNDLE_DIR/wheels/"
+  echo "    Bundled msa_ranker wheel: $(basename "$RANKER_WHEEL")"
+else
+  echo "    (no msa_ranker wheel found — bundle runs on the heuristic only)"
+fi
 
 # ── 2. React UI dist (must be pre-built before running this script) ───────────
 
@@ -207,13 +229,19 @@ if ! command -v dotnet &>/dev/null; then
   exit 1
 fi
 
+# .NET's `Version` MSBuild property (used for NuGet/package version and default assembly metadata)
+# must be a valid NuGet/SemVer string; a leading `v` (e.g. `v0.4.0-test`) is invalid and
+# fails the build ("'v0.4.0-test' is not a valid version string"). Strip the prefix for
+# -p:Version, but keep the full human string (incl. any leading `v`) in InformationalVersion
+# for traceability.
+NET_VERSION="${VERSION#v}"
 TRAY_OUT="$(mktemp -d)/tray-publish"
 dotnet publish "$TRAY_PROJ" \
   -r win-x64 \
   --self-contained true \
   -p:PublishSingleFile=true \
   -p:IncludeNativeLibrariesForSelfExtract=true \
-  -p:Version="$VERSION" \
+  -p:Version="$NET_VERSION" \
   -p:InformationalVersion="$VERSION" \
   -c Release \
   -o "$TRAY_OUT" \

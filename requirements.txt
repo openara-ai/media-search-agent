@@ -40,7 +40,11 @@ truststore
 #   pip install insightface onnxruntime         (macOS)
 #   pip install insightface onnxruntime-gpu     (Linux/Windows CUDA)
 # Then set face_recognizer_backend: insightface in config.yaml.
-transformers>=4.42.0  # RT-DETR object detection (Apache-2.0, default backend)
+# transformers <5: RT-DETR object detection (RTDetrForObjectDetection/RTDetrImageProcessor,
+# added 4.45). Cap below 5 because the macOS bundle pins torch>=2.4,<2.7 (arm64 wheel
+# stability) -> torch 2.6 / torchvision 0.21, which is too old for transformers 5.x's
+# RT-DETR import (it needs newer torchvision); 4.x RT-DETR works on capped + uncapped torch.
+transformers>=4.45,<5
 tokenizers>=0.19.0
 accelerate>=0.27.0
 scenedetect[opencv]  # Shot/scene detection for videos
@@ -84,3 +88,19 @@ pytest
 # explicitly here. The original audit only checked direct imports in
 # our own source — it didn't account for --no-deps installs whose
 # transitive deps are otherwise invisible.
+
+# --- msa-ranker (optional reranker integration) ---------------------------------
+# The learned reranker is an OPTIONAL dependency: MSA's import of it is guarded
+# (ADR-011), so MSA runs unchanged when it is absent (e.g. in CI, where the sibling
+# repo is not checked out). Install it to ACTIVATE event logging / serving. Uncomment
+# exactly ONE bare spec line below (not its label); its version must equal the vendored
+# wheel (tests/test_ranker_wheel_pin.py). Each spec is on its own line so uncommenting
+# it yields a valid requirement. Left commented so CI does not install the sibling path.
+#   dev (editable, both repos local):
+# -e ../msa-ranker
+#   release (PyPI, once published):
+# msa-ranker==0.0.1
+#   release (GitHub release asset — prebuilt wheel):
+# msa-ranker @ https://github.com/openara-ai/msa-ranker/releases/download/v0.0.1/msa_ranker-0.0.1-py3-none-any.whl
+#   release (git tag, builds from source):
+# msa-ranker @ git+https://github.com/openara-ai/msa-ranker@v0.0.1

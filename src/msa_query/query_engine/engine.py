@@ -7,8 +7,21 @@ from msa_query.query_engine.rerankers import score_breakdown
 from msa_query.config import settings
 from msa_query.storage.db import connect_readonly
 from pathlib import Path
+import math
 import re
+import time
 from datetime import date
+
+try:  # optional reranker integration (ADR-013) — features only; serving is wired in app.py
+    from msa_ranker import features as _ranker_features
+except ModuleNotFoundError as _exc:
+    _ranker_features = None
+    if (_exc.name or "").split(".")[0] != "msa_ranker":
+        # msa_ranker is installed but one of ITS deps is missing → broken install, surface it
+        logger.warning("msa_ranker present but a dependency is missing; reranker disabled: {}", _exc)
+except Exception as _exc:  # present but broken/incompatible → surface it, but stay up
+    _ranker_features = None
+    logger.warning("msa_ranker present but failed to import; reranker disabled: {}", _exc)
 
 
 _QUERY_STOPWORDS = {
@@ -131,6 +144,89 @@ def _load_known_people_names(conn: Any | None) -> List[str]:
     except Exception as exc:
         logger.warning(f"Could not load known people for query decomposition: {exc}")
         return []
+
+
+def _load_people_name_to_id(conn: Any | None) -> Dict[str, str]:
+    """Map labeled person name -> person_id (lowercased key), so the reranker can
+    resolve query people to ids alongside names (ADR-008; no extra lookup)."""
+    if conn is None:
+        return {}
+    try:
+        cur = conn.execute(
+            "SELECT name, person_id FROM person "
+            "WHERE name IS NOT NULL AND TRIM(name) != '' AND person_id IS NOT NULL"
+        )
+        return {str(name).lower(): str(pid) for (name, pid) in cur.fetchall() if name and pid}
+    except Exception as exc:
+        logger.warning(f"Could not load person name->id map: {exc}")
+        return {}
+
+
+class _DictPersonLookup:
+    """A msa_ranker PersonLookup backed by a prebuilt {media_id: {person_id}} map."""
+
+    def __init__(self, mapping: Dict[str, set]) -> None:
+        self._m = mapping
+
+    def person_ids_for_media(self, media_id: str) -> set:
+        return self._m.get(str(media_id), set())
+
+
+def _learned_rerank(
+    ranked: List[Dict[str, Any]],
+    feature_list: List[Dict[str, float] | None],
+    ctx: Any,
+    now: float | None,
+    ranker: Any,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, float] | None], bool]:
+    """Reorder `ranked` (and the aligned `feature_list`) by a learned model — spec 06.
+
+    **Reorder-only** (INV-6): returns a *permutation* of the inputs — never adds/drops a
+    candidate, and touches no SQLite write handle (it operates on in-memory dicts). On a
+    closed gate (``ranker is None``), unavailable features, a score-count mismatch, or
+    **any** scoring/ordering error, it returns the inputs **untouched** (no dict mutated)
+    so the heuristic order stands byte-identically (INV-3 / FR-14 fail-safe). The third
+    return is True when the learned model scored and its order was applied — i.e. the model
+    *served* (even if ties coincidentally left the order unchanged). The pre-existing
+    heuristic ``score`` is preserved on each result as ``heuristic_score`` before being
+    overwritten with the served score (NN1, so baseline eval stays reconstructable).
+    """
+    if ranker is None or not ranked or any(f is None for f in feature_list):
+        return ranked, feature_list, False
+    try:
+        # Score COPIES that carry the seam-computed features, so the original candidate
+        # dicts stay untouched until we commit on full success — any error (scoring OR a
+        # non-numeric sort key) leaves the heuristic path byte-identical, and the sort
+        # itself is inside the guard so it can never turn /search into a 500 (FR-14).
+        scoring_inputs = [{**m, "features": f} for m, f in zip(ranked, feature_list)]
+        scores = list(ranker.score(scoring_inputs, ctx, now=now))
+        if len(scores) != len(ranked):
+            raise ValueError(f"ranker returned {len(scores)} scores for {len(ranked)} candidates")
+        # NaN/inf do NOT raise on negation or sort (NaN compares False, so Timsort just
+        # finishes) — they'd be written into results and blow up the response's JSON
+        # serialization (500). Reject them here so the request falls back to the heuristic.
+        if not all(math.isfinite(s) for s in scores):
+            raise ValueError("ranker returned non-finite score(s)")
+        order = sorted(range(len(ranked)), key=lambda i: -scores[i])  # stable; may raise
+    except Exception as exc:  # bad model / non-finite / non-numeric / anything → heuristic
+        logger.warning("learned reranking failed; keeping heuristic order: {}", exc)
+        return ranked, feature_list, False
+    new_ranked: List[Dict[str, Any]] = []
+    new_feats: List[Dict[str, float] | None] = []
+    for i in order:
+        m = ranked[i]
+        m.setdefault("heuristic_score", m.get("score"))  # preserve NN1 before overwrite
+        m["score"] = scores[i]  # the served (learned) score
+        new_ranked.append(m)
+        new_feats.append(feature_list[i])
+    return new_ranked, new_feats, True
+
+
+class _SearchResults(list):
+    """A plain list of results that also carries `.query_context`, so callers that
+    just want the list are unaffected while the reranker shim can read the context."""
+
+    query_context: Dict[str, Any]
 
 
 # Person-aware candidate expansion is a recall helper: it can bring likely
@@ -266,21 +362,26 @@ def _enrich_people(conn: Any | None, candidates: List[Dict[str, Any]]) -> None:
         return
     placeholders = ",".join(["?"] * len(uniq))
     sql = (
-        "SELECT f.media_id, p.name "
+        "SELECT f.media_id, f.person_id, p.name "
         "FROM face f LEFT JOIN person p ON f.person_id = p.person_id "
         f"WHERE f.media_id IN ({placeholders}) AND p.name IS NOT NULL"
     )
     cur = conn.execute(sql, tuple(uniq))
     fmap: Dict[str, set[str]] = {}
-    for mid, pname in cur.fetchall():
+    idmap: Dict[str, set[str]] = {}
+    for mid, pid, pname in cur.fetchall():
         mid = str(mid)
         if not pname:
             continue
         fmap.setdefault(mid, set()).add(str(pname))
+        if pid:
+            idmap.setdefault(mid, set()).add(str(pid))  # person_id carried with name
     for m in candidates:
         mid = str(m.get("id"))
         if mid in fmap:
             m["faces"] = sorted(fmap[mid])
+        if mid in idmap:
+            m["person_ids"] = sorted(idmap[mid])
 
 
 # Preserve source-specific evidence before reranking so one media item can
@@ -403,7 +504,23 @@ class QueryEngine:
         self.sqlite_path = Path(sqlite_path) if sqlite_path is not None else None
         self.search_score_trace = search_score_trace
     
-    def search(self, q: str, filters: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
+    def search(
+        self, q: str, filters: Dict[str, Any] | None = None, ranker: Any = None
+    ) -> List[Dict[str, Any]]:
+        """Back-compat: a list of ranked results that also carries `.query_context`
+        (a list subclass), so existing callers/mocks are unaffected. `ranker` (the loaded
+        learned model, or None) is threaded through — None ⇒ heuristic order (INV-3)."""
+        results, query_context = self.search_for_serving(q, filters, ranker=ranker)
+        out = _SearchResults(results)
+        out.query_context = query_context
+        return out
+
+    def search_for_serving(
+        self, q: str, filters: Dict[str, Any] | None = None, ranker: Any = None
+    ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Like search() but also returns the query_context — used by the reranker
+        shim to log search/shown events. Each result carries `features` +
+        `heuristic_score` when msa_ranker is installed."""
         logger.info(f"Search request q='{q}' filters={filters}")
         sqlite_conn = None
         sqlite_path = self.sqlite_path
@@ -422,11 +539,29 @@ class QueryEngine:
             inferred_filters = dict(filters or {})
             for key, value in date_parts["date_filter"].items():
                 inferred_filters.setdefault(key, value)
+            _name_to_id = _load_people_name_to_id(sqlite_conn)
+            # People the user expressed in TEXT *and* via the UI People filter are both real
+            # query intent — merge them, else a filter-only person search would log
+            # person_hits=0 and contaminate training data (resolve names -> ids, ADR-008).
+            people_names = list(query_parts["inferred_people"]) + list(
+                inferred_filters.get("people") or []
+            )
+            inferred_person_ids: List[str] = []
+            for _n in people_names:
+                _pid = _name_to_id.get(str(_n).lower())
+                if _pid and _pid not in inferred_person_ids:
+                    inferred_person_ids.append(_pid)
+            # Date intent = whatever is in the merged filters (UI range or text-inferred).
+            date_intent = {
+                k: inferred_filters[k] for k in ("date_from", "date_to") if inferred_filters.get(k)
+            }
             query_context = {
                 "original_query": q,
                 "visual_query": search_text,
                 "inferred_people": query_parts["inferred_people"],
+                "inferred_person_ids": inferred_person_ids,  # resolved ids (ADR-008)
                 "visual_tokens": query_parts.get("visual_tokens", []),
+                "date_filter": date_intent or date_parts["date_filter"],
             }
 
             if self.search_score_trace and (
@@ -572,7 +707,42 @@ class QueryEngine:
                         f"total_score={m.get('score', 0.0):.4f}"
                     )
 
-            # 7) format
+            # 7) format (+ reranker features, computed once here — the seam — so logging
+            #    and serving share one code path; skipped when msa_ranker is absent)
+            # Reranker features, computed once here (the seam). All-or-nothing + guarded: a
+            # runtime extractor failure disables features for THIS search (→ None) and is
+            # logged, but must never turn /search into a 500 (INV-9). None ⇒ shim skips logging.
+            feature_list: List[Dict[str, float] | None] = [None] * len(ranked)
+            _feat_ctx = None
+            _now: float | None = None
+            if _ranker_features is not None:
+                try:
+                    place_filter = inferred_filters.get("place") or []
+                    _feat_ctx = _ranker_features.QueryContext(
+                        people=query_context["inferred_person_ids"],
+                        visual_tokens=query_context["visual_tokens"],
+                        date_intent=query_context.get("date_filter") or None,
+                        place_intent=place_filter[0] if place_filter else None,
+                    )
+                    _lookup = _DictPersonLookup(
+                        {str(m["id"]): set(m.get("person_ids", [])) for m in ranked}
+                    )
+                    _now = time.time()
+                    feature_list = [
+                        _ranker_features.feature_dict(m, _feat_ctx, _now, _lookup) for m in ranked
+                    ]
+                except Exception as exc:  # extractor blew up at runtime — never fail search
+                    logger.warning("reranker features failed; disabled for this search: {}", exc)
+                    feature_list = [None] * len(ranked)
+
+            # 7.5) learned reranking (spec 06): reorder the existing candidate set when a
+            #      gated model is active on this engine. Permutation-only, fail-safe to the
+            #      heuristic order; flag off / model absent ⇒ byte-identical to today (INV-3).
+            ranked, feature_list, _ltr_served = _learned_rerank(
+                ranked, feature_list, _feat_ctx, _now, ranker
+            )
+            query_context["ltr_served"] = _ltr_served
+
             results = [
                 {
                     "id": m["id"],
@@ -591,13 +761,17 @@ class QueryEngine:
                     "shot_id": m.get("shot_id"),
                     "date": m.get("date"),
                     "why": f"{m.get('faces')} | {m.get('scene_tags')} | tags={m.get('tags')} | {m.get('caption')} | src={m.get('source')} score={m.get('score'):.3f}",
+                    # the score_breakdown total (NN1) — preserved even when a learned model
+                    # served and overwrote `score`, so baseline eval stays reconstructable.
+                    "heuristic_score": m.get("heuristic_score", m.get("score")),
+                    "features": feats,
                 }
-                for m in ranked
+                for m, feats in zip(ranked, feature_list)
             ]
             logger.info(
                 f"Search complete results={len(results)} top_sources={[m.get('source') for m in ranked[:5]]}"
             )
-            return results
+            return results, query_context
         finally:
             if sqlite_conn is not None:
                 sqlite_conn.close()

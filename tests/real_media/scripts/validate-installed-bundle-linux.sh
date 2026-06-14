@@ -39,6 +39,7 @@ CONFIG_PATH="$HOME/.config/MediaSearchAgent/config.yaml"
 LOG_DIR="$HOME/.local/share/MediaSearchAgent/logs"
 FIXTURE_ROOT="$TEST_ROOT/fixtures"
 API_PORT=18080
+LEDGER_DIR="$RUN_ROOT/ranker-ledger"
 UV_BIN="$APP_DIR/bin/uv"
 VENV_PY="$APP_DIR/.venv/bin/python"
 MSA_BIN="$HOME/.local/bin/msa"
@@ -67,10 +68,19 @@ trap cleanup EXIT
 "$MSA_BIN" --help >/dev/null
 "$UV_BIN" pip install --python "$VENV_PY" pytest
 
+# S-5.4: IF the bundle shipped the learned-reranker serving library (zero-dep wheel),
+# confirm it installed into the bundle venv and imports. Public-mirror bundles ship
+# without the (private) wheel — skip cleanly there. Serving stays flag-off (heuristic).
+if ls "$APP_DIR"/wheels/msa_ranker-*.whl >/dev/null 2>&1; then
+  "$VENV_PY" -c "import msa_ranker.serving, msa_ranker.features, msa_ranker.model; print('msa_ranker serving lib OK')"
+else
+  echo "(no msa_ranker wheel in bundle — serving-lib check skipped; heuristic-only bundle)"
+fi
+
 # Step 6: Write an isolated installed-app config that points at the staged
 # fixture tree and a CI-only API port.
 mkdir -p "$(dirname "$CONFIG_PATH")"
-"$VENV_PY" - <<'PY' "$CONFIG_PATH" "$FIXTURE_ROOT" "$API_PORT"
+"$VENV_PY" - <<'PY' "$CONFIG_PATH" "$FIXTURE_ROOT" "$API_PORT" "$LEDGER_DIR"
 from pathlib import Path
 import sys
 import yaml
@@ -78,12 +88,19 @@ import yaml
 config_path = Path(sys.argv[1])
 fixture_root = sys.argv[2]
 api_port = int(sys.argv[3])
+ledger_dir = sys.argv[4]
 data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
 data["media_sources"] = [{"name": "Real Media Fixtures", "path": fixture_root, "read_only": True}]
 api = data.get("api") or {}
 api["host"] = "127.0.0.1"
 api["port"] = api_port
 data["api"] = api
+# S-5.4: pin the ranker event ledger to a known dir so the runtime BVT can assert
+# end-to-end label capture (search -> shown -> open). Logging is on by default.
+ranker = data.get("ranker") or {}
+ranker["event_logging"] = True
+ranker["ledger_dir"] = ledger_dir
+data["ranker"] = ranker
 # BVT runs on CPU (MSA_DEVICE=cpu, see Step 7), where the bundled config
 # default `enable_object_detection: auto` resolves to "skip". Force it on
 # so the indexer actually populates per-keyframe tags that the runtime
@@ -197,6 +214,12 @@ export MSA_REALDATA_THUMB_DIR="$DATA_DIR/data/thumbnails"
 export MSA_REALDATA_FACE_THUMB_DIR="$DATA_DIR/data/face_thumbnails"
 export MSA_REALDATA_FIXTURE_ROOT="$FIXTURE_ROOT"
 export MSA_REALDATA_BASE_URL="http://127.0.0.1:$API_PORT"
+# Expose the ledger dir (→ the BVT open-capture test runs) ONLY when the ranker wheel is
+# actually bundled. Public-mirror bundles ship without it ⇒ no LedgerWriter ⇒ no events;
+# leaving the var unset makes the test skip cleanly instead of failing.
+if ls "$APP_DIR"/wheels/msa_ranker-*.whl >/dev/null 2>&1; then
+  export MSA_REALDATA_LEDGER_DIR="$LEDGER_DIR"
+fi
 
 "$MSA_BIN" api start --no-browser >"$API_LOG" 2>&1 &
 API_PID=$!

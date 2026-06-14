@@ -1,4 +1,5 @@
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, WebSocket
 from fastapi.responses import FileResponse
@@ -12,6 +13,7 @@ from msa_apps.search_api.schemas import (
     FaceLabelRequest, BulkLabelRequest,
     PersonSuggestion, FaceSuggestionsResponse,
     BatchFaceSuggestionsRequest, BatchFaceSuggestionsResponse, BatchFaceSuggestionItem,
+    TrackOpenRequest,
 )
 from msa_apps.search_api.deps import get_query_engine
 from msa_query.storage.db import connect_readonly
@@ -34,10 +36,89 @@ try:
 except Exception:  # pragma: no cover
     QdrantClient = None  # type: ignore
 
+
+def _resolve_app_version() -> str:
+    """OpenAPI schema version — derived from installed package metadata (stamped
+    from the git tag at release build), never a hardcoded literal. Mirrors
+    `msa status`. Falls back to a dev marker for an uninstalled source checkout."""
+    from importlib.metadata import version, PackageNotFoundError
+    for dist in ("media-search-agent", "msa"):
+        try:
+            return version(dist)
+        except PackageNotFoundError:
+            continue
+    return "0.0.0.dev0"
+
+
+_APP_VERSION = _resolve_app_version()
+
 # --- Helpers for resolving absolute paths from (source_name, rel_path) ---
 from pathlib import Path
 from typing import Dict
-from fastapi import Request
+import uuid
+from fastapi import Request, BackgroundTasks, Response
+
+# Optional reranker integration (ADR-013). The ledger (logging) and serving modules are
+# imported SEPARATELY so an older msa_ranker that ships `ledger` but not yet `serving`
+# keeps event logging working — serving simply stays unavailable (learning-to-rank off).
+try:
+    from msa_ranker.ledger import LedgerWriter as _LedgerWriter
+except ModuleNotFoundError as _exc:
+    _LedgerWriter = None
+    if (_exc.name or "").split(".")[0] != "msa_ranker":
+        logger.warning("msa_ranker present but a dependency is missing; ranker logging disabled: {}", _exc)
+except Exception as _exc:  # present but broken/incompatible → surface it, but stay up
+    _LedgerWriter = None
+    logger.warning("msa_ranker present but failed to import; ranker logging disabled: {}", _exc)
+
+try:
+    from msa_ranker import serving as _ranker_serving
+except ModuleNotFoundError as _exc:
+    _ranker_serving = None
+    if (_exc.name or "").split(".")[0] != "msa_ranker":
+        logger.warning("msa_ranker present but a dependency is missing; learned ranking disabled: {}", _exc)
+except Exception as _exc:
+    _ranker_serving = None
+    logger.warning("msa_ranker present but failed to import; learned ranking disabled: {}", _exc)
+
+
+def _append_search_events(writer, search_id, q, query_context, results, model_version=None) -> None:
+    """Best-effort: append the search + shown events for a completed search
+    (runs as a post-response BackgroundTask; never affects the response)."""
+    try:
+        # If feature extraction was unavailable (msa_ranker present but broken), results
+        # carry features=None. Logging shown rows with empty features would corrupt the
+        # training dataset — skip logging entirely instead (#B).
+        if results and results[0].get("features") is None:
+            logger.warning("ranker features unavailable; skipping event logging to avoid empty rows")
+            return
+        ctx = {
+            "people": query_context.get("inferred_person_ids", []),
+            "date_intent": query_context.get("date_filter"),
+            "visual_tokens": query_context.get("visual_tokens", []),
+        }
+        _served = bool(query_context.get("ltr_served"))
+        writer.append_search(
+            search_id=search_id, user_id="default", query=q, ctx=ctx,
+            flag_on=_served, model_version=(model_version if _served else None), k=len(results),
+        )
+        rows = [
+            {
+                "media_id": str(r.get("id")),
+                "position": i,
+                "score": r.get("score") or 0.0,
+                "heuristic_score": (
+                    r.get("heuristic_score")
+                    if r.get("heuristic_score") is not None
+                    else (r.get("score") or 0.0)
+                ),
+                "features": r.get("features") or {},
+            }
+            for i, r in enumerate(results)
+        ]
+        writer.append_shown(search_id=search_id, rows=rows)
+    except Exception as exc:  # never let logging surface to the user
+        logger.warning("ranker event append failed (best-effort): {}", exc)
 
 def _get_config(request: Request):
     """Return current config from app.state if set, else load from settings.
@@ -128,6 +209,69 @@ async def _lifespan(app: FastAPI):
         _models_dir = getattr(_startup_cfg, 'models_dir', None) if _startup_cfg is not None else None
         if _models_dir is not None:
             _setup_models.get_manager().start_if_needed(_models_dir)
+        # Reranker event ledger (ADR-012/013): build a best-effort LedgerWriter onto
+        # app.state when msa_ranker is installed and event_logging is on. Absent package
+        # or any failure → no writer → MSA behaves exactly as today.
+        app.state.ledger_writer = None
+        try:
+            if _LedgerWriter is not None and _startup_cfg is not None:
+                _rk = getattr(_startup_cfg, "ranker", None)
+                _logging_on = getattr(_rk, "event_logging", True) if _rk else True
+                if _logging_on:
+                    # Config resolution (_resolve_data_paths) normally sets ranker.ledger_dir
+                    # to <data_dir>/ranker-ledger. This fallback only fires for configs built
+                    # without that resolution; keep it in the DATA area (alongside index/),
+                    # never logs/ (spec 01 — the ledger holds durable training labels).
+                    _ldir = Path(
+                        (getattr(_rk, "ledger_dir", None) if _rk else None)
+                        or (_startup_cfg.index_dir.parent / "ranker-ledger")
+                    )
+                    app.state.ledger_writer = _LedgerWriter(_ldir, event_logging=True)
+                    logger.info("Ranker event ledger active at {}", _ldir)
+        except Exception as _exc:  # pragma: no cover
+            logger.warning("Ranker ledger init failed (ranking telemetry off): {}", _exc)
+            app.state.ledger_writer = None
+        # Learned reranker (spec 06): resolve the model ONCE at startup, GUARDED. The gate
+        # (gate_ok) can pass yet load() race a half-written rename, so the whole thing is
+        # wrapped — a failure sets ranker=None and MSA still starts on the heuristic
+        # (AC-06.8, INV-3). Master flag default OFF ⇒ no model loaded unless asked.
+        app.state.ranker = None
+        app.state.ranker_model_id = None
+        try:
+            _rk = getattr(_startup_cfg, "ranker", None) if _startup_cfg is not None else None
+            if (
+                _ranker_serving is not None
+                and _rk is not None
+                and getattr(_rk, "enable_learning_to_rank", False)
+                and getattr(_rk, "ltr_model_dir", None)
+            ):
+                _mdir = Path(_rk.ltr_model_dir).expanduser()
+                # `Ranker.load` RE-VALIDATES the full gate (beats_baseline + feature-version
+                # + sha) on the exact bytes it reads, so even if the dir is swapped between
+                # gate_ok() and load() a gate-failing model is never served — load raises and
+                # we fall back. Deployment is a manual, atomic write-temp-rename step
+                # (ADR-011), not racing startup.
+                if _ranker_serving.gate_ok(_mdir):
+                    app.state.ranker = _ranker_serving.Ranker.load(_mdir)
+                    # Record the served model's id (from the manifest) so learned-search
+                    # events carry it — impressions/opens stay attributable per model. The id
+                    # is best-effort telemetry; serving correctness does not depend on it.
+                    try:
+                        _mf = json.loads((_mdir / "manifest.json").read_text())
+                        app.state.ranker_model_id = _mf.get("model_id")
+                    except Exception:
+                        app.state.ranker_model_id = None
+                    logger.info(
+                        "Learned ranker active from {} (model_id={})",
+                        _mdir,
+                        app.state.ranker_model_id,
+                    )
+                else:
+                    logger.info("Learned ranker gate closed at {} — using heuristic", _mdir)
+        except Exception as _exc:
+            logger.warning("Ranker load failed at startup — using heuristic: {}", _exc)
+            app.state.ranker = None
+            app.state.ranker_model_id = None
         # Startup complete — mark the app ready for health checks
         app.state._ready = True
         logger.info("App startup complete - status: ready")
@@ -173,7 +317,7 @@ def create_app(config_override=None, query_engine_override=None, reset_dependenc
     # Use existing global app if present (keeps route registrations), else create a new one
     app_instance = globals().get('app') if isinstance(globals().get('app'), FastAPI) else None
     if app_instance is None:
-        app_instance = FastAPI(title="Media Search API", version="0.1.0", lifespan=_lifespan)
+        app_instance = FastAPI(title="Media Search API", version=_APP_VERSION, lifespan=_lifespan)
         # Save into globals so subsequent decorators bind to this instance
         globals()['app'] = app_instance
         app_instance.add_middleware(
@@ -234,10 +378,14 @@ def health(request: Request):
     ready = getattr(request.app.state, "_ready", False)
     return {"status": "ready" if ready else "starting"}
 @app.post("/search", response_model=SearchResponse)
-def search(req: SearchRequest, request: Request, qe = Depends(get_query_engine)):
+def search(req: SearchRequest, request: Request, tasks: BackgroundTasks, qe = Depends(get_query_engine)):
     filters = req.filters.dict() if req.filters else None
     logger.info(f"API /search q='{req.q}' filters={filters}")
-    results = qe.search(req.q, filters=filters)
+    # Pass the startup-loaded, gated ranker (or None) through to the engine for this request
+    # — None ⇒ heuristic order, byte-identical to today (INV-3, spec 06). Threaded as a
+    # parameter (not shared engine state) so concurrent requests never race.
+    results = qe.search(req.q, filters=filters, ranker=getattr(request.app.state, "ranker", None))
+    query_context = getattr(results, "query_context", {})
     # Enrich results with GPS from SQLite
     try:
         S = _get_config(request)
@@ -274,8 +422,33 @@ def search(req: SearchRequest, request: Request, qe = Depends(get_query_engine))
     except Exception as e:
         logger.warning(f"GPS enrichment failed: {e}")
     logger.info(f"API /search results={len(results)}")
+    # Reranker telemetry (ADR-009/012): correlate opens to this search, append events
+    # AFTER the response (BackgroundTask) so logging never adds latency or failure.
+    search_id = str(uuid.uuid4())
+    writer = getattr(request.app.state, "ledger_writer", None)
+    if writer is not None:
+        _model_id = getattr(request.app.state, "ranker_model_id", None)
+        tasks.add_task(
+            _append_search_events, writer, search_id, req.q, query_context, results, _model_id
+        )
     # Ensure id is always a string for Pydantic validation
-    return SearchResponse(results=[SearchItem(**{**r, "id": str(r["id"])}) for r in results])
+    return SearchResponse(
+        results=[SearchItem(**{**r, "id": str(r["id"])}) for r in results],
+        search_id=search_id,
+    )
+
+
+@app.post("/track/open", status_code=204)
+def track_open(req: TrackOpenRequest, request: Request):
+    """Record that a search result was opened (the label). Fire-and-forget: returns
+    204 unconditionally, and never depends on the ranker being present (INV-9/ADR-009)."""
+    writer = getattr(request.app.state, "ledger_writer", None)
+    if writer is not None and req.search_id and req.media_id:
+        try:
+            writer.append_open(search_id=req.search_id, media_id=req.media_id, user_id="default")
+        except Exception as exc:  # telemetry must never fail the request (INV-9)
+            logger.warning("track_open append failed (best-effort): {}", exc)
+    return Response(status_code=204)
 
 # --- Media library listing ---
 @app.get("/media")
@@ -2170,6 +2343,20 @@ if not _UI_DIST.is_dir():
     _UI_DIST = Path(_msa_root) / "src" / "msa_apps" / "ui" / "dist"
 
 if _UI_DIST.is_dir():
+    # Cache policy: Vite emits content-hashed files under assets/ (e.g.
+    # index-C2xlEnZ1.js) — their content can never change under a fixed name, so
+    # cache them forever. EVERYTHING else (the index.html shell, favicon) must
+    # revalidate on each load: the shell is the only thing that points at the
+    # current hashed bundles, so a stale-cached shell silently keeps users on the
+    # OLD UI after an app update (observed: /track/open went un-fired until a
+    # manual hard-refresh). `no-cache` = "cache but revalidate" → a ~0.5 KB
+    # conditional 304, not a re-download. See internal/metrics/learnings.jsonl.
+    _IMMUTABLE = {"Cache-Control": "public, max-age=31536000, immutable"}
+    _NO_CACHE = {"Cache-Control": "no-cache"}
+
+    def _index() -> FileResponse:
+        return FileResponse(_UI_DIST / "index.html", headers=_NO_CACHE)
+
     @app.get("/{full_path:path}", include_in_schema=False)
     def serve_spa(full_path: str):
         # Resolve to an absolute path and verify it stays inside _UI_DIST to
@@ -2178,7 +2365,8 @@ if _UI_DIST.is_dir():
             asset = (_UI_DIST / full_path).resolve()
             asset.relative_to(_UI_DIST.resolve())  # raises ValueError if outside
         except ValueError:
-            return FileResponse(_UI_DIST / "index.html")
+            return _index()
         if asset.is_file():
-            return FileResponse(asset)
-        return FileResponse(_UI_DIST / "index.html")
+            headers = _IMMUTABLE if full_path.startswith("assets/") else _NO_CACHE
+            return FileResponse(asset, headers=headers)
+        return _index()

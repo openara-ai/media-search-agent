@@ -22,6 +22,7 @@ if (-not (Test-Path $Bundle)) {
 $runRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
 $appDir = Join-Path $runRoot "msa-app"
 $dataDir = Join-Path $runRoot "msa-data"
+$ledgerDir = Join-Path $runRoot "ranker-ledger"
 $testRoot = Join-Path $runRoot "msa-real-media-tests"
 $configPath = Join-Path $dataDir "config.yaml"
 $fixtureRoot = Join-Path $testRoot "fixtures"
@@ -70,6 +71,20 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
+# S-5.4: IF the bundle shipped the learned-reranker serving library (zero-dep wheel),
+# confirm it installed into the bundle venv and imports. Public-mirror bundles ship
+# without the (private) wheel - skip cleanly there. Serving stays flag-off (heuristic).
+$rankerInBundle = Get-ChildItem (Join-Path $appDir "wheels") -Filter "msa_ranker-*.whl" -ErrorAction SilentlyContinue
+if ($rankerInBundle) {
+    & $venvPy -c "import msa_ranker.serving, msa_ranker.features, msa_ranker.model; print('msa_ranker serving lib OK')"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "msa_ranker wheel bundled but not importable in the bundle venv"
+        exit $LASTEXITCODE
+    }
+} else {
+    Write-Host "(no msa_ranker wheel in bundle - serving-lib check skipped; heuristic-only bundle)"
+}
+
 # Step 5: Write an isolated installed-app config that points at the staged
 # fixture tree and a CI-only API port.
 #
@@ -91,6 +106,12 @@ api = data.get("api") or {}
 api["host"] = "127.0.0.1"
 api["port"] = api_port
 data["api"] = api
+# S-5.4: pin the ranker event ledger to a known dir so the runtime BVT can assert
+# end-to-end label capture (search -> shown -> open). Logging is on by default.
+ranker = data.get("ranker") or {}
+ranker["event_logging"] = True
+ranker["ledger_dir"] = r"$ledgerDir"
+data["ranker"] = ranker
 # BVT runs on CPU (MSA_DEVICE=cpu, see Step 6), where the bundled config
 # default `enable_object_detection: auto` resolves to "skip". Force it on
 # so the indexer actually populates per-keyframe tags that the runtime
@@ -268,6 +289,12 @@ $env:MSA_REALDATA_THUMB_DIR = Join-Path $dataDir "data\thumbnails"
 $env:MSA_REALDATA_FACE_THUMB_DIR = Join-Path $dataDir "data\face_thumbnails"
 $env:MSA_REALDATA_FIXTURE_ROOT = $fixtureRoot
 $env:MSA_REALDATA_BASE_URL = "http://127.0.0.1:$apiPort"
+# Expose the ledger dir (-> the BVT open-capture test runs) ONLY when the ranker wheel is
+# actually bundled. Public-mirror bundles ship without it => no LedgerWriter => no events;
+# leaving the var unset makes the test skip cleanly instead of failing.
+if (Get-ChildItem (Join-Path $appDir "wheels") -Filter "msa_ranker-*.whl" -ErrorAction SilentlyContinue) {
+    $env:MSA_REALDATA_LEDGER_DIR = $ledgerDir
+}
 
 try {
     $apiProcess = Start-Process -FilePath $msaCmd `

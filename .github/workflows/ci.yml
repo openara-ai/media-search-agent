@@ -37,6 +37,14 @@ jobs:
       - name: Lint .ps1 files (ASCII + LF)
         run: python scripts/check_ps1_ascii.py
 
+      - name: Check rendered metrics views are in sync
+        run: |
+          if [ -f internal/scripts/render_metrics.py ]; then
+            python internal/scripts/render_metrics.py --check
+          else
+            echo "render_metrics.py absent (mirror) — skipping"
+          fi
+
       - name: Cache pip
         uses: actions/cache@v4
         with:

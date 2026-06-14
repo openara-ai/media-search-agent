@@ -66,6 +66,53 @@ class TestResolveDataPaths:
         # log_dir is NOT under MSA_DATA_DIR — it resolves via MSA_LOG_DIR independently
         assert cfg.log_dir != (data_root / "logs").resolve()
 
+    def test_ledger_dir_defaults_under_data_root_not_logs(self, monkeypatch, tmp_path):
+        """The event ledger holds durable training labels, so it defaults into MSA's DATA
+        area alongside index/ — NOT logs/ (spec 01; logs are disposable/backup-excluded)."""
+        from msa_settings import config as cfg_mod
+        cfg_mod.load_config.cache_clear()
+        monkeypatch.delenv("MSA_DEV", raising=False)
+        monkeypatch.setenv("MSA_DATA_DIR", str(tmp_path / "mydata"))
+
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("log_level: INFO\n")
+        cfg = cfg_mod._load_config_impl(str(config_file))
+
+        data_root = tmp_path / "mydata"
+        assert Path(cfg.ranker.ledger_dir) == (data_root / "ranker-ledger").resolve()
+        # Sibling of index/, and explicitly NOT under logs/.
+        assert Path(cfg.ranker.ledger_dir).parent == cfg.index_dir.parent
+        assert Path(cfg.ranker.ledger_dir) != (Path(cfg.log_dir) / "ranker-ledger")
+
+    def test_relative_ledger_dir_resolves_under_data_root(self, monkeypatch, tmp_path):
+        """A relative ranker.ledger_dir override resolves under the data root (like
+        ltr_model_dir), not against the process cwd."""
+        from msa_settings import config as cfg_mod
+        cfg_mod.load_config.cache_clear()
+        monkeypatch.delenv("MSA_DEV", raising=False)
+        monkeypatch.setenv("MSA_DATA_DIR", str(tmp_path / "mydata"))
+
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("ranker:\n  ledger_dir: my-ledger\n")
+        cfg = cfg_mod._load_config_impl(str(config_file))
+
+        assert Path(cfg.ranker.ledger_dir) == (tmp_path / "mydata" / "my-ledger").resolve()
+
+    def test_absolute_ledger_dir_preserved(self, monkeypatch, tmp_path):
+        """An absolute ranker.ledger_dir override is used verbatim, not re-rooted under
+        the data dir (mirrors test_explicit_absolute_path_in_config_is_preserved)."""
+        from msa_settings import config as cfg_mod
+        cfg_mod.load_config.cache_clear()
+        monkeypatch.delenv("MSA_DEV", raising=False)
+        monkeypatch.setenv("MSA_DATA_DIR", str(tmp_path / "mydata"))
+
+        abs_ledger = str(tmp_path / "elsewhere" / "ranker-ledger")
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(f"ranker:\n  ledger_dir: '{abs_ledger}'\n")
+        cfg = cfg_mod._load_config_impl(str(config_file))
+
+        assert Path(cfg.ranker.ledger_dir) == Path(abs_ledger)
+
     def test_msa_log_dir_overrides_platform_default(self, monkeypatch, tmp_path):
         from msa_settings import config as cfg_mod
         cfg_mod.load_config.cache_clear()

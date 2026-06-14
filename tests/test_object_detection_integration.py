@@ -183,8 +183,15 @@ def test_qdrant_filter_builder():
     print(f"✓ Qdrant filter returns None for empty tags")
 
 
+@pytest.mark.slow
 def test_full_pipeline_with_object_detection(temp_workspace):
-    """Test the full indexing pipeline with object detection enabled."""
+    """Test the full indexing pipeline with object detection enabled.
+
+    Marked `slow` (kept out of the quick `-m "not slow"` gate): although the object
+    detector is stubbed, `run_index` still builds the real `ViT-L-14` CLIP encoder, which
+    downloads weights from HuggingFace on a cold runner → flaky HTTP 429. The fast gate
+    must stay hermetic; the full lane (which runs slow tests) keeps this coverage.
+    """
     from msa_indexer.pipeline import run_index
     from msa_indexer.db.sqlite_store import SQLiteStore
     from types import SimpleNamespace

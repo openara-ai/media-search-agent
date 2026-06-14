@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { X, MapPin, Calendar, Tag, Expand, Copy, Check } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import { getMediaFaces, imageUrl, videoUrl } from '../../api/media'
+import { trackOpen } from '../../api/search'
 import { FaceStrip } from './FaceStrip'
 import { cn } from '../../lib/utils'
 
@@ -30,6 +31,7 @@ interface DrawerItem {
 interface MediaDetailDrawerProps {
   item: DrawerItem | null
   onClose: () => void
+  searchId?: string | null  // present only when opened from a search → enables /track/open
 }
 
 function formatDate(iso: string | null | undefined): string {
@@ -74,9 +76,24 @@ function PathRow({ path }: { path: string }) {
   )
 }
 
-export function MediaDetailDrawer({ item, onClose }: MediaDetailDrawerProps) {
+export function MediaDetailDrawer({ item, onClose, searchId }: MediaDetailDrawerProps) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const [imgLightbox, setImgLightbox] = useState(false)
+
+  // Log the open as a relevance label when this item came from a search (best-effort).
+  // Track once per opened item — a later searchId change while the same item stays open
+  // (background refetch / a new search) must not re-post a duplicate, mis-attributed label.
+  const trackedItemRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!item?.id) {
+      trackedItemRef.current = null  // reset when the drawer closes
+      return
+    }
+    if (searchId && trackedItemRef.current !== item.id) {
+      trackedItemRef.current = item.id
+      trackOpen(searchId, item.id)
+    }
+  }, [item?.id, searchId])
 
   const { data: facesData } = useQuery({
     queryKey: ['media-faces', item?.id],

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -42,6 +42,51 @@ describe('MediaDetailDrawer', () => {
   it('does not render media content when item is null', () => {
     wrap(<MediaDetailDrawer item={null} onClose={vi.fn()} />)
     expect(screen.queryByRole('img')).toBeNull()
+  })
+
+  describe('open tracking (/track/open)', () => {
+    it('posts the open as a label when opened from a search', async () => {
+      wrap(<MediaDetailDrawer item={baseItem} onClose={vi.fn()} searchId="srch-123" />)
+      await waitFor(() => {
+        expect(fetch).toHaveBeenCalledWith('/track/open', expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ search_id: 'srch-123', media_id: 'img-01' }),
+        }))
+      })
+    })
+
+    it('does not post /track/open when there is no search_id', async () => {
+      wrap(<MediaDetailDrawer item={baseItem} onClose={vi.fn()} />)
+      // Wait for effects + the faces query to flush, so a late post would be caught.
+      await waitFor(() => expect(fetch).toHaveBeenCalled())  // the faces request
+      await new Promise(r => setTimeout(r, 0))
+      const urls = (fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls.map(c => c[0])
+      expect(urls).not.toContain('/track/open')
+    })
+
+    it('tracks once per opened item even if searchId changes while it stays open', async () => {
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      const view = (sid: string) => (
+        <QueryClientProvider client={qc}>
+          <MemoryRouter>
+            <MediaDetailDrawer item={baseItem} onClose={vi.fn()} searchId={sid} />
+          </MemoryRouter>
+        </QueryClientProvider>
+      )
+      const { rerender } = render(view('srch-1'))
+      await waitFor(() =>
+        expect(fetch).toHaveBeenCalledWith('/track/open', expect.objectContaining({ method: 'POST' }))
+      )
+      // Same item stays open but the search refetches under a new id — must NOT re-post.
+      rerender(view('srch-2'))
+      await new Promise(r => setTimeout(r, 0))
+      const trackPosts = (fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls
+        .filter(c => c[0] === '/track/open')
+      expect(trackPosts).toHaveLength(1)
+      expect(trackPosts[0][1]).toMatchObject({
+        body: JSON.stringify({ search_id: 'srch-1', media_id: 'img-01' }),
+      })
+    })
   })
 
   describe('PathRow', () => {

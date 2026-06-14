@@ -126,6 +126,19 @@ else
   printf '\033[0;33m  ~ python not found — skipping pytest\033[0m\n'
 fi
 
+# ── Rendered metrics views (regenerate-and-diff gate) ────────────────────────
+# Keep the ROADMAP/learnings generated regions in sync with the internal/metrics
+# ledgers. Skipped where the renderer is absent (e.g. the public mirror, which
+# excludes internal/).
+if [ -n "$PYTHON" ] && [ -f "$ROOT/internal/scripts/render_metrics.py" ]; then
+  bold "Checking rendered ROADMAP/learnings views..."
+  if "$PYTHON" "$ROOT/internal/scripts/render_metrics.py" --check; then
+    check_pass "metrics views in sync"
+  else
+    check_fail "metrics views stale — run: python internal/scripts/render_metrics.py"
+  fi
+fi
+
 # ── Vitest (if ui directory exists and npm is available) ─────────────────────
 
 UI_DIR="$ROOT/src/msa_apps/ui"

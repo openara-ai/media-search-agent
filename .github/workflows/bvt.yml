@@ -4,9 +4,15 @@ name: BVT
 # installer tools. The bundle jobs are the safety net for tool version drift —
 # they confirm that the pinned versions in versions.env actually work end-to-end.
 #
+# This is the STANDALONE bundle-validation workflow. The release pipeline no
+# longer calls it: as of the build-once change, release.yml validates each
+# real-versioned release-candidate bundle in-place inside its build job (the
+# exact artifact that ships), rather than rebuilding a throwaway 0.0.0-ci bundle
+# here. Use this workflow for on-demand bundle BVT and the dev-tools harness.
+#
 # Triggers:
 #   workflow_dispatch — manual run; include_slow_checks opt-in
-#   workflow_call     — release gate (always runs bundle jobs, never slow checks)
+#   workflow_call     — retained for ad-hoc reuse (no current caller)
 
 on:
   workflow_dispatch:

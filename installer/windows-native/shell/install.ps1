@@ -806,7 +806,7 @@ function Install-Bundle($tag) {
     New-Item -ItemType Directory -Path $RepoDir -Force | Out-Null
 
     foreach ($item in @("src", "scripts", "pyproject.toml", "requirements.txt",
-                        "requirements-windows.txt", "LICENSE", "NOTICE", "uninstall.ps1")) {
+                        "requirements-windows.txt", "LICENSE", "NOTICE", "uninstall.ps1", "wheels")) {
         $src = Join-Path $bundleDir $item
         if (Test-Path $src) {
             Copy-Item $src (Join-Path $RepoDir $item) -Recurse -Force
@@ -960,14 +960,73 @@ function Install-AppRuntime($UvExe) {
     $reqs = "$RepoDir\requirements-windows.txt"
     if (-not (Test-Path $reqs)) { $reqs = "$RepoDir\requirements.txt" }
 
-    Write-Info "Installing Python packages (this may take several minutes)..."
-    Invoke-Native "uv pip install requirements" {
-        & $UvExe pip install --python "$VenvDir\Scripts\python.exe" -r $reqs --quiet
+    # Strip any uncommented msa-ranker line so the ranker is installed only by the
+    # explicit wheel-or-pin branch below (always --no-deps), never by the bulk -r step.
+    $rankerRe  = '^\s*msa[-_]ranker\s*(==|@)'
+    $reqLines  = Get-Content $reqs
+    $rankerPin = ($reqLines | Where-Object { $_ -notmatch '^\s*#' -and $_ -match $rankerRe } | Select-Object -First 1)
+    # Drop a trailing inline comment ( #... preceded by space) - pip rejects it on the
+    # command line, unlike in a -r file. The leading-space requirement preserves a
+    # "#fragment" inside a URL/wheel spec (no preceding space).
+    if ($rankerPin) { $rankerPin = ($rankerPin -replace '\s+#.*$', '').Trim() }
+    $tmpReqs = Join-Path $env:TEMP "msa-reqs-$PID.txt"
+    # Write UTF-8 *without* a BOM. Set-Content -Encoding UTF8 on Windows PowerShell 5.1
+    # emits a BOM (U+FEFF), which lands on the first requirement line and can make
+    # uv/pip mis-parse it. UTF8Encoding($false) writes no BOM.
+    $kept = @($reqLines | Where-Object { $_ -match '^\s*#' -or $_ -notmatch $rankerRe })
+    [System.IO.File]::WriteAllLines($tmpReqs, $kept, (New-Object System.Text.UTF8Encoding($false)))
+
+    try {
+        Write-Info "Installing Python packages (this may take several minutes)..."
+        Invoke-Native "uv pip install requirements" {
+            & $UvExe pip install --python "$VenvDir\Scripts\python.exe" -r $tmpReqs --quiet
+        }
+        Invoke-Native "uv pip install app" {
+            & $UvExe pip install --python "$VenvDir\Scripts\python.exe" --no-deps $RepoDir --quiet
+        }
+        # Learned-reranker serving library (zero-dependency, installed --no-deps). The venv
+        # is reused across upgrades, so ALWAYS clear any prior msa-ranker first, then
+        # (re)install from the configured source if one is present. Uninstall-first keeps the
+        # venv's ranker state matching the requirements in every case - a deactivated pin, or
+        # a pin whose PEP 508 marker is false here (uv installs nothing) - both end heuristic
+        # (INV-9; app.py logs whenever msa_ranker imports). No-op on a fresh venv (uv exits 0
+        # when the package is absent).
+        #
+        # uv prints "Using Python ... environment at:" to stderr; under the script-wide
+        # $ErrorActionPreference='Stop', PowerShell 5.1 promotes ANY native-command stderr
+        # write to a terminating NativeCommandError -> exit 1, and `*> $null` does not
+        # suppress it (it redirects the text but the terminating error still fires). This is
+        # a best-effort no-op, so drop to 'Continue' around it (the bash twin in install.sh
+        # achieves the same with `|| true`). --quiet also keeps the banner off stdout.
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & $UvExe pip uninstall --python "$VenvDir\Scripts\python.exe" --quiet msa-ranker *> $null
+        } finally {
+            $ErrorActionPreference = $prevEAP
+        }
+        $rankerWheel = Get-ChildItem (Join-Path $RepoDir "wheels") -Filter "msa_ranker-*.whl" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($rankerWheel) {
+            # Offline path: the vendored wheel ships only with private bundles.
+            Invoke-Native "uv pip install msa_ranker" {
+                & $UvExe pip install --python "$VenvDir\Scripts\python.exe" --no-deps $rankerWheel.FullName --quiet
+            }
+            Write-Ok "Learned reranker installed ($($rankerWheel.Name))"
+        } elseif ($rankerPin) {
+            # Online path (the public mirror ships no vendored wheel): install whichever single
+            # msa-ranker spec is uncommented in the requirements - a PyPI ==pin, a GitHub
+            # release-asset URL, or a git+ ref. ADR-011 keeps that version == the wheel's. If
+            # the spec carries a marker that is false here, uv installs nothing -> stays
+            # heuristic (the uninstall above already cleared any stale copy).
+            Invoke-Native "uv pip install msa_ranker (pin)" {
+                & $UvExe pip install --python "$VenvDir\Scripts\python.exe" --no-deps "$rankerPin" --quiet
+            }
+            Write-Ok "Learned reranker installed from requirements pin ($rankerPin)"
+        }
+        Write-Ok "Python packages installed"
+    } finally {
+        Remove-Item $tmpReqs -ErrorAction SilentlyContinue
     }
-    Invoke-Native "uv pip install app" {
-        & $UvExe pip install --python "$VenvDir\Scripts\python.exe" --no-deps $RepoDir --quiet
-    }
-    Write-Ok "Python packages installed"
 }
 
 function Install-FacenetPytorch($UvExe) {

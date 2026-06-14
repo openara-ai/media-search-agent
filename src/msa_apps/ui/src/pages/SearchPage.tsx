@@ -24,10 +24,15 @@ export function SearchPage() {
   const [filters, setFilters] = useState<SearchFilters>({})
   const [minScore, setMinScore] = useState(15)
   const [selected, setSelected] = useState<SearchItem | null>(null)
+  // Snapshot the search_id at click time so an open stays tied to the search that produced
+  // the result — a later background refetch changing data.search_id can't re-attribute it.
+  const [selectedSearchId, setSelectedSearchId] = useState<string | null>(null)
   const indexerRunning = useIndexerRunning()
 
   const debouncedFilters = useDebounce(filters, 300)
-  const { data: allResults, isFetching, isError } = useSearch(submitted, debouncedFilters)
+  const { data, isFetching, isError } = useSearch(submitted, debouncedFilters)
+  const allResults = data?.results
+  const searchId = data?.search_id ?? null
   const results = minScore > 0
     ? allResults?.filter(r => (r.score ?? 0) * 100 >= minScore)
     : allResults
@@ -111,7 +116,7 @@ export function SearchPage() {
                     type={item.type}
                     date={item.date}
                     place={item.place}
-                    onClick={() => setSelected(item)}
+                    onClick={() => { setSelected(item); setSelectedSearchId(searchId) }}
                   />
                 ))}
               </div>
@@ -120,7 +125,7 @@ export function SearchPage() {
         </div>
       </div>
 
-      <MediaDetailDrawer item={selected} onClose={() => setSelected(null)} />
+      <MediaDetailDrawer item={selected} onClose={() => setSelected(null)} searchId={selectedSearchId} />
     </div>
   )
 }

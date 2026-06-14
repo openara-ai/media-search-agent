@@ -4,7 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "media-search-agent"
-version = "0.1.0"
+# Dev placeholder only — NOT authoritative. The real version is the git tag,
+# stamped into this field at release build (scripts/lib/version.sh via the
+# release workflow / build-bundle.sh). All runtime surfaces derive from the
+# installed package metadata; see _resolve_app_version in the search API.
+version = "0.0.0.dev0"
 description = "Local media indexer with vector+metadata search"
 readme = "README.md"
 requires-python = ">=3.11"

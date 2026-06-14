@@ -80,6 +80,25 @@ class RetrievalConfig:
     search_score_trace: bool = False
 
 @dataclass
+class RankerConfig:
+    """msa-ranker integration config.
+
+    `event_logging` is the privacy kill-switch (ADR-014, default ON — labels are needed
+    to learn; set false to opt out). `ledger_dir` defaults to <data_dir>/ranker-ledger
+    (alongside `index/`, NOT logs/ — it holds durable training labels; spec 01) when unset;
+    a relative override resolves under the data root.
+
+    Serving (spec 06): `enable_learning_to_rank` is the master flag — **default OFF**, so
+    search is byte-identical to today (INV-3) until a model is explicitly enabled.
+    `ltr_model_dir` is the deployed model dir (a `manifest.json` + its artifact); the gate
+    (`beats_baseline` + feature-version + sha) is applied at load, and any failure falls
+    back to the heuristic."""
+    event_logging: bool = True
+    ledger_dir: Optional[str] = None
+    enable_learning_to_rank: bool = False
+    ltr_model_dir: Optional[str] = None
+
+@dataclass
 class CollectionsConfig:
     """Qdrant collection names"""
     image: str = "image_emb"
@@ -152,6 +171,7 @@ class Config:
     # Nested configs
     server: ServerConfig = field(default_factory=ServerConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
+    ranker: RankerConfig = field(default_factory=RankerConfig)
     collections: CollectionsConfig = field(default_factory=CollectionsConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
     ui: UiConfig = field(default_factory=UiConfig)
@@ -343,6 +363,28 @@ def _resolve_data_paths(cfg: Config) -> Config:
         p: Path = getattr(cfg, field_name)
         if not p.is_absolute():
             setattr(cfg, field_name, (data_root / p).resolve())
+
+    # The reranker model dir is nested under `ranker`. Resolve it the same way (relative
+    # → data root, `~` expanded) so a relative `ltr_model_dir` works when `msa api start`
+    # runs from any cwd — not interpreted against the process working directory.
+    _rk = getattr(cfg, "ranker", None)
+    _mdir = getattr(_rk, "ltr_model_dir", None) if _rk is not None else None
+    if _mdir:
+        _mp = Path(_mdir).expanduser()
+        _rk.ltr_model_dir = str(_mp if _mp.is_absolute() else (data_root / _mp).resolve())
+
+    # The reranker event ledger (spec 01) lives in MSA's DATA area, alongside `index/` —
+    # NOT in logs/. logs/ is treated as disposable (log-rotated, cleaned, often excluded
+    # from backups), but the ledger holds the accrued interaction labels the model trains
+    # on, so it belongs with the durable, backed-up data set (next to index/media.sqlite).
+    # Default it under data_root; resolve a relative override the same way as ltr_model_dir.
+    if _rk is not None:
+        _ldir = getattr(_rk, "ledger_dir", None)
+        if _ldir:
+            _lp = Path(_ldir).expanduser()
+            _rk.ledger_dir = str(_lp if _lp.is_absolute() else (data_root / _lp).resolve())
+        else:
+            _rk.ledger_dir = str((data_root / "ranker-ledger").resolve())
 
     # Create directories that must exist before the app can write to them.
     # Files (sqlite_path, faiss_path, face_faiss_path) share index_dir as parent,

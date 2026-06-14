@@ -15,25 +15,69 @@ permissions:
   contents: write   # needed to create GitHub Releases and upload assets
 
 jobs:
-  # ── Repository gate: only auto-run on the staging and public mirrors ────────
-  # Tag-push auto-runs are restricted to the staging and public repos so the
-  # upstream dev repo (and any forks) don't accidentally cut a release.
+  # ── Repository gate: auto-run on private (main gate) + the staging/public mirrors ──
+  # The PRIVATE repo is the primary release gate: a tag-push there runs the full
+  # pipeline (tests + build + BVT) so failures are caught at the source, before the
+  # tag is ever mirrored. Publishing is still blocked on private by the `release`
+  # job's `if: github.repository != 'kumraj/media-search-agent'`, so private
+  # validates without cutting a GitHub Release.
+  # Staging/public auto-run on tag arrival to build + BVT (+ publish on public).
+  # Forks and any other repo are excluded so they can't accidentally cut a release.
   # Manual `workflow_dispatch` is allowed everywhere as an escape hatch.
   preflight:
     name: Repository gate
     if: >-
       github.event_name == 'workflow_dispatch' ||
+      github.repository == 'kumraj/media-search-agent' ||
       github.repository == 'openara-ai/media-search-agent-public-staging' ||
       github.repository == 'openara-ai/media-search-agent'
     runs-on: ubuntu-latest
-    timeout-minutes: 1
+    timeout-minutes: 2
     steps:
+      - uses: actions/checkout@v4
+
+      # The version is the tag (version=${GITHUB_REF_NAME#v}); there is no version
+      # input. Reject a non-v* ref so a stray branch dispatch can't cut a release
+      # tagged with the branch name. (The push trigger already filters to v*; this
+      # also covers workflow_dispatch, which can run against any ref.)
+      - name: Guard — ref must be a v* release tag
+        run: |
+          ref="${GITHUB_REF_NAME}"
+          case "$ref" in
+            v[0-9]*) echo "Release ref: $ref" ;;
+            *)
+              echo "::error::Release must run against a v<semver> tag (got '$ref'). For workflow_dispatch, pick a vX.Y.Z tag in the ref selector, not a branch."
+              exit 1 ;;
+          esac
+
+      # A release must ship a curated CHANGELOG section. Fail loudly if it's
+      # missing rather than publishing a placeholder body — run prepare_release.py
+      # (which renames [Unreleased] → [X.Y.Z], no leading v) before tagging.
+      - name: Guard — CHANGELOG has a section for this version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! awk -v ver="$version" '
+            /^## \[/ { h=$0; sub(/^## \[/,"",h); sub(/\].*/,"",h); if (h==ver) found=1 }
+            END { exit(found?0:1) }
+          ' CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$version]' section. Run internal/scripts/prepare_release.py to cut it before tagging."
+            exit 1
+          fi
+          echo "CHANGELOG section for $version present."
+
       - run: echo "Proceeding on ${{ github.repository }} (event=${{ github.event_name }}, ref=${{ github.ref_name }})"
 
-  # ── Test gate: all three must pass before any installer is built ────────────
+  # ── Test gate (PRIVATE only) ────────────────────────────────────────────────
+  # The full suite runs only on the private dev repo — now on every tag-push (the
+  # main gate), as well as on manual `workflow_dispatch`. At staging/public (auto on
+  # tag arrival) these are skipped — the tag was already validated in private — and
+  # only build + BVT run (budget). Because a "skipped" status propagates through the
+  # needs-graph, each downstream job (build-ui, the bundle jobs, release) carries its
+  # OWN explicit guard so it proceeds when these are skipped but blocks when they fail.
   test:
     name: Quick Tests (Ubuntu)
     needs: preflight
+    if: github.repository == 'kumraj/media-search-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -71,6 +115,7 @@ jobs:
   integration:
     name: Full Integration (Ubuntu)
     needs: preflight
+    if: github.repository == 'kumraj/media-search-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -101,6 +146,7 @@ jobs:
   macos-test:
     name: Unit Tests (macOS)
     needs: preflight
+    if: github.repository == 'kumraj/media-search-agent'
     runs-on: macos-14
     timeout-minutes: 20
     steps:
@@ -138,13 +184,24 @@ jobs:
 
   windows-test:
     needs: preflight
+    if: github.repository == 'kumraj/media-search-agent'
     uses: ./.github/workflows/windows-test.yml
 
-  # ── BVT gate: validates bundled tool versions end-to-end ────────────────────
-  bvt:
-    name: BVT (Bundle)
-    needs: [test, integration, macos-test, windows-test]
-    uses: ./.github/workflows/bvt.yml
+  # ── BVT gate ────────────────────────────────────────────────────────────────
+  # Build-once: the BVT (real-media install validation) now runs INSIDE each
+  # build-*-shell-bundle job below, against the exact real-versioned bundle that
+  # ships — not a separate 0.0.0-ci rebuild. A validation failure fails that build
+  # job, so the release (plain `if`, implicit all-needs-succeeded) is skipped. The
+  # reusable bvt.yml is kept for standalone manual runs (workflow_dispatch), which
+  # also exercise the dev-tools harness that the release path does not need.
+  #
+  # Skip propagation is the trap here: the private-only test jobs skip on staging/
+  # public, and that "skipped" status flows through the needs-graph. build-ui absorbs
+  # it with its !contains(failure) guard, but the guard does NOT carry over — each
+  # build-*-shell-bundle job and release needs its OWN explicit guard, or it skips even
+  # when build-ui succeeded (build + BVT then silently never run on staging/public). A
+  # failed preflight/test still blocks: build-ui skips → bundles see build-ui != success
+  # → skip → release skips.
 
   # NOTE: Releases ship shell bundles + bootstrap installer scripts (one-line
   # install). The Windows .exe path (Inno Setup) was removed in 2026-05; the
@@ -156,7 +213,13 @@ jobs:
     name: Build React UI
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [test, integration, macos-test, windows-test]
+    needs: [preflight, test, integration, macos-test, windows-test]
+    # preflight must SUCCEED for the build — and the bundle jobs that need build-ui, and
+    # release — to run. A failed preflight OR a skipped preflight (an out-of-allowlist
+    # repo, e.g. a fork's v* tag push, where preflight's repo gate skips it) blocks the
+    # whole chain, so an unapproved tag push can't burn the bundle/BVT runners. The
+    # full-test jobs may pass (private) or be skipped (staging/public); block if any failed.
+    if: ${{ !cancelled() && needs.preflight.result == 'success' && !contains(needs.*.result, 'failure') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -173,12 +236,16 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # ── macOS shell bundle ────────────────────────────────────────────────────────
+  # ── macOS shell bundle — build + BVT ──────────────────────────────────────────
   build-macos-shell-bundle:
-    name: Build macOS Shell Bundle
+    name: Build macOS Shell Bundle + Run BVT
     runs-on: macos-14
-    timeout-minutes: 30
+    timeout-minutes: 90
     needs: [build-ui]
+    # Explicit guard REQUIRED — without it this job inherits the implicit success()
+    # gate and is skipped on staging/public when the private-only test jobs skip (that
+    # "skipped" status propagates past build-ui). Run whenever build-ui succeeded.
+    if: ${{ !cancelled() && needs.build-ui.result == 'success' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -195,6 +262,22 @@ jobs:
       - name: Build macOS bundle
         run: bash installer/macos/shell/build-bundle.sh --version "${{ steps.version.outputs.version }}" --platform macos
 
+      # BVT: validate the exact release-candidate bundle we are about to upload,
+      # by installing it the way an end user would and running the real-media
+      # harness against the installed tools. Build-once: this is the same artifact
+      # that ships, not a separate 0.0.0-ci rebuild (which is what bvt.yml does for
+      # standalone manual runs).
+      - name: Cache bundle model artifacts
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/msa-macos-home/Library/Caches/MediaSearchAgent
+          key: ${{ runner.os }}-${{ runner.arch }}-bundle-models-v1
+
+      - name: Validate macOS bundle install (BVT)
+        run: |
+          BUNDLE=$(ls dist/shell/MediaSearchAgent-*-macos-arm64.tar.gz)
+          bash tests/real_media/scripts/validate-installed-bundle-macos.sh "$BUNDLE"
+
       - uses: actions/upload-artifact@v4
         with:
           name: macos-shell-bundle
@@ -202,12 +285,14 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # ── Linux shell bundle ────────────────────────────────────────────────────────
+  # ── Linux shell bundle — build + BVT ──────────────────────────────────────────
   build-linux-shell-bundle:
-    name: Build Linux Shell Bundle
+    name: Build Linux Shell Bundle + Run BVT
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 75
     needs: [build-ui]
+    # Explicit guard required — see build-macos-shell-bundle.
+    if: ${{ !cancelled() && needs.build-ui.result == 'success' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -224,6 +309,18 @@ jobs:
       - name: Build Linux bundle
         run: bash installer/macos/shell/build-bundle.sh --version "${{ steps.version.outputs.version }}" --platform linux
 
+      # BVT: validate the exact release-candidate bundle (see macOS job for rationale).
+      - name: Cache bundle model artifacts
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/msa-linux-home/.cache/MediaSearchAgent
+          key: ${{ runner.os }}-bundle-models-v1
+
+      - name: Validate Linux bundle install (BVT)
+        run: |
+          BUNDLE=$(ls dist/shell/MediaSearchAgent-*-linux-x86_64.tar.gz)
+          bash tests/real_media/scripts/validate-installed-bundle-linux.sh "$BUNDLE"
+
       - uses: actions/upload-artifact@v4
         with:
           name: linux-shell-bundle
@@ -231,12 +328,14 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # ── Windows shell bundle ──────────────────────────────────────────────────────
+  # ── Windows shell bundle — build + BVT ────────────────────────────────────────
   build-windows-shell-bundle:
-    name: Build Windows Shell Bundle
+    name: Build Windows Shell Bundle + Run BVT
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 90
     needs: [build-ui]
+    # Explicit guard required — see build-macos-shell-bundle.
+    if: ${{ !cancelled() && needs.build-ui.result == 'success' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -267,6 +366,20 @@ jobs:
         shell: bash
         run: bash installer/windows-native/shell/build-bundle.sh --version "${{ steps.version.outputs.version }}"
 
+      # BVT: validate the exact release-candidate bundle (see macOS job for rationale).
+      - name: Cache bundle model artifacts
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\msa-app\Cache
+          key: ${{ runner.os }}-bundle-models-v1
+
+      - name: Validate Windows bundle install (BVT)
+        shell: powershell
+        run: |
+          $zip = Get-ChildItem dist/shell/MediaSearchAgent-*-windows-x86_64.zip | Select-Object -First 1
+          & powershell -ExecutionPolicy Bypass -File tests/real_media/scripts/validate-installed-bundle-windows.ps1 -Bundle $zip.FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - uses: actions/upload-artifact@v4
         with:
           name: windows-shell-bundle
@@ -277,7 +390,24 @@ jobs:
   # ── GitHub Release ────────────────────────────────────────────────────────────
   release:
     name: Publish GitHub Release
-    needs: [build-macos-shell-bundle, build-linux-shell-bundle, build-windows-shell-bundle, bvt]
+    needs: [build-macos-shell-bundle, build-linux-shell-bundle, build-windows-shell-bundle]
+    # Publish only on the two openara-ai mirrors — never on the private dev repo (a
+    # tag-push there is a validation run that must NOT cut a Release), and never on a
+    # fork. Use a POSITIVE allowlist, not `!= private`: preflight admits workflow_dispatch
+    # from any repo (escape hatch), so a bare `!= private` would let a fork publish a
+    # Release on itself. The guard is also EXPLICIT about each bundle succeeding — a plain
+    # `if: <repo>` leans on the implicit success() gate, which skips this job whenever a
+    # needed bundle was skipped (and "skipped" reaches here transitively from the
+    # private-only test jobs on staging/public — the trap that disabled the bundle jobs).
+    # So: allowlist the publish targets, check each bundle's result, tolerate skipped
+    # ancestors via !cancelled().
+    if: >-
+      ${{ !cancelled()
+          && (github.repository == 'openara-ai/media-search-agent'
+              || github.repository == 'openara-ai/media-search-agent-public-staging')
+          && needs.build-macos-shell-bundle.result == 'success'
+          && needs.build-linux-shell-bundle.result == 'success'
+          && needs.build-windows-shell-bundle.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -287,6 +417,32 @@ jobs:
       - name: Extract version from tag
         id: version
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      # Pull this version's section out of CHANGELOG.md (the curated record),
+      # rather than auto-dumping commits. Prints the lines between "## [VERSION]"
+      # and the next "## [" heading.
+      - name: Extract changelog section for this release
+        id: changelog
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          section=$(awk -v ver="$VERSION" '
+            /^## \[/ {
+              hdr = $0
+              sub(/^## \[/, "", hdr); sub(/\].*/, "", hdr)
+              if (printing) { exit }
+              if (hdr == ver) { printing = 1; next }
+            }
+            printing && /^\[[^][]*\]:/ { exit }
+            printing { print }
+          ' CHANGELOG.md)
+          if [ -z "$(printf "%s" "$section" | tr -d '[:space:]')" ]; then
+            section="_No changelog entry for ${VERSION}; see CHANGELOG.md._"
+          fi
+          {
+            echo "section<<CHANGELOG_EOF"
+            printf "%s\n" "$section"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Download macOS shell bundle
         uses: actions/download-artifact@v4
@@ -327,10 +483,20 @@ jobs:
           # this, /releases/latest/ would never resolve to the only release
           # we have.
           prerelease: ${{ contains(github.ref_name, '-') }}
+          # The install one-liner below is PINNED to the public repo, not
+          # ${{ github.repository }}. Staging is private, so its release assets aren't
+          # anonymously downloadable, AND the installer scripts fetch the bundle from
+          # the public repo (install.sh GITHUB_REPO / install.ps1 $GithubRepo) — so a
+          # self-referential staging URL can never produce a working install. The public
+          # command is canonical (a staging release just previews it); CI BVT is what
+          # actually validates the staging install.
           body: |
             ## Media Search Agent v${{ steps.version.outputs.version }}
 
             Local-first semantic photo & video search. Indexes using CLIP embeddings, RT-DETR object detection, and facenet-pytorch face recognition. Fully offline — no cloud.
+
+            ### What's changed
+            ${{ steps.changelog.outputs.section }}
 
             ### Install
 

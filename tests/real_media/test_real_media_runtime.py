@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -90,7 +91,9 @@ def _json_request(url: str, method: str = "GET", payload: dict | None = None) ->
     request = Request(url, data=body, headers=headers, method=method)
     try:
         with urlopen(request, timeout=20) as response:
-            return response.status, json.loads(response.read().decode("utf-8"))
+            raw = response.read().decode("utf-8")
+            # 204 No Content (e.g. /track/open) has an empty body — return None.
+            return response.status, (json.loads(raw) if raw else None)
     except HTTPError as exc:  # pragma: no cover
         raw_body = exc.read().decode("utf-8", errors="replace")
         try:
@@ -292,6 +295,38 @@ class TestIndexedArtifacts:
             assert place.strip()
 
 
+def _wait_for_ledger_events(ledger_dir: Path, search_id: str, timeout: float = 15.0) -> list[dict]:
+    """Poll the JSONL ledger for every event tagged with `search_id`. `search`/`shown`
+    are appended via a BackgroundTask (after the HTTP response), so they trail slightly;
+    return as soon as search+shown+open are all present, else the best set seen by timeout.
+    """
+    deadline = time.monotonic() + timeout
+    latest: list[dict] = []
+    while True:
+        events: list[dict] = []
+        for path in sorted(ledger_dir.glob("events-*.jsonl")):
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if ev.get("search_id") == search_id:
+                    events.append(ev)
+        latest = events
+        if {"search", "shown", "open"} <= {e.get("ev") for e in events}:
+            return events
+        if time.monotonic() >= deadline:
+            return latest
+        time.sleep(0.5)
+
+
 @pytest.mark.skipif(_api_base_url() is None, reason="API runtime checks skipped because MSA_REALDATA_BASE_URL is not set")
 class TestRuntimeApi:
     def test_health_ready(self):
@@ -303,6 +338,51 @@ class TestRuntimeApi:
         status, payload = _json_request(f"{_api_base_url()}/search", method="POST", payload={"q": "dog"})
         assert status == 200
         assert isinstance(payload.get("results"), list)
+
+    def test_ranker_event_capture_end_to_end(self):
+        """The full label-capture loop in the INSTALLED bundle: /search returns a
+        search_id, /track/open records an open, and search + shown + open all land in
+        the JSONL ledger — with the shown rows carrying the serving-lib feature vector
+        (computed at the engine seam even though serving stays flag-off here).
+
+        This is the exact backend path that silently produced zero labels once (a
+        stale-cached UI never fired /track/open); the BVT now guards it end to end.
+        Skips cleanly if ranker logging isn't configured for the run.
+        """
+        ledger_dir = os.environ.get("MSA_REALDATA_LEDGER_DIR")
+        if not ledger_dir:
+            pytest.skip("MSA_REALDATA_LEDGER_DIR not set (ranker event logging not configured)")
+        ledger = Path(ledger_dir)
+
+        status, payload = _json_request(
+            f"{_api_base_url()}/search", method="POST", payload={"q": "dog"}
+        )
+        assert status == 200
+        search_id = payload.get("search_id")
+        assert search_id, "search response must carry search_id (ADR-009) so opens correlate"
+        results = payload.get("results") or []
+        assert results, "need at least one result to open"
+        media_id = results[0]["id"]
+
+        status, _ = _json_request(
+            f"{_api_base_url()}/track/open",
+            method="POST",
+            payload={"search_id": search_id, "media_id": media_id},
+        )
+        assert status == 204
+
+        events = _wait_for_ledger_events(ledger, search_id, timeout=15.0)
+        kinds = {e.get("ev") for e in events}
+        assert {"search", "shown", "open"} <= kinds, f"missing ledger event kinds; got {kinds}"
+        assert any(
+            e.get("media_id") == media_id for e in events if e.get("ev") == "open"
+        ), "the opened media_id was not captured as an open event"
+        shown = [e for e in events if e.get("ev") == "shown"]
+        assert (
+            shown
+            and isinstance(shown[0].get("features"), dict)
+            and "sim" in shown[0]["features"]
+        ), "shown rows must carry the serving-lib feature vector"
 
     def test_search_query_top_k_contains_expected_dog_fixtures(self):
         status, payload = _json_request(f"{_api_base_url()}/search", method="POST", payload={"q": "dog"})

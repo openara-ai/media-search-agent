@@ -33,6 +33,7 @@ export interface SearchItem {
 
 export interface SearchResponse {
   results: SearchItem[]
+  search_id?: string  // correlates a later /track/open back to this search (ADR-009)
 }
 
 export interface MediaItem {

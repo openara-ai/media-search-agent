@@ -69,7 +69,11 @@ tqdm
 truststore
 
 # Object detection — RT-DETR backend (Apache-2.0, default)
-transformers>=4.42.0
+# transformers <5: RT-DETR object detection (RTDetrForObjectDetection/RTDetrImageProcessor,
+# added 4.45). Cap below 5 because the macOS bundle pins torch>=2.4,<2.7 (arm64 wheel
+# stability) -> torch 2.6 / torchvision 0.21, which is too old for transformers 5.x's
+# RT-DETR import (it needs newer torchvision); 4.x RT-DETR works on capped + uncapped torch.
+transformers>=4.45,<5
 tokenizers>=0.19.0   # transitive of transformers; pinned here for stability
 accelerate>=0.27.0   # transitive of transformers; needed for device_map at runtime
 scenedetect  # Indexer imports shot detection support at startup; cv2 comes from opencv-python-headless above
@@ -79,3 +83,26 @@ reverse-geocoder
 
 # HEIC support
 pillow-heif
+
+# --- msa-ranker (optional learned reranker) ------------------------------------
+# OPTIONAL. MSA's import of the learned reranker is guarded (ADR-011), so the app
+# runs on the built-in heuristic when it is absent — which is the PUBLIC default.
+# Leave this commented for the heuristic (public) build.
+#
+# Install source, in order of how the installer resolves it:
+#   1. Offline/bundled: the vendored wheel in installer/wheels/ (private; absent
+#      from the public mirror). When present, the installer uses it and ignores
+#      the lines below.
+#   2. Online fallback: when no vendored wheel is present, the installer installs
+#      whichever SINGLE spec below is uncommented (pip install --no-deps <spec>).
+#
+# Activation later = uncomment exactly ONE line. Its version must equal the
+# vendored wheel version — enforced by tests/test_ranker_wheel_pin.py (ADR-011).
+# The openara-ai/msa-ranker coordinates below are illustrative until the package
+# is published.
+#   PyPI (once published on PyPI):
+# msa-ranker==0.0.1
+#   GitHub release asset (prebuilt wheel — no PyPI, no build step):
+# msa-ranker @ https://github.com/openara-ai/msa-ranker/releases/download/v0.0.1/msa_ranker-0.0.1-py3-none-any.whl
+#   Git tag (builds from source on the user's machine; needs git):
+# msa-ranker @ git+https://github.com/openara-ai/msa-ranker@v0.0.1

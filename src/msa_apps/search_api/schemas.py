@@ -36,6 +36,11 @@ class SearchItem(BaseModel):
     why: str | None
 class SearchResponse(BaseModel):
     results: List[SearchItem]
+    search_id: Optional[str] = None  # correlates opens back to this search (ADR-009)
+
+class TrackOpenRequest(BaseModel):
+    search_id: str
+    media_id: str
 
 class KeyframeInfo(BaseModel):
     kf_index: int
