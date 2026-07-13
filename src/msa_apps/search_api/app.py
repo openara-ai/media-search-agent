@@ -52,6 +52,24 @@ def _resolve_app_version() -> str:
 
 _APP_VERSION = _resolve_app_version()
 
+
+def _effective_api_url(cfg) -> str:
+    """The URL the API is actually reachable at, for the diagnostics endpoint (spec §1.3
+    "runtime port authority"). In the Tauri desktop shell the backend runs on the supervisor-
+    assigned ephemeral port (``SIDECAR_PORT``), not ``config.yaml`` ``api.port`` — so a
+    diagnostics ``api_url`` derived from config would be wrong (the config port is unused in
+    shell mode). Prefer the actually-bound sidecar port when present; else fall back to the
+    configured port (browser / ``msa api start`` mode, byte-identical to before)."""
+    sidecar_raw = os.environ.get("SIDECAR_PORT")
+    if sidecar_raw:
+        try:
+            sidecar_port = int(sidecar_raw)
+            if 1 <= sidecar_port <= 65535:
+                return f"http://127.0.0.1:{sidecar_port}"
+        except ValueError:
+            pass
+    return f"http://localhost:{getattr(getattr(cfg, 'api', None), 'port', 8000)}"
+
 # --- Helpers for resolving absolute paths from (source_name, rel_path) ---
 from pathlib import Path
 from typing import Dict
@@ -550,7 +568,6 @@ def list_media(
                 # correlated EXISTS so SQLite resolves the inner set once
                 # (driven by idx_face_person and the implicit UNIQUE index on
                 # person.name) instead of re-evaluating per outer media row.
-                # See internal/docs/search/BROWSE_FILTER_PERFORMANCE_LESSON.md.
                 where.append(
                     f"""
                     m.media_id IN (
@@ -2066,6 +2083,12 @@ def diagnostics(request: Request):
         p = log_dir / filename
         if p.exists():
             logs[name] = dp(p)
+    # msa-desktop.log: the unified rotating shell log (Tauri desktop mode) — the primary
+    # troubleshooting artifact spanning the provisioning shim + uvicorn. Written to the
+    # launcher log dir (MSA_LOG_DIR); absent in browser / `msa api start` mode.
+    desktop_log = log_dir / "msa-desktop.log"
+    if desktop_log.exists():
+        logs["desktop"] = dp(desktop_log)
     if latest_launch:
         logs["launch"] = dp(latest_launch)
     if latest_install:
@@ -2085,7 +2108,8 @@ def diagnostics(request: Request):
         "models_dir": dp(getattr(cfg, "models_dir", config_file.parent / "models")),
         "log_dir": dp(log_dir),
         "logs": logs,
-        "api_url": f"http://localhost:{getattr(getattr(cfg, 'api', None), 'port', 8000)}",
+        "api_url": _effective_api_url(cfg),
+        "app_version": _APP_VERSION,
     }
     if qdrant_url:
         result["qdrant_url"] = qdrant_url
@@ -2264,6 +2288,19 @@ def get_setup_status(request: Request):
     return {"ready": all(present.values()), "models": models_out}
 
 
+@app.post("/api/setup/retry", status_code=202)
+def retry_setup(request: Request):
+    """Re-trigger the first-launch model downloads: reset any errored models to pending and restart
+    the background worker. This is what the setup screen's Retry button needs — a plain page reload
+    only re-subscribes to the manager's held complete/error state (``/ws/setup`` is a pure subscriber
+    that must never call ``start_if_needed``). Idempotent and safe: ``start_if_needed`` is a no-op
+    when a download is already cleanly in flight or fully done, and only resets+restarts once every
+    in-progress model has settled with at least one error."""
+    S = _get_config(request)
+    _setup_models.get_manager().start_if_needed(S.models_dir)
+    return {"status": "retrying"}
+
+
 @app.websocket("/ws/setup")
 async def ws_setup(websocket: WebSocket):
     """Stream first-launch model download progress.
@@ -2350,7 +2387,7 @@ if _UI_DIST.is_dir():
     # current hashed bundles, so a stale-cached shell silently keeps users on the
     # OLD UI after an app update (observed: /track/open went un-fired until a
     # manual hard-refresh). `no-cache` = "cache but revalidate" → a ~0.5 KB
-    # conditional 304, not a re-download. See internal/metrics/learnings.jsonl.
+    # conditional 304, not a re-download.
     _IMMUTABLE = {"Cache-Control": "public, max-age=31536000, immutable"}
     _NO_CACHE = {"Cache-Control": "no-cache"}
 

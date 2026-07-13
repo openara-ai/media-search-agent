@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { QueryClientProvider, useQuery } from '@tanstack/react-query'
+import { QueryClientProvider } from '@tanstack/react-query'
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import { queryClient } from '@/lib/queryClient'
 import { Layout } from '@/components/layout/Layout'
@@ -9,9 +9,7 @@ import { BrowsePage } from '@/pages/BrowsePage'
 import { PeoplePage } from '@/pages/PeoplePage'
 import { IndexerPage } from '@/pages/IndexerPage'
 import { SettingsPage } from '@/pages/SettingsPage'
-import { SetupPage } from '@/pages/SetupPage'
-import { fetchSetupStatus } from '@/api/setup'
-import type { SetupStatus } from '@/api/setup'
+import { StartupGate } from '@/components/StartupGate'
 
 function RootRedirect() {
   const { search } = useLocation()
@@ -36,19 +34,7 @@ function MainApp() {
 }
 
 function AppInner() {
-  const [setupDone, setSetupDone] = useState(false)
   const [launchSplashVisible, setLaunchSplashVisible] = useState(false)
-
-  const { data, isLoading, isError, refetch } = useQuery<SetupStatus>({
-    queryKey: ['setup/status'],
-    queryFn: fetchSetupStatus,
-    // Retry while the API is still starting up
-    retry: 10,
-    retryDelay: 1000,
-    // Never re-fetch automatically once we have an answer
-    staleTime: Infinity,
-    refetchOnWindowFocus: false,
-  })
 
   useEffect(() => {
     const url = new URL(window.location.href)
@@ -62,58 +48,27 @@ function AppInner() {
   }, [])
 
   const dismissLaunchSplash = useCallback(() => setLaunchSplashVisible(false), [])
-  const launchSplash = (
-    <LaunchBanner visible={launchSplashVisible} onDismiss={dismissLaunchSplash} />
-  )
 
-  if (isLoading) {
-    return launchSplashVisible ? launchSplash : null
-  }
-
-  // Retries exhausted — API is unreachable. Show an explicit error rather than
-  // a permanent blank screen so the user knows what happened and can retry.
-  if (isError || !data) {
-    return (
-      <>
-        <div className="fixed inset-0 flex flex-col items-center justify-center gap-4 bg-slate-950 text-slate-300">
-          <p className="text-sm">Could not reach the Media Search Agent API.</p>
-          <button
-            type="button"
-            onClick={() => refetch()}
-            className="rounded-lg border border-slate-700 bg-slate-800 px-4 py-2 text-sm hover:bg-slate-700"
-          >
-            Retry
-          </button>
-        </div>
-        {launchSplash}
-      </>
-    )
-  }
-
-  if (!data.ready && !setupDone) {
-    return (
-      <>
-        <SetupPage
-          initialModels={data.models}
-          onComplete={() => setSetupDone(true)}
-        />
-        {launchSplash}
-      </>
-    )
-  }
-
+  // StartupGate guarantees the backend is up AND the AI models are ready before AppInner mounts,
+  // so there is no setup/status gating here anymore — just the main app + the launch banner.
   return (
     <>
       <MainApp />
-      {launchSplash}
+      <LaunchBanner visible={launchSplashVisible} onDismiss={dismissLaunchSplash} />
     </>
   )
 }
 
 export function App() {
+  // StartupGate owns the entire first run in one splash: it polls /health for provisioning, then
+  // gates on /api/setup/status + /ws/setup for the AI-model download, revealing AppInner only once
+  // both are done (M-7 · spec §S-2). In browser/dev mode /health is same-origin and already ready
+  // and the models are usually present, so the gate is invisible.
   return (
     <QueryClientProvider client={queryClient}>
-      <AppInner />
+      <StartupGate>
+        <AppInner />
+      </StartupGate>
     </QueryClientProvider>
   )
 }

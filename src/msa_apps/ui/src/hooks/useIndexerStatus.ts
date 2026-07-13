@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import type { IndexerStatus } from '../api/indexer'
+import { wsUrl } from '../lib/apiBase'
 
 interface WSUpdate {
   status: IndexerStatus
@@ -16,8 +17,7 @@ export function useIndexerWS(): WSUpdate | null {
 
     function connect() {
       if (closed) return
-      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-      ws = new WebSocket(`${proto}//${location.host}/ws/indexer`)
+      ws = new WebSocket(wsUrl('/ws/indexer'))
       ws.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data)

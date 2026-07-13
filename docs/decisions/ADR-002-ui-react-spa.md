@@ -46,12 +46,12 @@ Tech stack:
 
 ## Migration Strategy
 
-Streamlit runs in parallel throughout Milestone 2 (Phases 2A–2D). It is only removed
-in Phase 2E once all React workspaces are validated. This allows incremental development
+Streamlit runs in parallel throughout the React migration. It is only removed
+once all React workspaces are validated. This allows incremental development
 without breaking the working UI during the transition.
 
-The Phase 1B addition (Setup & Index tab in Streamlit) is explicitly temporary — it
-provides self-service indexer control for Milestone 1 and is replaced by the Phase 2C
+The earlier Setup & Index tab in Streamlit is explicitly temporary — it
+provides self-service indexer control in the interim and is replaced by the
 React workspace.
 
 ## Consequences
@@ -60,5 +60,5 @@ React workspace.
   of the install step. Node.js is a build-time dependency (not runtime — the output
   is static files).
 - The FastAPI `app.py` gains a static file mount; the existing API routes are unchanged.
-- Phase 1B (Streamlit indexer tab) is knowingly temporary technical work.
-- After Phase 2E: `start.sh` no longer launches Streamlit; port 8501 is fully retired.
+- The Streamlit indexer tab is knowingly temporary technical work.
+- Once the migration completes: `start.sh` no longer launches Streamlit; port 8501 is fully retired.

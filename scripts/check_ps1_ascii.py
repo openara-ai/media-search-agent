@@ -26,12 +26,35 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXCLUDED_DIRS = {".git", "node_modules", ".venv", "dist", "build"}
 
+# Vendored from desktop-app-template-spike (read-only); ASCII-clean must be fixed
+# upstream + re-vendored before S-3 Windows packaging - see tracking issue #163.
+# These two build scripts are byte-identical copies from the spike and carry em-dash/section
+# chars in their comments. The exemption is narrow (exactly these two repo-relative paths);
+# every MSA-authored .ps1 (installer/**, tests/**) stays strictly ASCII + LF.
+VENDORED_PS1 = frozenset({
+    Path("scripts/build-app.ps1"),
+    Path("scripts/build-backend.ps1"),
+})
+
+
+def _is_vendored(path: Path) -> bool:
+    """True iff ``path`` is one of the read-only vendored build scripts (compared as a
+    repo-relative path, so it works for both discovered and explicitly-passed args)."""
+    try:
+        rel = path.resolve().relative_to(REPO_ROOT)
+    except (ValueError, OSError):
+        return False
+    return rel in VENDORED_PS1
+
 
 def discover_ps1() -> list[Path]:
     out: list[Path] = []
     for path in REPO_ROOT.rglob("*.ps1"):
-        if any(part in EXCLUDED_DIRS for part in path.relative_to(REPO_ROOT).parts):
+        rel = path.relative_to(REPO_ROOT)
+        if any(part in EXCLUDED_DIRS for part in rel.parts):
             continue
+        if rel in VENDORED_PS1:
+            continue  # read-only vendored script - exempt (see VENDORED_PS1)
         out.append(path)
     return out
 
@@ -59,15 +82,19 @@ def main(argv: list[str]) -> int:
         files = discover_ps1()
 
     bad: list[tuple[Path, list[tuple[int, int, int]]]] = []
+    scanned = 0
     for f in files:
         if f.suffix.lower() != ".ps1":
             continue
+        if _is_vendored(f):
+            continue  # exempt even when passed explicitly (pre-commit) - see VENDORED_PS1
+        scanned += 1
         issues = scan(f)
         if issues:
             bad.append((f, issues))
 
     if not bad:
-        print(f"OK: scanned {len(files)} .ps1 file(s); ASCII + LF clean.")
+        print(f"OK: scanned {scanned} .ps1 file(s); ASCII + LF clean.")
         return 0
 
     print(f"FAIL: non-ASCII or CR bytes in {len(bad)} .ps1 file(s):")

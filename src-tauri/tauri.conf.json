@@ -1,0 +1,47 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "MediaSearchAgent",
+  "mainBinaryName": "MediaSearchAgent",
+  "version": "0.0.0",
+  "identifier": "ai.openara.mediasearchagent",
+  "build": {
+    "frontendDist": "../src/msa_apps/ui/dist",
+    "beforeBuildCommand": "npm --prefix src/msa_apps/ui run build",
+    "beforeDevCommand": "npm --prefix src/msa_apps/ui run dev",
+    "devUrl": "http://localhost:5173"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/openara-ai/media-search-agent/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNGMzJEMTdGRTZGMDA3NjMKUldSakIvRG1mOUV5UDZsNkgwaTBod2lPTjZKaUNYWTZMaldWbmdvSlpnREdyN2t3THozYVJndS8K"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "createUpdaterArtifacts": false,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "bin",
+      "backend"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "12.0",
+      "signingIdentity": "-"
+    }
+  }
+}

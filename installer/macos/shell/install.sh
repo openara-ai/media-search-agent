@@ -31,6 +31,10 @@ log_bold()  { printf "\n${BOLD}%s${NC}\n" "$*" >&2; }
 die()       { printf "${RED}✗${NC} %s\n" "$*" >&2; exit 1; }
 
 LAUNCH_AGENT_LABEL="ai.openara.mediasearchagent"
+# Constants used by the thin macOS Tauri bootstrap (the Linux path re-sets what it needs below).
+GITHUB_REPO="openara-ai/media-search-agent"
+APP_ID="ai.openara.mediasearchagent"
+PYTHON_VERSION="3.12.8"
 
 unload_launch_agent() {
   [[ "${OS:-}" != "macos" ]] && return 0
@@ -137,6 +141,9 @@ ${BOLD}Options${NC}
                            Default Linux: \$HOME/.local/share/MediaSearchAgent
                            Also settable via env: MSA_DIR=/path
 
+      --headless           Provision inline and install the msa CLI; do not launch the GUI
+                           (macOS: SSH/CI sessions - leaves the box ready for 'msa api start')
+
       --skip-autostart     Skip LaunchAgent (macOS) / systemd service (Linux) registration
 
       --allow-downgrade    Allow installing an older version over a newer one
@@ -179,6 +186,7 @@ OPT_BUNDLE=""
 OPT_DIR="${MSA_DIR:-}"
 OPT_SKIP_AUTOSTART=""
 OPT_ALLOW_DOWNGRADE=""
+OPT_HEADLESS=""
 
 parse_args() {
   while [[ $# -gt 0 ]]; do
@@ -192,6 +200,7 @@ parse_args() {
       --dir=*)              OPT_DIR="${1#*=}"; shift ;;
       --skip-autostart)     OPT_SKIP_AUTOSTART=1; shift ;;
       --allow-downgrade)    OPT_ALLOW_DOWNGRADE=1; shift ;;
+      --headless)           OPT_HEADLESS=1; shift ;;
       --no-color)           NO_COLOR=1; _disable_colors; shift ;;
       *) die "Unknown argument: $1  (run with --help for usage)" ;;
     esac
@@ -311,9 +320,11 @@ download() {
 # hijacked / MITM'd / corrupted bundle now fails before tar -xzf instead of
 # getting installed and run.
 #
-# Skipped for local --bundle installs (caller handles trust). If
-# SHA256SUMS.txt is missing from the release (older releases predate this
-# file), warn rather than fail so existing releases still install.
+# Skipped only for local --bundle installs (caller handles trust). Otherwise
+# HARD FAILS on mismatch AND on a missing / 404 / not-listed checksum (M-7/S-4:
+# every release now ships SHA256SUMS.txt over ALL assets, so a missing checksum
+# is a real failure, not a legacy-release fallback) — parity with the thin
+# bootstraps' verify_thin_sha256 (macOS) and Test-SetupSha256 (Windows).
 verify_bundle_sha256() {
   local bundle_file="$1"
   local bundle_name="$2"
@@ -323,16 +334,11 @@ verify_bundle_sha256() {
   local sums_file; sums_file="$(mktemp)"
 
   # Fetch SHA256SUMS.txt directly with curl/wget rather than going through
-  # download() because download() dies on 404. Older releases predate
-  # SHA256SUMS.txt and we want to warn-and-continue on that specific case.
-  #
-  # IMPORTANT: distinguish "HTTP 404" (the legacy-release fallback path)
-  # from any other failure (transient TLS / proxy / 5xx / connection
-  # reset). Treating every fetch failure as "release predates checksums"
-  # silently bypasses the supply-chain guard whenever the network has a
-  # bad moment - exactly the failure mode this verification was added to
-  # prevent. The legacy fallback warns and proceeds; everything else
-  # hard-fails so the user can retry / use --bundle instead.
+  # download() because download() dies on 404 and we want a specific,
+  # actionable message per failure. As of M-7/S-4 EVERY release ships
+  # SHA256SUMS.txt over all assets, so a 404 / non-200 / missing file is now a
+  # HARD FAIL (not the old warn-and-continue legacy fallback): the user retries
+  # once the network is healthy, or passes --bundle <local-path>.
   local sums_http="000"
   if command -v curl &>/dev/null; then
     sums_http="$(curl -sSL --proto '=https' --tlsv1.2 --retry 2 \
@@ -348,14 +354,12 @@ verify_bundle_sha256() {
     [[ -z "$sums_http" || "$sums_http" == "0" ]] && sums_http="000"
   else
     rm -f "$sums_file"
-    log_warn "Neither curl nor wget found - skipping integrity check."
-    return
+    die "curl or wget is required to verify the download."
   fi
 
   if [[ "$sums_http" == "404" ]]; then
     rm -f "$sums_file"
-    log_warn "SHA256SUMS.txt not found (HTTP 404) at $sums_url - skipping integrity check. The release may predate signed checksums."
-    return
+    die "SHA256SUMS.txt not found (HTTP 404) at $sums_url. Refusing to install an unverified bundle - every release now ships checksums (M-7/S-4); pass --bundle <local-path> to install a copy you've verified yourself."
   fi
   if [[ "$sums_http" != "200" ]]; then
     rm -f "$sums_file"
@@ -377,8 +381,7 @@ verify_bundle_sha256() {
   rm -f "$sums_file"
 
   if [[ -z "$expected" ]]; then
-    log_warn "$bundle_name not listed in SHA256SUMS.txt - skipping integrity check."
-    return
+    die "$bundle_name not listed in SHA256SUMS.txt. Refusing to install a bundle with no published checksum."
   fi
 
   local actual
@@ -387,8 +390,7 @@ verify_bundle_sha256() {
   elif command -v sha256sum &>/dev/null; then
     actual="$(sha256sum "$bundle_file" | awk '{print tolower($1)}')"
   else
-    log_warn "Neither shasum nor sha256sum found - skipping integrity check."
-    return
+    die "shasum or sha256sum is required to verify the download."
   fi
 
   if [[ "$actual" != "$expected" ]]; then
@@ -1010,6 +1012,186 @@ EOF
   log_ok "systemd user service installed — app will start on login"
 }
 
+# ── Thin macOS Tauri bootstrap (M-7/S-3) ──────────────────────────────────────
+#
+# macOS is short-circuited to this thin path from main(): download the Tauri updater
+# artifact (MediaSearchAgent_<v>_aarch64.app.tar.gz), SHA-256 verify it (hard fail),
+# extract to ~/Applications, dequarantine, and either open the GUI (which provisions +
+# renders itself) or provision inline for --headless. Nothing heavy happens here. The
+# Linux branch is UNCHANGED - main() falls through to the legacy bundle flow for it.
+
+# Hard-fail SHA-256 verify against the release's SHA256SUMS.txt (parity with the Windows
+# thin bootstrap: 404 / missing / not-listed / mismatch all abort - an unsigned artifact
+# is never run unverified). Skipped only for a local --bundle path (caller is trusted).
+verify_thin_sha256() {
+  local file="$1" name="$2" base="$3"
+  local sums_url="${base}/SHA256SUMS.txt"
+  local sums_file; sums_file="$(mktemp)"
+  log_info "Verifying installer integrity..."
+  log_info "  from $sums_url"
+
+  local http="000"
+  if command -v curl &>/dev/null; then
+    http="$(curl -sSL --proto '=https' --tlsv1.2 --retry 2 \
+      --write-out '%{http_code}' --output "$sums_file" "$sums_url" 2>/dev/null || echo "000")"
+  elif command -v wget &>/dev/null; then
+    local werr; werr="$(wget -q --https-only --tries=2 --server-response \
+      -O "$sums_file" "$sums_url" 2>&1 || true)"
+    http="$(printf '%s\n' "$werr" | awk '/HTTP\/[0-9.]+[[:space:]]+[0-9]{3}/ {c=$2} END {print c+0}')"
+    [[ -z "$http" || "$http" == "0" ]] && http="000"
+  else
+    rm -f "$sums_file"; die "curl or wget is required to verify the download."
+  fi
+  if [[ "$http" != "200" ]]; then
+    rm -f "$sums_file"
+    die "Could not fetch SHA256SUMS.txt from $sums_url (HTTP $http). Refusing to install an unverified installer - retry once the network is healthy, or pass --bundle <local-path>."
+  fi
+
+  local expected
+  expected="$(awk -v name="$name" '
+    /^[[:space:]]*$/ || /^#/ { next }
+    { hash=$1; sub(/^[*\.\/]+/, "", $2); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2);
+      if ($2 == name) { print tolower(hash); exit } }' "$sums_file")"
+  rm -f "$sums_file"
+  [[ -n "$expected" ]] || die "$name not listed in SHA256SUMS.txt. Refusing to install an artifact with no published checksum."
+
+  local actual
+  if command -v shasum &>/dev/null; then
+    actual="$(shasum -a 256 "$file" | awk '{print tolower($1)}')"
+  elif command -v sha256sum &>/dev/null; then
+    actual="$(sha256sum "$file" | awk '{print tolower($1)}')"
+  else
+    die "shasum or sha256sum is required to verify the download."
+  fi
+  [[ "$actual" == "$expected" ]] || die "Installer SHA256 mismatch for ${name}: expected $expected, got $actual. The download may be corrupted or tampered with - aborting before install."
+  log_ok "Installer SHA256 verified (${expected:0:12}...)"
+}
+
+fetch_macos_app_archive() {
+  # Echoes the local path to a verified .app.tar.gz.
+  local tag="$1"
+  if [[ -n "$OPT_BUNDLE" ]]; then
+    [[ -f "$OPT_BUNDLE" ]] || die "Bundle not found: $OPT_BUNDLE"
+    log_info "Using local bundle: $OPT_BUNDLE"
+    echo "$OPT_BUNDLE"; return 0
+  fi
+  local bare="${tag#v}"
+  local name="MediaSearchAgent_${bare}_aarch64.app.tar.gz"
+  local base="https://github.com/${GITHUB_REPO}/releases/download/${tag}"
+  local dest; dest="$(mktemp -d)/${name}"
+  download "${base}/${name}" "$dest" "app $tag"
+  verify_thin_sha256 "$dest" "$name" "$base"
+  echo "$dest"
+}
+
+install_app_archive() {
+  local archive="$1" app_bundle="$2"
+  mkdir -p "$HOME/Applications"
+  # Best-effort stop a running instance so we can replace the bundle cleanly.
+  osascript -e 'tell application "MediaSearchAgent" to quit' >/dev/null 2>&1 || true
+  pkill -f "$app_bundle/Contents/MacOS/" >/dev/null 2>&1 || true
+  rm -rf "$app_bundle"
+  # The Tauri updater .app.tar.gz holds MediaSearchAgent.app at the archive root.
+  tar -xzf "$archive" -C "$HOME/Applications"
+  [[ -d "$app_bundle" ]] || die "Extraction did not produce $app_bundle"
+}
+
+install_msa_launcher_headless() {
+  # `msa` CLI launcher targeting the app-private venv (S-5 item 3, pulled forward for headless).
+  local venv_dir="$1"
+  local launcher_dir="$HOME/.local/bin"
+  local launcher="$launcher_dir/msa"
+  mkdir -p "$launcher_dir"
+  cat > "$launcher" <<EOF
+#!/usr/bin/env bash
+exec "$venv_dir/bin/msa" "\$@"
+EOF
+  chmod +x "$launcher"
+  if ! echo ":${PATH}:" | grep -q ":${launcher_dir}:"; then
+    log_warn "Add ~/.local/bin to your PATH:  export PATH=\"\$HOME/.local/bin:\$PATH\""
+  fi
+  log_ok "Installed msa launcher at $launcher"
+}
+
+macos_headless_provision() {
+  local app_bundle="$1" app_private="$2"
+  local resources="$app_bundle/Contents/Resources"
+  local staged_uv="$resources/bin/uv"
+  local backend="$resources/backend"
+  [[ -x "$staged_uv" ]] || die "Bundled uv not found at $staged_uv - is the app installed?"
+  [[ -d "$backend/app" ]] || die "Shim not found at $backend/app - is the app installed?"
+
+  # Mirror the supervisor: uv into <root>/bin, uv python install, uv venv, with the SAME UV_* pins.
+  local uv_runtime="$app_private/bin/uv"
+  mkdir -p "$app_private/bin"
+  cp "$staged_uv" "$uv_runtime"; chmod +x "$uv_runtime"
+
+  export UV_CACHE_DIR="$app_private/uv-cache"
+  export UV_PYTHON_INSTALL_DIR="$app_private/python"
+  export UV_NO_CONFIG=1
+  export UV_PYTHON_INSTALL_BIN=0
+
+  local venv_dir="$app_private/.venv"
+  local venv_python="$venv_dir/bin/python3"
+  log_info "Installing CPython ${PYTHON_VERSION} (app-private)..."
+  "$uv_runtime" python install "$PYTHON_VERSION" || die "uv python install failed"
+  if [[ ! -x "$venv_python" ]]; then
+    log_info "Creating the app-private venv..."
+    "$uv_runtime" venv "$venv_dir" --python "$PYTHON_VERSION" || die "uv venv failed"
+  fi
+
+  log_bold "Provisioning dependencies (one-time)"
+  # All path logic stays in the shim; PYTHONPATH just makes `app` importable.
+  PYTHONPATH="$backend" "$venv_python" -m app.provision \
+    || die "Provisioning failed. See ~/Library/Logs/MediaSearchAgent."
+
+  install_msa_launcher_headless "$venv_dir"
+  log_ok "Media Search Agent provisioned (headless)."
+  printf "  Start the backend + SPA (browser mode) with:\n    msa api start\n" >&2
+}
+
+macos_thin_install() {
+  local app_bundle="$HOME/Applications/MediaSearchAgent.app"
+  local app_private="$HOME/Library/Application Support/${APP_ID}"
+
+  printf "\n${BOLD}Media Search Agent Installer${NC}\n" >&2
+  printf "${DIM}Local-first semantic search for your photos and videos${NC}\n\n" >&2
+
+  # Reuse the shared pre-flight (macOS version floor + disk + RAM); it targets APP_CODE_DIR.
+  APP_CODE_DIR="$app_bundle/Contents/Resources"
+  check_system_requirements
+
+  local tag
+  if [[ -n "$OPT_BUNDLE" ]]; then
+    tag="${OPT_VERSION:-(local bundle)}"
+  else
+    tag="$(resolve_version)"
+  fi
+  log_info "Version: $tag"
+
+  log_bold "[1/2] Installer"
+  local archive
+  archive="$(fetch_macos_app_archive "$tag")"
+  install_app_archive "$archive" "$app_bundle"
+  # Dequarantine so Gatekeeper does not block the unsigned app.
+  xattr -dr com.apple.quarantine "$app_bundle" 2>/dev/null || true
+  log_ok "Installed to $app_bundle"
+
+  if [[ -n "$OPT_HEADLESS" ]]; then
+    log_bold "[2/2] Headless provisioning"
+    macos_headless_provision "$app_bundle" "$app_private"
+    return 0
+  fi
+
+  log_bold "[2/2] Launch"
+  printf "\n${GREEN}${BOLD}  ✓ Media Search Agent installed!${NC}\n\n" >&2
+  if open "$app_bundle" 2>/dev/null; then
+    log_ok "Launched. The window opens and finishes first-run setup itself."
+  else
+    log_warn "Could not launch app (Gatekeeper may have blocked it). Try: open \"$app_bundle\""
+  fi
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 main() {
@@ -1034,6 +1216,14 @@ main() {
   if [[ "$OS" == "linux" && "$ARCH" == "arm64" ]]; then
     die "Linux arm64 is not yet supported. Only Linux x86_64 bundles are published.
        Check https://github.com/${GITHUB_REPO:-openara-ai/media-search-agent}/releases for updates."
+  fi
+
+  # macOS is short-circuited to the thin Tauri bootstrap (download .app.tar.gz -> verify ->
+  # ~/Applications -> dequarantine -> open / headless). The Linux branch falls through to the
+  # UNCHANGED legacy bundle flow below.
+  if [[ "$OS" == "macos" ]]; then
+    macos_thin_install
+    exit 0
   fi
 
   # ── Platform paths (ADR-009) ──────────────────────────────────────────────

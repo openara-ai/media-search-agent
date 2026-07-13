@@ -130,18 +130,18 @@ This project's [`CLAUDE.md`](../CLAUDE.md) ships in the public mirror as a reusa
 starter containing the durable patterns (doc placement, git workflow, never-do,
 PR triage, etc.) — read it directly for the full text. Project-specific state
 that changes session to session — current phase, file locations, the ADR summary
-table, do-not-change rules tied to this codebase — lives in a separate private
-companion file that stays in the private repo.
+table, do-not-change rules tied to this codebase — lives in a separate
+project-specific companion file that is not published to the public mirror.
 
 The mechanism is a single instruction at the bottom of `CLAUDE.md` that tells
-the agent to read the private companion file (if it exists) before responding.
-The agent sees the instruction at session start and loads the private file as
+the agent to read the companion file (if it exists) before responding.
+The agent sees the instruction at session start and loads the companion file as
 additional context. Public-mirror readers (and anyone using this `CLAUDE.md` as
 a starter for their own project) just delete that footer.
 
 The split avoids the maintenance burden of keeping a "public copy" and "what we
 actually use" in sync — there's one source of truth for the patterns, and the
-private layer carries only what genuinely shouldn't be public.
+companion file carries only what genuinely shouldn't be public.
 
 ---
 

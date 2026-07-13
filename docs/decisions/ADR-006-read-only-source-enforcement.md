@@ -8,7 +8,7 @@ The app indexes user media libraries that may contain years of irreplaceable per
 photos and videos. Sources in `config.yaml` carry a `read_only` flag intended to
 prevent accidental modification.
 
-An audit (Phase 3E) found that `read_only` is stored and returned by the API but
+An audit found that `read_only` is stored and returned by the API but
 **never checked in code**. This is safe today because:
 
 - The indexer is inherently read-only by design — it calls `rglob()`, reads EXIF/video

@@ -311,6 +311,12 @@ function SliderWithValue({ value, onChange, disabled = false }: { value: number;
 export function SettingsPage() {
   const { data: diag } = useQuery({ queryKey: ['diagnostics'], queryFn: getDiagnostics })
 
+  // Source the version from the backend (_APP_VERSION → importlib.metadata, stamped from
+  // the git tag at release build). We deliberately do NOT use window.__APP_VERSION__: the
+  // shell injects env!("CARGO_PKG_VERSION"), but src-tauri/Cargo.toml is never stamped at
+  // release (only tauri.conf.json is), so it would report a stale "0.1.0" in every package.
+  const appVersion = diag?.app_version
+
   return (
     <div className="p-6 max-w-2xl mx-auto space-y-6">
       <h1 className="text-xl font-semibold text-zinc-900 dark:text-zinc-100">Settings</h1>
@@ -336,10 +342,26 @@ export function SettingsPage() {
                 logKey={LOG_KEYS.has(key) ? key : undefined}
               />
             ))}
+            <PathRow label="Backend" value={diag.api_url} />
             {diag.qdrant_url && <PathRow label="Qdrant" value={diag.qdrant_url} />}
           </ul>
         </div>
       )}
+
+      {/* About */}
+      <div className="bg-slate-100 dark:bg-zinc-800 rounded-lg overflow-hidden">
+        <div className="px-4 py-3 border-b border-slate-200 dark:border-zinc-700 text-sm font-medium text-zinc-700 dark:text-zinc-200">
+          About
+        </div>
+        <ul className="divide-y divide-slate-200 dark:divide-zinc-700">
+          <li className="flex items-center gap-3 px-4 py-2.5">
+            <span className="text-xs text-zinc-400 dark:text-zinc-500 w-24 shrink-0">Version</span>
+            <span className="text-xs font-mono text-zinc-500 dark:text-zinc-400 flex-1">
+              {appVersion ?? 'unknown'}
+            </span>
+          </li>
+        </ul>
+      </div>
     </div>
   )
 }

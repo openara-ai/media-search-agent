@@ -28,33 +28,31 @@ This project was developed using agentic workflow with AI coding agents as code 
 - 📍 **GPS & metadata** — EXIF location (including GoPro GPS data), camera, lens, timestamp all parsed and searchable.
 - 🔒 **Fully offline** — Apple Silicon MPS, NVIDIA CUDA, or CPU. Nothing phones home.
 - ⚡ **Fast** — embedded Qdrant for vector search, SQLite for metadata. No external services.
+- 🖥️ **Native desktop app** — self-contained app on macOS and Windows with signed auto-update; Linux and servers run the same engine headless in the browser.
 
 ## Quick start
 
-Install with a single one-liner. No admin rights, no git, no Node required.
+macOS and Windows install a native desktop app; Linux runs headless in your browser.
+Your existing Python is left untouched, and everything uninstalls cleanly. Full setup,
+requirements, and troubleshooting are in the [Installation guide](docs/INSTALL.md).
 
-**macOS / Linux (x86_64):**
+### macOS — Apple Silicon (M1/M2/M3/M4)
+
+Download the latest **`.dmg`** from the [Releases page](https://github.com/openara-ai/media-search-agent/releases/latest), open it, and drag **MediaSearchAgent** into Applications. Launch it — the app sets itself up on first run.
+
+### Windows 11
+
+Download the latest **`setup.exe`** from the [Releases page](https://github.com/openara-ai/media-search-agent/releases/latest) and run it (per-user, no admin). Launch **MediaSearchAgent** from the Start menu — it sets itself up on first run.
+
+### Linux (and servers / headless)
 
 ```bash
 curl -fsSL https://github.com/openara-ai/media-search-agent/releases/latest/download/install.sh | bash
 ```
 
-**Windows (PowerShell 5.1+):**
+Serves the UI in your browser at <http://localhost:8000>; add `--headless` for servers/CI.
 
-```powershell
-powershell -c "irm https://github.com/openara-ai/media-search-agent/releases/latest/download/install.ps1 | iex"
-```
-
-The installer downloads a pre-built bundle, creates an **isolated Python
-environment inside the app's own data directory**, and starts the service.
-Any Python you already have on your machine — system Python, Homebrew, conda,
-pyenv, virtualenvs — is left completely untouched, and the app is removed
-cleanly on uninstall. Open <http://localhost:8000>, add a media folder on the
-**Indexer** page, and click **Run**. After the indexer finishes, type "kids
-on a swing" into the search bar and the moments appear.
-
-- Full walkthrough with screenshots: [Quick Start guide](docs/QUICKSTART.md)
-- Platform requirements, troubleshooting, uninstall: [Installation guide](docs/INSTALL.md)
+Then add a media folder on the **Indexer** page, click **Run**, and search — see the [Quick Start guide](docs/QUICKSTART.md) for a full walkthrough with screenshots.
 
 ## How it works
 
@@ -80,7 +78,9 @@ tagging. SQLite is the canonical store for metadata and embeddings; Qdrant
 powers fast vector search at runtime. At query time, the same model encodes
 your text into a vector, Qdrant returns the nearest neighbors, and the search
 engine ranks them by similarity and metadata filters before they reach the
-UI. The React UI talks to a single FastAPI process at port 8000.
+UI. The React UI talks to a local FastAPI backend — embedded in the native
+desktop window on macOS and Windows, or served in your browser at port 8000 on
+Linux and headless installs.
 
 For the full design — schema, dataflow, indexing pipeline, search ranking —
 see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -141,6 +141,7 @@ Built on excellent open-source work:
 [Qdrant](https://github.com/qdrant/qdrant),
 [FastAPI](https://github.com/tiangolo/fastapi),
 [React](https://react.dev/),
+[Tauri](https://tauri.app/),
 [uv](https://github.com/astral-sh/uv),
 [ExifTool](https://exiftool.org/),
 [MediaInfo](https://mediaarea.net/MediaInfo).

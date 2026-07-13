@@ -42,7 +42,7 @@ PS1 files run on end-users' Windows machines, so:
 
   <body — what changed and why; reference phase and ADR if relevant>
 
-  Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+  Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
   ```
 
 **Push and PR**

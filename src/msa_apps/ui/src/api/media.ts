@@ -1,4 +1,5 @@
 import type { MediaListResponse, MediaFacesResponse, MediaFilters } from './types'
+import { apiUrl } from '../lib/apiBase'
 
 export async function getMedia(
   filters: MediaFilters,
@@ -17,31 +18,31 @@ export async function getMedia(
   if (filters.people && filters.people.length > 0 && filters.people_mode) params.set('people_mode', filters.people_mode)
   if (filters.sort_by) params.set('sort_by', filters.sort_by)
   if (filters.sort_order) params.set('sort_order', filters.sort_order)
-  const res = await fetch(`/media?${params}`)
+  const res = await fetch(apiUrl(`/media?${params}`))
   if (!res.ok) throw new Error(`Media listing failed: ${res.status}`)
   return res.json()
 }
 
 export async function getMediaFaces(mediaId: string): Promise<MediaFacesResponse> {
-  const res = await fetch(`/media/${mediaId}/faces`)
+  const res = await fetch(apiUrl(`/media/${mediaId}/faces`))
   if (!res.ok) throw new Error(`Faces fetch failed: ${res.status}`)
   return res.json()
 }
 
 export function thumbnailUrl(mediaId: string | null | undefined): string | null {
   if (!mediaId) return null
-  return `/thumbnails/${mediaId}.jpg`
+  return apiUrl(`/thumbnails/${mediaId}.jpg`)
 }
 
 export function faceThumbnailUrl(faceId: string): string {
   const sanitized = faceId.replace(/:/g, '_')
-  return `/face_thumbnails/${sanitized}.jpg`
+  return apiUrl(`/face_thumbnails/${sanitized}.jpg`)
 }
 
 export function imageUrl(mediaId: string): string {
-  return `/images/${mediaId}`
+  return apiUrl(`/images/${mediaId}`)
 }
 
 export function videoUrl(mediaId: string): string {
-  return `/videos/${mediaId}`
+  return apiUrl(`/videos/${mediaId}`)
 }

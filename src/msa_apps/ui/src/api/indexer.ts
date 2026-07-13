@@ -1,3 +1,5 @@
+import { apiUrl } from '../lib/apiBase'
+
 export interface IndexerStatus {
   status: 'idle' | 'running' | 'complete' | 'error' | 'stopped'
   run_id: string | null
@@ -58,7 +60,7 @@ export interface BrowseResult {
 }
 
 export async function startIndexer(): Promise<void> {
-  const res = await fetch('/indexer/start', { method: 'POST' })
+  const res = await fetch(apiUrl('/indexer/start'), { method: 'POST' })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }))
     throw new Error(err.detail ?? 'Failed to start indexer')
@@ -66,7 +68,7 @@ export async function startIndexer(): Promise<void> {
 }
 
 export async function stopIndexer(): Promise<void> {
-  const res = await fetch('/indexer/stop', { method: 'POST' })
+  const res = await fetch(apiUrl('/indexer/stop'), { method: 'POST' })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }))
     throw new Error(err.detail ?? 'Failed to stop indexer')
@@ -74,13 +76,13 @@ export async function stopIndexer(): Promise<void> {
 }
 
 export async function getIndexStats(): Promise<IndexStats> {
-  const res = await fetch('/indexer/stats')
+  const res = await fetch(apiUrl('/indexer/stats'))
   if (!res.ok) throw new Error(res.statusText)
   return res.json()
 }
 
 export async function getSources(): Promise<MediaSource[]> {
-  const res = await fetch('/config/sources')
+  const res = await fetch(apiUrl('/config/sources'))
   if (!res.ok) throw new Error(res.statusText)
   const data = await res.json()
   return data.sources
@@ -92,7 +94,7 @@ export async function addSource(body: {
   description?: string
   read_only?: boolean
 }): Promise<void> {
-  const res = await fetch('/config/sources', {
+  const res = await fetch(apiUrl('/config/sources'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -112,10 +114,13 @@ export interface Diagnostics {
   logs: Record<string, string>
   qdrant_url?: string
   api_url: string
+  /** App/package version reported by the backend (fallback when the desktop shell
+   *  hasn't injected window.__APP_VERSION__, e.g. browser / dev mode). */
+  app_version?: string
 }
 
 export async function getDiagnostics(): Promise<Diagnostics> {
-  const res = await fetch('/diagnostics')
+  const res = await fetch(apiUrl('/diagnostics'))
   if (!res.ok) throw new Error(res.statusText)
   return res.json()
 }
@@ -146,13 +151,13 @@ export interface ModelConfig {
 }
 
 export async function getModelConfig(): Promise<ModelConfig> {
-  const res = await fetch('/config/model')
+  const res = await fetch(apiUrl('/config/model'))
   if (!res.ok) throw new Error(res.statusText)
   return res.json()
 }
 
 export async function patchModelConfig(updates: Partial<ModelConfigEditable>): Promise<void> {
-  const res = await fetch('/config/model', {
+  const res = await fetch(apiUrl('/config/model'), {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(updates),
@@ -164,20 +169,20 @@ export async function patchModelConfig(updates: Partial<ModelConfigEditable>): P
 }
 
 export async function deleteSource(name: string): Promise<void> {
-  const res = await fetch(`/config/sources/${encodeURIComponent(name)}`, {
+  const res = await fetch(apiUrl(`/config/sources/${encodeURIComponent(name)}`), {
     method: 'DELETE',
   })
   if (!res.ok) throw new Error(res.statusText)
 }
 
 export async function getPlatform(): Promise<{ platform: 'wsl2' | 'linux' | 'macos' | 'windows' }> {
-  const res = await fetch('/platform')
+  const res = await fetch(apiUrl('/platform'))
   if (!res.ok) throw new Error(res.statusText)
   return res.json()
 }
 
 export async function nativePick(): Promise<{ path: string | null; cancelled: boolean }> {
-  const res = await fetch('/browse/pick')
+  const res = await fetch(apiUrl('/browse/pick'))
   if (res.status === 405) return { path: null, cancelled: false }  // not supported → fallback
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }))
@@ -187,7 +192,7 @@ export async function nativePick(): Promise<{ path: string | null; cancelled: bo
 }
 
 export async function browse(path: string): Promise<BrowseResult> {
-  const res = await fetch(`/browse?path=${encodeURIComponent(path)}`)
+  const res = await fetch(apiUrl(`/browse?path=${encodeURIComponent(path)}`))
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }))
     throw new Error(err.detail ?? 'Failed to browse directory')

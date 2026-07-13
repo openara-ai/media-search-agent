@@ -413,33 +413,28 @@ def test_macos_shell_installer_verifies_bundle_sha256_against_published_sums():
         "reaches the extract step."
     )
 
-    # Missing SHA256SUMS.txt (HTTP 404) is a warning, not a hard fail -
-    # older releases predate this file. But the fallback must be gated on
-    # the explicit 404 status code; other fetch failures (transient TLS /
-    # proxy / 5xx / connection reset) must hard-fail because the
-    # alternative is silently extracting an unverified bundle - exactly
-    # the supply-chain guard bypass this function exists to prevent.
-    # Caught in PR #132 review (Codex).
-    assert "skipping integrity check" in text
-    assert "HTTP 404" in text, (
-        "verify_bundle_sha256 must distinguish HTTP 404 (the legacy-release "
-        "fallback) from other fetch failures. The previous catch-everything "
-        "form let transient TLS/proxy/5xx failures silently bypass "
-        "verification."
-    )
-    # Capture the HTTP status code so 404 vs everything-else can branch.
+    # M-7/S-4: the legacy bundle verify now HARD-FAILS on a missing / 404 /
+    # not-listed checksum — the last warn-and-continue is closed now that every
+    # release ships SHA256SUMS.txt over all assets (parity with the thin
+    # bootstraps' verify_thin_sha256 / Test-SetupSha256). It still captures the
+    # HTTP status so the 404 case gets a specific, actionable die() message.
     assert "--write-out '%{http_code}'" in text, (
         "verify_bundle_sha256 must capture the HTTP status code via curl "
-        "--write-out so 404 (legacy release) can be distinguished from "
-        "non-200 transport failures."
+        "--write-out so a 404 gets a specific message."
     )
-    # Non-200 / non-404 status must die() with a clear remediation.
     sha_func_idx = text.index("verify_bundle_sha256()")
     next_func_idx = text.index("\n# ── Version resolution", sha_func_idx)
     sha_body = text[sha_func_idx:next_func_idx]
+    assert "skipping integrity check" not in sha_body, (
+        "M-7/S-4 closed the warn-and-continue path — a missing/404/not-listed "
+        "checksum must die(), not warn-and-proceed."
+    )
+    assert "HTTP 404" in sha_body  # still branched — but now a hard fail
     assert "Refusing to install an unverified bundle" in sha_body, (
-        "Non-404 SHA256SUMS fetch failures must die() with a clear "
-        "remediation, not warn-and-proceed."
+        "A 404 / non-200 SHA256SUMS fetch must die() with a clear remediation."
+    )
+    assert "Refusing to install a bundle with no published checksum" in sha_body, (
+        "A bundle not listed in SHA256SUMS.txt must die(), not warn-and-proceed."
     )
 
     # Local --bundle path skips verification.

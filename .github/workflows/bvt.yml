@@ -1,35 +1,50 @@
 name: BVT
 
-# Tests real media fixtures against both dev environment tools and bundled
-# installer tools. The bundle jobs are the safety net for tool version drift —
-# they confirm that the pinned versions in versions.env actually work end-to-end.
+# On-demand real-media validation, dispatchable on ANY branch. Pick ONE suite per run so you
+# only pay for what you're testing (the two suites are mutually exclusive - a desktop run never
+# builds shell bundles, and vice versa):
 #
-# This is the STANDALONE bundle-validation workflow. The release pipeline no
-# longer calls it: as of the build-once change, release.yml validates each
-# real-versioned release-candidate bundle in-place inside its build job (the
-# exact artifact that ships), rather than rebuilding a throwaway 0.0.0-ci bundle
-# here. Use this workflow for on-demand bundle BVT and the dev-tools harness.
+#   suite: desktop       - the Tauri desktop app on macOS + Windows (.dmg / setup.exe): build
+#                          each, then run the real-media desktop BVT against the installed app.
+#   suite: shell-bundle  - the Linux shell bundle (.tar.gz): build it + run its install BVT, plus
+#                          the dev-tools (dev-environment) real-media harness. macOS/Windows are
+#                          desktop-app only; their shell bundles were retired.
 #
-# Triggers:
-#   workflow_dispatch — manual run; include_slow_checks opt-in
-#   workflow_call     — retained for ad-hoc reuse (no current caller)
+# The release pipeline does NOT call this: release.yml validates each real-versioned
+# release-candidate artifact in-place inside its own build job (the exact artifact that ships).
+# Use THIS workflow for on-demand pre-merge validation on a feature branch.
 
 on:
   workflow_dispatch:
     inputs:
+      suite:
+        description: "Which BVT suite to run (mutually exclusive)"
+        required: true
+        default: desktop
+        type: choice
+        options:
+          - desktop        # macOS + Windows Tauri desktop app (.dmg / setup.exe)
+          - shell-bundle   # Linux shell bundle + the dev-tools harness (macOS/Windows are desktop-only)
       include_slow_checks:
-        description: "Run slow model-backed real-media checks (dev-tools job only)"
+        description: "Run slow model-backed real-media checks (dev-tools job only; shell-bundle suite)"
         required: false
         default: true
         type: boolean
-  workflow_call:
+      upload_installer:
+        description: "Upload the BVT-validated installer (.dmg / setup.exe) for manual testing (desktop suite only). Off by default so routine runs don't accumulate build artifacts."
+        required: false
+        default: false
+        type: boolean
 
 jobs:
-  # ── React UI (built once, shared across all bundle jobs) ─────────────────────
+  # ── React UI (built once for the Linux shell-bundle job) ─────────────────────
   build-ui:
     name: Build React UI
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Only the shell-bundle jobs consume this artifact (the desktop jobs build the SPA themselves
+    # via tauri's beforeBuildCommand), so it runs only in the shell-bundle suite.
+    if: ${{ inputs.suite == 'shell-bundle' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -56,7 +71,7 @@ jobs:
     name: Dev Tools — BVT (Ubuntu)
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    if: github.event_name == 'workflow_dispatch'
+    if: ${{ inputs.suite == 'shell-bundle' }}
 
     steps:
       - name: Checkout
@@ -124,6 +139,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 75
     needs: build-ui
+    if: ${{ inputs.suite == 'shell-bundle' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -147,99 +163,144 @@ jobs:
           BUNDLE=$(ls dist/shell/MediaSearchAgent-*-linux-x86_64.tar.gz)
           bash tests/real_media/scripts/validate-installed-bundle-linux.sh "$BUNDLE"
 
-  # ── macOS shell bundle ────────────────────────────────────────────────────────
-  macos-bundle:
-    name: macOS Bundle — BVT
+  # ── Tauri desktop app — macOS: build the shippable artifact + real-media desktop BVT ──────────
+  # The go-forward validation path. Builds the desktop .dmg the SAME way release.yml does
+  # (stage-desktop-backend.sh → npx tauri build), then runs the real-media BVT against the
+  # installed .app — a HARD gate here (unlike release.yml's continue-on-error), because the whole
+  # point of dispatching this workflow on a branch is a real pass/fail signal. Self-contained: no
+  # build-ui dependency (tauri's beforeBuildCommand builds the SPA). Non-publish build — the
+  # committed tauri.conf createUpdaterArtifacts:false means no signing key is needed.
+  desktop-macos:
+    name: Desktop BVT (macOS)
     runs-on: macos-14
     timeout-minutes: 90
-    needs: build-ui
+    if: ${{ inputs.suite == 'desktop' }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download React UI dist
-        uses: actions/download-artifact@v4
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          name: ui-dist-bvt
-          path: src/msa_apps/ui/dist
+          workspaces: src-tauri
 
-      - name: Cache bundle model artifacts
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            src/msa_apps/ui/package-lock.json
+
+      # Root npm ci installs the vendored @tauri-apps/cli (npx tauri); the SPA deps let tauri.conf's
+      # beforeBuildCommand build the embedded frontend.
+      - name: Install Tauri CLI (root) + SPA deps
+        run: |
+          npm ci
+          npm ci --prefix src/msa_apps/ui
+
+      - name: uv (pinned)
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: '0.5.21'
+
+      - name: Stage desktop backend (uv + backend tree + tools + version stamp)
+        shell: bash
+        run: bash scripts/stage-desktop-backend.sh
+
+      # Validation build: no updater artifacts (committed default), no signing key.
+      - name: Build Tauri desktop bundle
+        shell: bash
+        run: npx tauri build
+
+      - name: Cache desktop BVT model artifacts
         uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}/msa-macos-home/Library/Caches/MediaSearchAgent
-          key: ${{ runner.os }}-${{ runner.arch }}-bundle-models-v1
+          path: ${{ runner.temp }}/msa-desktop-home/Library/Caches/MediaSearchAgent
+          key: ${{ runner.os }}-${{ runner.arch }}-desktop-bvt-models-v1
 
-      - name: Build macOS bundle
-        run: bash installer/macos/shell/build-bundle.sh --version 0.0.0-ci --platform macos
-
-      - name: Validate macOS bundle install
-        run: |
-          BUNDLE=$(ls dist/shell/MediaSearchAgent-*-macos-arm64.tar.gz)
-          bash tests/real_media/scripts/validate-installed-bundle-macos.sh "$BUNDLE"
-
-  # ── Windows shell bundle ──────────────────────────────────────────────────────
-  # Build and test run on Windows because the tray app publish needs the
-  # Windows-hosted .NET toolchain.
-  # Test runs on Windows (validates bundled exiftool.exe).
-  windows-bundle-build:
-    name: Windows Bundle — Build
-    runs-on: windows-latest
-    timeout-minutes: 30
-    needs: build-ui
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download React UI dist
-        uses: actions/download-artifact@v4
-        with:
-          name: ui-dist-bvt
-          path: src/msa_apps/ui/dist
-
-      - name: Set up .NET SDK
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '8.0.x'
-
-      # build-bundle.sh's final step calls `zip`, which isn't on windows-latest
-      # Git Bash by default. See release.yml for the matching step.
-      - name: Install zip (for build-bundle.sh)
-        run: choco install zip --no-progress -y
-        shell: powershell
-
-      - name: Build Windows bundle
+      - name: Validate desktop install (real-media BVT)
         shell: bash
-        run: bash installer/windows-native/shell/build-bundle.sh --version 0.0.0-ci
+        run: |
+          DMG=$(ls src-tauri/target/release/bundle/dmg/*.dmg | head -1)
+          bash tests/real_media/scripts/validate-installed-desktop-macos.sh "$DMG"
 
-      - name: Upload bundle artifact
+      # Opt-in (upload_installer=true) hand-off of the validated installer for manual testing — any
+      # branch dispatch, no tag / no publish (release.yml's IS_PUBLISH path is untouched). Off by
+      # default so routine BVT runs validate without accumulating build artifacts. success() keeps a
+      # failed BVT from uploading, so a downloadable artifact only ever exists for a build that passed.
+      - name: Upload validated .dmg (BVT passed)
+        if: ${{ success() && inputs.upload_installer }}
         uses: actions/upload-artifact@v4
         with:
-          name: msa-windows-bundle-ci
-          path: dist/shell/MediaSearchAgent-*-windows-x86_64.zip
+          name: desktop-macos-dmg
+          path: src-tauri/target/release/bundle/dmg/*.dmg
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
 
-  windows-bundle-test:
-    name: Windows Bundle — BVT
+  # ── Tauri desktop app — Windows: build the shippable setup.exe + real-media desktop BVT ───────
+  # See desktop-macos. Git Bash runs the bash steps on windows-latest. The BVT UI-launches the
+  # installed app (CI: discovers the ephemeral port from msa-desktop.log, runs the runtime
+  # suite, quits + asserts no orphan sidecar) — the go-forward replacement for the legacy Windows
+  # shell-bundle BVT, and the way to get REAL Windows validation from a Mac dev box.
+  desktop-windows:
+    name: Desktop BVT (Windows)
     runs-on: windows-latest
-    timeout-minutes: 75
-    needs: windows-bundle-build
+    timeout-minutes: 90
+    if: ${{ inputs.suite == 'desktop' }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download bundle
-        uses: actions/download-artifact@v4
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          name: msa-windows-bundle-ci
-          path: dist/shell
+          workspaces: src-tauri
 
-      - name: Cache bundle model artifacts
-        uses: actions/cache@v4
+      - uses: actions/setup-node@v4
         with:
-          path: ${{ runner.temp }}\msa-app\Cache
-          key: ${{ runner.os }}-bundle-models-v1
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            src/msa_apps/ui/package-lock.json
 
-      - name: Validate Windows bundle install
+      - name: Install Tauri CLI (root) + SPA deps
+        run: |
+          npm ci
+          npm ci --prefix src/msa_apps/ui
+
+      - name: uv (pinned)
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: '0.5.21'
+
+      - name: Stage desktop backend (uv + backend tree + tools + version stamp)
+        shell: bash
+        run: bash scripts/stage-desktop-backend.sh
+
+      - name: Build Tauri desktop bundle
+        shell: bash
+        run: npx tauri build
+
+      - name: Validate desktop install (real-media BVT, CI)
         shell: powershell
         run: |
-          $zip = Get-ChildItem dist/shell/MediaSearchAgent-*-windows-x86_64.zip | Select-Object -First 1
-          & powershell -ExecutionPolicy Bypass -File tests/real_media/scripts/validate-installed-bundle-windows.ps1 -Bundle $zip.FullName
+          $setup = Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          & powershell -ExecutionPolicy Bypass -File tests/real_media/scripts/validate-installed-desktop-windows.ps1 -Ci -Setup $setup.FullName
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # Opt-in (upload_installer=true) hand-off of the validated installer for manual testing — any
+      # branch dispatch, no tag / no publish (release.yml's IS_PUBLISH path is untouched). Off by
+      # default so routine BVT runs validate without accumulating build artifacts. success() keeps a
+      # failed BVT from uploading, so a downloadable artifact only ever exists for a build that passed.
+      - name: Upload validated setup.exe (BVT passed)
+        if: ${{ success() && inputs.upload_installer }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-windows-setup-exe
+          path: src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error
+          retention-days: 7

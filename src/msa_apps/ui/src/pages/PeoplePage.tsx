@@ -9,6 +9,7 @@ import {
   type Face, type Person, type FaceSimilarMatch, type MediaInfo,
 } from '../api/faces'
 import { faceThumbnailUrl } from '../api/media'
+import { apiUrl } from '../lib/apiBase'
 import { MediaDetailDrawer } from '../components/media/MediaDetailDrawer'
 import { cn } from '../lib/utils'
 
@@ -68,7 +69,7 @@ function LabelPopover({
       <div className="bg-white dark:bg-zinc-900 rounded-xl shadow-2xl w-80 border border-slate-200 dark:border-zinc-700 flex flex-col overflow-hidden">
         <div className="flex items-center gap-3 px-4 py-3 border-b border-slate-200 dark:border-zinc-800">
           <img
-            src={face.thumbnail ?? faceThumbnailUrl(face.face_id)}
+            src={face.thumbnail ? apiUrl(face.thumbnail) : faceThumbnailUrl(face.face_id)}
             alt=""
             className="w-10 h-10 rounded-full object-cover bg-slate-200 dark:bg-zinc-800 shrink-0"
             onError={e => { (e.target as HTMLImageElement).style.visibility = 'hidden' }}
@@ -110,7 +111,7 @@ function LabelPopover({
               )}
             >
               <img
-                src={p.thumbnail ?? ''}
+                src={p.thumbnail ? apiUrl(p.thumbnail) : ''}
                 alt=""
                 className="w-7 h-7 rounded-full object-cover bg-slate-200 dark:bg-zinc-700 shrink-0"
                 onError={e => { (e.target as HTMLImageElement).style.visibility = 'hidden' }}
@@ -165,7 +166,7 @@ function SimilarLabelCard({
   onIndividualLabel: (e: React.MouseEvent) => void
 }) {
   const safe = match.face_id.replace(/:/g, '_')
-  const thumb = `/face_thumbnails/${safe}.jpg`
+  const thumb = apiUrl(`/face_thumbnails/${safe}.jpg`)
   const szClass = SIZE_CLASS[thumbSize]
   const wClass = szClass.split(' ')[0]  // e.g. 'w-24'
 
@@ -409,7 +410,7 @@ function SimilarFacesView({
 
         <div className="flex items-center gap-2 shrink-0">
           <img
-            src={sourceFace.thumbnail ?? faceThumbnailUrl(sourceFace.face_id)}
+            src={sourceFace.thumbnail ? apiUrl(sourceFace.thumbnail) : faceThumbnailUrl(sourceFace.face_id)}
             alt=""
             className="w-8 h-8 rounded-full object-cover bg-slate-200 dark:bg-zinc-800"
             onError={e => { (e.target as HTMLImageElement).style.visibility = 'hidden' }}
@@ -517,7 +518,7 @@ function SimilarFacesView({
                         className="w-full text-left px-3 py-2 text-sm text-zinc-800 dark:text-zinc-200 hover:bg-slate-100 dark:hover:bg-zinc-800 flex items-center gap-2"
                       >
                         <img
-                          src={p.thumbnail ?? ''}
+                          src={p.thumbnail ? apiUrl(p.thumbnail) : ''}
                           alt=""
                           className="w-6 h-6 rounded-full object-cover bg-slate-200 dark:bg-zinc-700 shrink-0"
                           onError={e => { (e.target as HTMLImageElement).style.visibility = 'hidden' }}
@@ -703,7 +704,7 @@ function FaceCard({
   onSimilar: (face: Face) => void
   onExpand: (face: Face) => void
 }) {
-  const thumb = face.thumbnail ?? faceThumbnailUrl(face.face_id)
+  const thumb = face.thumbnail ? apiUrl(face.thumbnail) : faceThumbnailUrl(face.face_id)
   const canExpand = face.media_id != null
 
   return (
@@ -1022,7 +1023,7 @@ function PersonCard({
       >
         {person.thumbnail ? (
           <img
-            src={person.thumbnail}
+            src={person.thumbnail ? apiUrl(person.thumbnail) : undefined}
             alt={person.name}
             className="w-full h-full object-cover"
             onError={e => { (e.target as HTMLImageElement).style.visibility = 'hidden' }}

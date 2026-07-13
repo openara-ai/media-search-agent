@@ -1,0 +1,18 @@
+{
+  "app": {
+    "name": "MediaSearchAgent",
+    "identifier": "ai.openara.mediasearchagent",
+    "icon": "assets/icon.png",
+    "window": { "width": 1440, "height": 900 }
+  },
+  "spa_dir": "src/msa_apps/ui/dist",
+  "sidecars": [
+    {
+      "name": "backend",
+      "kind": "bundled",
+      "adapter": "python",
+      "entry": "app",
+      "ready_path": "/health"
+    }
+  ]
+}

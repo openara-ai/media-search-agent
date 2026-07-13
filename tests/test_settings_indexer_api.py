@@ -105,8 +105,13 @@ class TestDiagnostics:
 
     def test_required_top_level_keys(self, client):
         body = client.get("/diagnostics").json()
-        for key in ("msa_root", "config_file", "sqlite_path", "log_dir", "logs", "qdrant_url"):
+        for key in ("msa_root", "config_file", "sqlite_path", "log_dir", "logs",
+                    "qdrant_url", "api_url", "app_version"):
             assert key in body, f"missing key: {key}"
+
+    def test_app_version_is_nonempty_string(self, client):
+        body = client.get("/diagnostics").json()
+        assert isinstance(body["app_version"], str) and body["app_version"]
 
     def test_fixed_log_keys_always_present(self, client):
         logs = client.get("/diagnostics").json()["logs"]
@@ -124,6 +129,18 @@ class TestDiagnostics:
         (tmp_path / "logs" / "launch-2026-03-24_170000.log").write_text("started\n")
         logs = client.get("/diagnostics").json()["logs"]
         assert "launch" in logs
+
+    def test_desktop_log_absent_when_no_file(self, client):
+        """msa-desktop.log only appears in Tauri shell mode (file present)."""
+        logs = client.get("/diagnostics").json()["logs"]
+        assert "desktop" not in logs
+
+    def test_desktop_log_present_when_file_exists(self, client, tmp_path):
+        """The unified shell log surfaces as the 'desktop' entry when it exists."""
+        (tmp_path / "logs" / "msa-desktop.log").write_text("shell up\n")
+        logs = client.get("/diagnostics").json()["logs"]
+        assert "desktop" in logs
+        assert logs["desktop"].endswith("msa-desktop.log")
 
     def test_app_log_visible_when_msa_log_dir_differs_from_cfg_log_dir(
         self, db, tmp_path, monkeypatch

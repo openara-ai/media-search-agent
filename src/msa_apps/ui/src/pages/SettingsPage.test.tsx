@@ -42,10 +42,12 @@ const diagData = {
     app:     '/home/user/msa/logs/msa.log',
     uvicorn: '/home/user/msa/logs/uvicorn.log',
     qdrant:  '/home/user/msa/logs/qdrant.log',
+    desktop: '/home/user/msa/logs/msa-desktop.log',
     launch:  '/home/user/msa/logs/launch-2026-03-24_170000.log',
   },
   qdrant_url: 'http://localhost:6333',
-  api_url: 'http://localhost:8000',
+  api_url: 'http://localhost:52341',
+  app_version: '0.3.2',
 }
 
 function mockFetch(): void {
@@ -104,6 +106,44 @@ describe('SettingsPage', () => {
       const hrefs = links.map(l => l.getAttribute('href') ?? '')
       // /logs/app etc. — none should be /config or /sqlite
       expect(hrefs.every(h => h.startsWith('/logs/'))).toBe(true)
+    })
+
+    it('shows the backend url (port) row', async () => {
+      renderPage()
+      await waitFor(() => screen.getByText('Diagnostics'))
+      expect(screen.getByText('Backend')).toBeInTheDocument()
+      expect(screen.getByText('http://localhost:52341')).toBeInTheDocument()
+    })
+
+    it('shows the desktop log location without an external link', async () => {
+      renderPage()
+      await waitFor(() => screen.getByText('Diagnostics'))
+      expect(screen.getByText('Desktop log')).toBeInTheDocument()
+      expect(screen.getByText('/home/user/msa/logs/msa-desktop.log')).toBeInTheDocument()
+      // msa-desktop.log has no GET /logs/{name} viewer, so no open-in-browser link
+      const links = screen.getAllByTitle('Open log in browser')
+      expect(links.some(l => (l.getAttribute('href') ?? '').includes('desktop'))).toBe(false)
+    })
+  })
+
+  describe('about', () => {
+    it('renders About heading and the backend-reported version', async () => {
+      renderPage()
+      // About/Version render immediately; the version resolves once diagnostics loads.
+      expect(screen.getByText('About')).toBeInTheDocument()
+      expect(screen.getByText('Version')).toBeInTheDocument()
+      await waitFor(() => expect(screen.getByText('0.3.2')).toBeInTheDocument())
+    })
+
+    it('uses the backend version, NOT the shell-injected window.__APP_VERSION__', async () => {
+      // Regression guard: window.__APP_VERSION__ is env!("CARGO_PKG_VERSION") from the never-
+      // stamped src-tauri/Cargo.toml (stale "0.1.0"), so the backend app_version must win.
+      // jsdom's window is the global object, so stubbing the global injects window.__APP_VERSION__.
+      // afterEach → vi.unstubAllGlobals() restores it (and the fetch mock) for the next test.
+      vi.stubGlobal('__APP_VERSION__', '0.1.0')
+      renderPage()
+      await waitFor(() => expect(screen.getByText('0.3.2')).toBeInTheDocument())
+      expect(screen.queryByText('0.1.0')).toBeNull()
     })
   })
 

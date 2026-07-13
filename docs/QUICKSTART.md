@@ -1,63 +1,49 @@
 # Quick Start
 
-A 5-minute walkthrough from zero to your first semantic search.
+A short walkthrough from zero to your first semantic search.
 
-By the end you'll have Media Search Agent running at <http://localhost:8000>,
-indexing a folder of your photos, and answering natural-language queries.
+By the end you'll have Media Search Agent running, indexing a folder of your
+photos, and answering natural-language queries.
 
 ## 1. Install
 
-One line. The installer fetches the latest release bundle, sets up an
-isolated Python environment, and starts the app.
+**macOS (Apple Silicon)** — download the latest **`.dmg`** from the
+[Releases page](https://github.com/openara-ai/media-search-agent/releases/latest),
+drag **MediaSearchAgent** into Applications, and launch it.
 
-**macOS (Apple Silicon) and Linux (x86_64):**
+**Windows 11** — download the latest **`setup.exe`** from the
+[Releases page](https://github.com/openara-ai/media-search-agent/releases/latest)
+and run it (per-user, no admin). Launch **MediaSearchAgent** from the Start
+menu.
+
+**Linux (x86_64)** — one line; serves the UI in your browser at
+<http://localhost:8000>:
 
 ```bash
 curl -fsSL https://github.com/openara-ai/media-search-agent/releases/latest/download/install.sh | bash
 ```
 
-**Windows (PowerShell 5.1+):**
+No admin rights, no git, no Node, no system Python required.
 
-```powershell
-powershell -c "irm https://github.com/openara-ai/media-search-agent/releases/latest/download/install.ps1 | iex"
-```
+For platform requirements, the terminal one-liners for macOS/Windows,
+headless installs, troubleshooting, and uninstall, see
+[INSTALL.md](INSTALL.md).
 
-No admin rights, no git, no Node required.
+## 2. First launch
 
-First run downloads ~1.5 GB of ML model weights — CLIP from OpenAI's CDN,
-RT-DETR from Hugging Face, facenet-pytorch from its project GitHub
-releases. Allow 5–10 minutes on a typical home connection. Subsequent
-launches start in seconds.
+The app window opens immediately with a setup screen. On first run it
+downloads its Python runtime, ML libraries, and model weights (~3.5 GB total,
+sized to your hardware) with live progress for each stage — allow several
+minutes on a typical home connection. Setup runs once; later launches start
+in seconds. If it's interrupted, the next launch resumes where it left off.
 
-For platform requirements, troubleshooting, and uninstall, see [INSTALL.md](INSTALL.md).
+On macOS and Windows the app is a normal desktop window — closing it stops
+the app (a running indexing job keeps going in the background and reconnects
+when you relaunch). On Linux, the UI lives in your browser at
+<http://localhost:8000>.
 
-## 2. Starting the app
-
-When the install finishes, the app opens automatically in your browser at
-<http://localhost:8000>. If it doesn't, visit that URL manually.
-
-A small icon also appears in your **menu bar** (macOS — picture-frame
-icon) or **system tray** (Windows — magnifying-glass icon). This is how
-you control the app from now on — start, stop, view logs, launch the CLI,
-or quit.
-
-**macOS:**
-
-<img src="images/menu-bar-app.png" alt="macOS menu bar app" width="360">
-
-**Windows:**
-
-<img src="images/msa-tray-app.png" alt="Windows system tray app" width="360">
-
-The full menu reference is in [INSTALL.md](INSTALL.md#menu-bar--system-tray-app).
-The app re-launches automatically on login by default.
-
-If you click **Quit**, the icon goes away. To bring it back:
-
-- **macOS** — open `MediaSearchAgent` from Spotlight (`⌘ Space`, type
-  "media search"), or double-click `~/Applications/MediaSearchAgent.app`
-  in Finder.
-- **Windows** — open it from the **Start Menu** → "Media Search Agent".
+The desktop app keeps itself up to date automatically — see
+[INSTALL.md](INSTALL.md#updating).
 
 ## 3. Add a media folder
 
@@ -110,7 +96,7 @@ that person searchable.
 ## Where to go next
 
 - [Configuration](CONFIGURATION.md) — `config.yaml` reference (models, ports, thresholds)
-- [CLI reference](CLI.md) — drive the indexer and API server from the terminal
+- [CLI reference](CLI.md) — drive the indexer and API server from the terminal (headless/Linux installs)
 - [Search guide](features/search.md) — how scoring works, query tips
 - [People guide](features/people.md) — face labeling workflow
 - [Video guide](features/video.md) — semantic search across video keyframes

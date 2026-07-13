@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core permissions for the MediaSearchAgent window. The SPA reaches the backend with plain fetch() to the injected 127.0.0.1 URL, so no extra plugin permissions are needed in the webview; the sidecar is spawned from Rust (which bypasses the JS permission system).",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

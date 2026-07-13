@@ -13,7 +13,7 @@ by the shell bundle.
 
 **Why the pivot:**
 
-- Code signing was deferred indefinitely (Phase 3A). Unsigned `.exe` installers
+- Code signing was deferred indefinitely. Unsigned `.exe` installers
   trigger Windows SmartScreen warnings that hurt the prerelease launch.
 - The shell bundle approach works without signing and is simpler to distribute.
 - Inno Setup added Windows-specific CI dependencies and complexity.
@@ -81,10 +81,10 @@ Behaviour:
 - Double-clicking the app when already running: detects services up and opens browser only
 - Quitting: SIGTERM to uvicorn + Qdrant; waits for clean exit
 
-### Windows Installer — Phase 1D (Prerelease, WSL2 users only) — historical, superseded by update above
+### Windows Installer — early prerelease (WSL2 users only) — historical, superseded by update above
 
 **Scope:** Existing WSL2 users only. Users without WSL2 receive a clear message:
-"WSL2 is required. See setup-guide.md." Full automation for non-WSL2 users is Phase 3B.
+"WSL2 is required. See setup-guide.md." Full automation for non-WSL2 users comes in a later release.
 
 **Format:** PowerShell scripts delivered as a zip or via a one-line invocation.
 
@@ -98,12 +98,12 @@ Behaviour:
 Toast notifications use the Windows built-in `BurntToast` PowerShell module or fall
 back to `msg.exe` for machines where BurntToast is unavailable.
 
-### Windows Installer — Phase 3B (Public, any Windows user) — historical, superseded by update above
+### Windows Installer — public (any Windows user) — historical, superseded by update above
 
 **Format:** Inno Setup `.exe` wizard — the standard for open source Windows installers
 (used by VS Code, Python.org, Git for Windows).
 
-Additions over Phase 1D:
+Additions over the early prerelease:
 - WSL2 detection: if absent, runs `wsl --install --distribution Ubuntu-22.04`
 - Reboot-resume: writes a `InstallStage` value to
   `HKCU\Software\MediaSearchAgent` and adds itself to `RunOnce` if a reboot is
@@ -112,14 +112,14 @@ Additions over Phase 1D:
 - Auto-generated `unins000.exe` handles Windows-side removal; calls `uninstall.ps1`
   for the WSL2 side
 
-### Windows Launcher — Phase 3C (Public) — historical, superseded by update above
+### Windows Launcher (Public) — historical, superseded by update above
 
 **Format:** Small Go binary (~3 MB, no runtime dependency) providing a system tray icon,
 mirroring the macOS menu bar experience exactly.
 
 - Tray icon: grey (stopped) / green (running) / orange (error)
 - Menu: Open Media Search | — | Restart Services | View Logs | Start on Login | — | Quit
-- Bundled inside the Phase 3B Inno Setup installer
+- Bundled inside the public Inno Setup installer
 
 ### Installer Logging (Both Platforms)
 
@@ -171,10 +171,10 @@ developer), this means most steps are skipped:
 
 - macOS installer requires Xcode Command Line Tools. The preinstall script detects
   their absence and prompts the user; the install cannot proceed without them.
-- Code signing (Phase 3A) is required to eliminate Gatekeeper "Open Anyway" friction
-  on macOS and SmartScreen warnings on Windows. Milestone 1 and 2 work without signing;
-  friends must click through a one-time OS warning.
-- The Platypus `.app` approach for macOS is sufficient for Milestones 1 and 2.
+- Code signing is required to eliminate Gatekeeper "Open Anyway" friction
+  on macOS and SmartScreen warnings on Windows. Early releases work without signing;
+  users must click through a one-time OS warning.
+- The Platypus `.app` approach for macOS is sufficient for early releases.
 - A hand-built `.app` bundle is not a drop-in replacement for Platypus status-menu
   behaviour. If Platypus CLI is missing at build time, the fallback launcher must be
   treated as a simpler browser launcher, not as a menu bar app.

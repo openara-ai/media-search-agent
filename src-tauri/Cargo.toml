@@ -1,0 +1,28 @@
+# TEMPLATE-OWNED (vendored): the Tauri shell. The only project-specific things here are
+# the sidecar *name* (resolved from app.config.json at build time) — everything else is
+# the same supervisor logic for every app in the fleet.
+[package]
+name = "media-search-agent"
+version = "0.1.0"
+description = "MediaSearchAgent - local-first semantic media search desktop shell (Tauri)"
+authors = ["openara-ai"]
+edition = "2021"
+rust-version = "1.77.2"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-updater = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# smaller, faster release bundle
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"

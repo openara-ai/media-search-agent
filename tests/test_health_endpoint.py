@@ -105,6 +105,27 @@ class TestLifespanModelSetup:
                 app.state.S = saved_S
             del app.state._skip_instance_lock
 
+    def test_setup_retry_endpoint_restarts_the_download(self, tmp_path):
+        """POST /api/setup/retry must re-trigger the download via start_if_needed(models_dir) — the
+        Retry button's real backend hook (a plain reload can't restart a settled/errored worker)."""
+        from msa_apps.search_api.app import app
+        from msa_apps.search_api import setup_models as _sm
+
+        fake_cfg = SimpleNamespace(models_dir=tmp_path / "models", log_dir=str(tmp_path))
+        app.state.S = fake_cfg
+        app.state._skip_instance_lock = True
+        try:
+            with patch.object(_sm.get_manager(), "start_if_needed") as mock_start:
+                with TestClient(app) as client:
+                    mock_start.reset_mock()  # ignore the one call the lifespan makes at startup
+                    r = client.post("/api/setup/retry")
+                    assert r.status_code == 202
+                    assert r.json() == {"status": "retrying"}
+                    mock_start.assert_called_once_with(fake_cfg.models_dir)
+        finally:
+            del app.state.S
+            del app.state._skip_instance_lock
+
     def test_ws_setup_does_not_call_start_if_needed(self, tmp_path):
         """Connecting to /ws/setup must not trigger start_if_needed — it is a pure
         progress subscriber. The download is owned by the lifespan, not the WebSocket."""

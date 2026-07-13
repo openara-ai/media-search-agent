@@ -890,7 +890,7 @@ the installer-selected Blackwell-compatible CUDA torch stack.
 | Linux / WSL2 CPU | ✓ This spike | Pair quality passes; warm average 309.1ms on this WSL host |
 | Windows native Python (CPU) | ✓ Installed-runtime smoke | Pair quality passes; warm average 273.7ms with shell installer CPU torch |
 
-**Windows native is a shipping production path** (Phase 4B, `requirements-windows.txt`
+**Windows native is a shipping production path** (`requirements-windows.txt`
 and `install.ps1`). It has install-level concerns that macOS and WSL2 cannot
 cover, but those concerns are narrower than model quality. The current Windows
 installer already installs `torch` / `torchvision` before other packages, which
@@ -1128,7 +1128,7 @@ uv run python scripts/spike_face_recognizer_eval.py \
 ```
 
 **Recommended Windows approach:** run the same evaluator on the Windows CUDA
-machine used for Phase 4B validation. Repeat with `--device cpu` only if we want
+machine used for Windows-native validation. Repeat with `--device cpu` only if we want
 a Windows-specific CPU timing estimate for setup messaging.
 
 For a background indexer, ~1.5–2.5s/image on Intel i5 means 10K photos takes

@@ -24,7 +24,7 @@ folders.
 On first run, the app downloads ~1.5 GB of pre-trained model weights from
 the three upstream projects: CLIP from OpenAI's CDN, RT-DETR from Hugging
 Face, and facenet-pytorch from its project GitHub releases. After download
-they live in per-user cache directories and are loaded locally for every 
+they live in per-user cache directories and are loaded locally for every
 search and index operation. No content from your library is ever sent anywhere.
 
 ## Hardware
@@ -39,9 +39,13 @@ Not via the install one-liner — release bundles are Apple Silicon only
 and running `bash scripts/dev-setup.sh`, but ML inference falls back to CPU
 and is slow. Intel Macs are not a supported target.
 
+**Does it work on Windows 10?**
+No — the desktop app requires Windows 11 or later (x86_64). Windows 11
+ships the WebView2 runtime the app is built on.
+
 **Does it work on Linux?**
-Yes — Ubuntu 22.04 and equivalents. Tested on WSL2.
-NVIDIA GPU optional but highly recommended.
+Yes — Ubuntu 22.04 and equivalents, running headless with the UI in your
+browser. Tested on WSL2. NVIDIA GPU optional but highly recommended.
 
 ## Formats and media
 
@@ -115,32 +119,39 @@ the roadmap.
 ## Running the app
 
 **How do I update?**
-Re-run the same install one-liner. The installer detects an existing
-install, upgrades it in place, and preserves your config, index, and
-labeled people.
+On macOS and Windows you don't do anything — the desktop app checks for a
+new release at launch, verifies its signature, and installs it in the
+background; the update takes effect the next time you start the app. On
+Linux and headless installs, re-run the install one-liner — it upgrades in
+place and preserves your config, index, and labeled people.
 
 **How do I uninstall?**
-Run `msa uninstall` on macOS/Linux, or use the Windows uninstaller (see
-[INSTALL.md](INSTALL.md#uninstall)). Your media library is never touched. See
-[INSTALL.md](INSTALL.md#uninstall) for the full path list.
+macOS: drag the app to the Trash. Windows: **Settings → Apps →
+MediaSearchAgent → Uninstall**. Linux: `msa uninstall`. Your index and
+config are kept unless you delete them yourself, and your media library is
+never touched. See [INSTALL.md](INSTALL.md#uninstall) for the full path
+list.
 
 **Can I run it on a different port?**
-Yes — change `port:` under `api:` in `config.yaml`. See
-[CONFIGURATION.md](CONFIGURATION.md).
+The desktop app doesn't use a fixed port at all — it picks a private local
+port each launch, so there's nothing to configure and nothing to conflict.
+On browser/headless installs, change `port:` under `api:` in `config.yaml`.
+See [CONFIGURATION.md](CONFIGURATION.md).
 
 **Can I run it on a NAS or home server and access it from another device?**
-Yes. Stop the running app from the menu-bar / tray icon, then in a shell
-on the server run `msa api start --bind-host 0.0.0.0`. Visit
-`http://<server-ip>:8000` from another device on your LAN. Treat this as
-a trusted-network setup — there's no auth in front of the API.
+Yes. Install on the server with the headless flag (see
+[INSTALL.md](INSTALL.md#install--linux-and-servers--headless)), then run
+`msa api start --bind-host 0.0.0.0`. Visit `http://<server-ip>:8000` from
+another device on your LAN. Treat this as a trusted-network setup — there's
+no auth in front of the API.
 
-**Does it run as a background service?**
-Sort of. The installer registers an auto-start hook (launch agent on
-macOS, Task Scheduler on Windows) so the menu-bar / tray app — and the
-API process it manages — relaunches whenever you log in. It is not yet a
-true headless daemon: there's no service that runs without a logged-in
-user session, and `msa api start` invoked manually runs in the foreground
-of its terminal until you stop it.
+**Does it keep running when I close the window?**
+The app itself quits when you close its window — there's no tray icon and
+no auto-start at login. The one exception is an in-progress indexing run:
+it deliberately keeps running in the background so a long first index isn't
+lost, and the app reconnects to it when you relaunch. On headless installs,
+`msa api start` runs in the foreground of its terminal; use your own
+service manager (e.g. systemd) if you want it supervised.
 
 ## Project
 

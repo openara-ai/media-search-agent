@@ -12,17 +12,17 @@ for the cases when you want to tune something.
 
 | Platform | Path |
 |---|---|
-| **macOS** | `~/MediaSearchAgent/config.yaml` |
+| **macOS** | `~/Library/Application Support/MediaSearchAgent/config.yaml` |
 | **Windows** | `%USERPROFILE%\MediaSearchAgent\config.yaml` |
-| **Linux** | `~/MediaSearchAgent/config.yaml` |
+| **Linux** | `~/.config/MediaSearchAgent/config.yaml` |
 
-The file is created on first install from the platform-specific template
-shipped with the installer.
+The file is created on first run from the platform-specific template shipped
+with the app. It is never overwritten by updates or reinstalls.
 
 ## When changes take effect
 
-- **API process** — restart it after editing (Indexer page → Stop, then run
-  the start command again, or just restart the menu-bar / tray app).
+- **Desktop app (macOS / Windows)** — quit the app and relaunch it.
+- **Browser / headless installs** — restart the server (`msa api restart`).
 - **Indexer** — picks up the latest config every time you click **Run**.
 
 The UI does not hot-reload `config.yaml`.
@@ -133,6 +133,10 @@ The defaults work well across most consumer video. Lower
 seeing too many fragmentary shots.
 
 ## Server / API
+
+These settings apply to browser and headless installs (`msa api start`).
+The **desktop app ignores them** — it binds a private local port of its own
+on every launch, so it never conflicts with anything else on your machine.
 
 ```yaml
 api:

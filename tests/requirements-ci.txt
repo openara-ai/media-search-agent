@@ -18,6 +18,10 @@ qdrant-client  # for QdrantStore imports in retrievers
 # Required for API tests
 fastapi  # for FastAPI TestClient
 httpx  # for TestClient async support (transitive dep, explicit for safety)
+# The desktop BVT (test_desktop_bvt.py) boots the REAL sidecar entry
+# (src/msa_apps/search_api/sidecar.py), which imports uvicorn. Pin identically
+# to requirements-api.txt so the CI env matches the packaged runtime.
+uvicorn[standard]==0.30.6
 
 # Required for object detection and video features
 loguru  # for logging in object detection

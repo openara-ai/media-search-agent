@@ -96,6 +96,34 @@ License: MIT
 Source:  https://github.com/tiangolo/fastapi
 
 -------------------------------------------------------------------------------
+Tauri (desktop shell)
+License: MIT or Apache-2.0
+Source:  https://github.com/tauri-apps/tauri
+
+The macOS and Windows desktop apps are built on the Tauri framework and its
+plugins (shell, updater), each dual-licensed MIT / Apache-2.0. The compiled
+desktop binaries additionally link Rust crates from the Tauri dependency
+tree under their respective licenses (predominantly MIT and/or Apache-2.0).
+
+-------------------------------------------------------------------------------
+uv (Python package and environment manager)
+License: MIT or Apache-2.0
+Source:  https://github.com/astral-sh/uv
+
+Desktop and headless installs bundle the uv binary, which the app uses to
+provision its private Python environment.
+
+-------------------------------------------------------------------------------
+CPython (standalone Python runtime)
+License: Python Software Foundation License Version 2
+Source:  https://www.python.org/
+Builds:  https://github.com/astral-sh/python-build-standalone
+
+The app provisions a standalone CPython build (python-build-standalone,
+installed via uv) private to the application; it does not modify or depend
+on any system Python.
+
+-------------------------------------------------------------------------------
 PRIVACY NOTICE
 -------------------------------------------------------------------------------
 

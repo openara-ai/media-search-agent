@@ -1,7 +1,8 @@
 import type { SearchFilters, SearchResponse } from './types'
+import { apiUrl } from '../lib/apiBase'
 
 export async function postSearch(q: string, filters?: SearchFilters): Promise<SearchResponse> {
-  const res = await fetch('/search', {
+  const res = await fetch(apiUrl('/search'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ q, filters: filters ?? null }),
@@ -14,7 +15,7 @@ export async function postSearch(q: string, filters?: SearchFilters): Promise<Se
  *  fire-and-forget — never disrupts the UI if the ranker/endpoint is unavailable. */
 export async function trackOpen(searchId: string, mediaId: string): Promise<void> {
   try {
-    await fetch('/track/open', {
+    await fetch(apiUrl('/track/open'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ search_id: searchId, media_id: mediaId }),

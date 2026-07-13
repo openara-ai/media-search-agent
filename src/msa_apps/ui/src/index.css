@@ -1,3 +1,40 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/*
+ * First-run setup progress bar (StartupGate). uv installs the ~2 GB PyTorch/CUDA stack while
+ * piping its output, so it emits no byte progress and the fill width can hold flat for minutes.
+ * A continuously-moving barber-pole stripe on the fill guarantees a visible "still working"
+ * signal independent of the byte-backed width — it's what tells the user the install isn't hung.
+ * Honors prefers-reduced-motion (falls back to a static fill).
+ */
+@keyframes msa-provisioning-stripe {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 1rem 0;
+  }
+}
+
+.msa-provisioning-bar {
+  background-image: linear-gradient(
+    -45deg,
+    rgba(255, 255, 255, 0.22) 25%,
+    transparent 25%,
+    transparent 50%,
+    rgba(255, 255, 255, 0.22) 50%,
+    rgba(255, 255, 255, 0.22) 75%,
+    transparent 75%,
+    transparent
+  );
+  background-size: 1rem 1rem;
+  animation: msa-provisioning-stripe 0.8s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .msa-provisioning-bar {
+    animation: none;
+  }
+}

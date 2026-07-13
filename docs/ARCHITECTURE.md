@@ -68,15 +68,18 @@ graph TD
   IP -->|export vectors + payloads| QD
 ```
 
-A single FastAPI process serves the React UI on port 8000 and embeds the
-Qdrant vector database in-process — no separate service, no Docker. The
-indexer is a separate process that writes to the same on-disk stores.
+A single FastAPI process embeds the Qdrant vector database in-process — no
+separate service, no Docker. The indexer is a separate process that writes
+to the same on-disk stores. On macOS and Windows the FastAPI process runs as
+a sidecar inside the native desktop app (see
+[Desktop shell](#desktop-shell-macos--windows)); on Linux and headless
+installs it serves the React UI directly in your browser at port 8000.
 
 ## Components
 
 | Component | What it does |
 |---|---|
-| **React SPA** | Single-page UI for search, browse, indexer, people, settings. Built with Vite + TypeScript. Served as static assets by FastAPI. |
+| **React SPA** | Single-page UI for search, browse, indexer, people, settings. Built with Vite + TypeScript. Embedded in the desktop window on macOS/Windows; served as static assets by FastAPI in browser mode. |
 | **FastAPI + Uvicorn** | HTTP/WebSocket API. Owns the process, embeds Qdrant, drives the QueryEngine. |
 | **QueryEngine** | Encodes the query, runs vector retrieval, applies filters, reranks, returns the top results. Pure Python in-process. |
 | **ClipEmbedder** | Image and text encoder (CLIP, default `ViT-L-14` weights). Drives both indexing and search. |
@@ -193,6 +196,56 @@ app works fully offline.
 
 Model selection is configurable — see [CONFIGURATION.md](CONFIGURATION.md).
 
+## Desktop shell (macOS / Windows)
+
+On macOS and Windows the app ships as a native desktop app built on
+[Tauri](https://tauri.app/): a small Rust **supervisor** owns the window and
+runs the same Python backend described above as a **sidecar** process. The
+engine is identical across desktop and browser installs — the shell only
+changes how it's launched and displayed.
+
+```mermaid
+graph TD
+  subgraph Shell[Desktop app - one double-click]
+    SUP[Supervisor - Rust<br/>window + webview + updater]
+    SPA[React SPA<br/>embedded in the webview]
+  end
+
+  subgraph Sidecar[Python sidecar]
+    SHIM[Provisioning shim<br/>first-run setup + health responder]
+    FA[FastAPI + Uvicorn<br/>same backend as browser mode]
+  end
+
+  SUP -->|"spawns with SIDECAR_PORT"| SHIM
+  SHIM -->|"hands the port to"| FA
+  SPA -->|"HTTP + WebSocket<br/>127.0.0.1:&lt;ephemeral port&gt;"| FA
+```
+
+The mechanics that matter:
+
+- **Ephemeral port** — the supervisor picks a fresh `127.0.0.1` port on every
+  launch and passes it to the sidecar. The desktop app has no fixed port, so
+  it can never collide with another service (port 8000 is browser mode only).
+- **`window.__API_BASE__` seam** — before the SPA loads, the supervisor
+  injects the sidecar's base URL into the webview. All SPA fetches and
+  WebSockets route through one helper that falls back to relative URLs when
+  the seam is absent — which is exactly browser mode, byte-identical build.
+- **Provisioning shim** — on first launch the sidecar entry installs a
+  standalone CPython and the ML/Python dependencies with a bundled `uv` into
+  an app-private directory, streaming stage-by-stage progress to the setup
+  screen over the same port. The step ledger makes it resumable: a crash or
+  quit mid-install continues where it left off on the next launch. Once the
+  environment is ready, the shim starts uvicorn on the same port.
+- **Clean lifecycle** — closing the window terminates the sidecar; a parent
+  watchdog inside the sidecar exits if the supervisor ever dies first, so no
+  orphaned Python processes either way. The indexer is the deliberate
+  exception: it runs as a detached process, survives a window close, and the
+  app re-attaches to it on relaunch.
+- **Auto-update** — at launch the supervisor checks GitHub Releases,
+  verifies the new bundle's minisign signature, and installs it in the
+  background; the update applies on the next start. Failures are ignored
+  (never block launch).
+
 ## Process boundaries
 
 ```mermaid
@@ -251,6 +304,7 @@ Two processes share three on-disk stores:
 | SQLite schema and queries | `src/msa_indexer/db/sqlite_store.py` |
 | Qdrant export and client | `src/msa_indexer/db/qdrant_export.py`, `src/msa_query/storage/qdrant_client.py` |
 | Unified CLI (`msa`) | `src/msa_cli/` |
+| Desktop shell — supervisor, sidecar shim | `src-tauri/`, `src/msa_apps/search_api/sidecar.py` |
 
 API endpoints are also auto-documented at <http://localhost:8000/docs> when
 the app is running (FastAPI's built-in Swagger UI).

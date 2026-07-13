@@ -15,24 +15,30 @@ permissions:
   contents: write   # needed to create GitHub Releases and upload assets
 
 jobs:
-  # ── Repository gate: auto-run on private (main gate) + the staging/public mirrors ──
-  # The PRIVATE repo is the primary release gate: a tag-push there runs the full
-  # pipeline (tests + build + BVT) so failures are caught at the source, before the
-  # tag is ever mirrored. Publishing is still blocked on private by the `release`
-  # job's `if: github.repository != 'kumraj/media-search-agent'`, so private
-  # validates without cutting a GitHub Release.
-  # Staging/public auto-run on tag arrival to build + BVT (+ publish on public).
-  # Forks and any other repo are excluded so they can't accidentally cut a release.
-  # Manual `workflow_dispatch` is allowed everywhere as an escape hatch.
+  # ── Repository gate: auto-run on our own repos (the private dev gate + the openara-ai
+  # staging/public mirrors); third-party forks are excluded from auto-run. ──
+  # The private dev repo is the primary release gate: a tag-push there runs the full pipeline
+  # (tests + build + BVT) so failures are caught at the source, before the tag is ever mirrored.
+  # Publishing is gated separately (see the `release` job) to the openara-ai publish repos ONLY,
+  # so a private-dev validation run never cuts a GitHub Release. Staging/public auto-run on tag
+  # arrival to build + BVT (+ publish on public). The private dev repo is admitted as a non-fork
+  # repo that isn't openara-ai (our repos are created by push, never via GitHub's fork button, so
+  # they report fork==false); real third-party forks report fork==true and are excluded from
+  # auto-run — they can still use the workflow_dispatch escape hatch on their own copy.
   preflight:
     name: Repository gate
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      github.repository == 'kumraj/media-search-agent' ||
+      github.repository == 'openara-ai/media-search-agent' ||
       github.repository == 'openara-ai/media-search-agent-public-staging' ||
-      github.repository == 'openara-ai/media-search-agent'
+      (github.event.repository.fork == false && github.repository_owner != 'openara-ai')
     runs-on: ubuntu-latest
     timeout-minutes: 2
+    # Same predicate the bundle jobs use to force createUpdaterArtifacts:true + inject the fleet
+    # signing key: the publishing repos (staging + public) sign updater artifacts, so those — and
+    # only those — must carry the real updater pubkey (the placeholder guard below is IS_PUBLISH-only).
+    env:
+      IS_PUBLISH: ${{ github.repository == 'openara-ai/media-search-agent' || github.repository == 'openara-ai/media-search-agent-public-staging' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -65,6 +71,97 @@ jobs:
           fi
           echo "CHANGELOG section for $version present."
 
+      # ── Version-consistency preflight (M-7/S-4 spec item 4; ADR-012 §4) ─────────────────────
+      # The release version must agree across the tag, tauri.conf.json, pyproject.toml, and the
+      # CHANGELOG section — a tag/bundle version mismatch is exactly the release footgun this guards. MSA stamps
+      # tauri.conf.json + pyproject FROM the git tag at build time (stage-desktop-backend.sh), so the
+      # COMMITTED files carry placeholders ('0.0.0' / '0.0.0.dev0'); the guard accepts a placeholder
+      # (it will be stamped) OR an exact tag-base match, and FAILS a hard-coded real version that
+      # disagrees with the tag. It also asserts the updater endpoint targets the PUBLIC repo — the
+      # in-app updater resolves the manifest anonymously only there (S-4 item 2). Tag passed via env,
+      # never interpolated into the script (Actions script-injection hardening).
+      - name: Guard — version consistency + updater endpoint
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys, pathlib
+          tag = os.environ["RELEASE_TAG"]
+          version = tag[1:] if tag.startswith("v") else tag
+          m = re.match(r"^(\d+)\.(\d+)\.(\d+)", version)
+          if not m:
+              print(f"::error::release version '{version}' (tag '{tag}') is not X.Y.Z[...]")
+              sys.exit(1)
+          base = ".".join(m.groups())
+          errors = []
+          tconf = json.loads(pathlib.Path("src-tauri/tauri.conf.json").read_text())
+          tv = tconf.get("version", "")
+          if tv not in ("0.0.0", base):
+              errors.append(f"tauri.conf.json version '{tv}' != tag base '{base}' and is not the '0.0.0' build-stamp placeholder")
+          pp = pathlib.Path("pyproject.toml").read_text()
+          pm = re.search(r'(?m)^\s*version\s*=\s*"([^"]+)"', pp)
+          pv = pm.group(1) if pm else ""
+          pvm = re.match(r"^(\d+)\.(\d+)\.(\d+)", pv)
+          if pv != "0.0.0.dev0" and (not pvm or ".".join(pvm.groups()) != base):
+              errors.append(f"pyproject.toml version '{pv}' != tag base '{base}' and is not the '0.0.0.dev0' placeholder")
+          cl = pathlib.Path("CHANGELOG.md").read_text()
+          if not re.search(r'(?m)^## \[' + re.escape(version) + r'\]', cl):
+              errors.append(f"CHANGELOG.md has no '## [{version}]' section")
+          PUB = "openara-ai/media-search-agent"
+          eps = tconf.get("plugins", {}).get("updater", {}).get("endpoints", [])
+          # Anchor on the full host+path — a substring check (`PUB in e`) also passes the
+          # staging repo `openara-ai/media-search-agent-public-staging`, whose releases are
+          # NOT anonymously resolvable, so the in-app updater would silently fail for users.
+          pub_re = re.compile(rf"^https://github\.com/{re.escape(PUB)}/releases/")
+          if not (eps and all(pub_re.match(e) for e in eps)):
+              errors.append(f"updater endpoint(s) {eps} must all match ^https://github.com/{PUB}/releases/")
+          if errors:
+              for e in errors:
+                  print("::error::" + e)
+              sys.exit(1)
+          print(f"Version consistency OK: base={base}; tauri={tv}; pyproject={pv}; CHANGELOG [{version}]; updater -> {PUB}")
+          PY
+
+      # ── Real updater pubkey preflight (M-7/S-4; ADR-012) — PUBLISH path only ─────────────────
+      # On the publishing repos the bundle jobs force createUpdaterArtifacts:true and inject the
+      # real fleet private key (TAURI_SIGNING_*), so every produced .app.tar.gz / setup.exe / latest.json
+      # is minisign-signed with the real key. If tauri.conf.json still carries the COMMITTED placeholder
+      # pubkey (its base64 decodes to a minisign key whose comment contains 'PLACEHOLDER - TODO replace
+      # in M-7/S-4'), installed clients verify those real-key signatures against the placeholder public
+      # key and auto-update fails at runtime for EVERY release cut from this state. Hard-fail here so the
+      # developer's "paste the real pubkey" step (RELEASING.md) is an ENFORCED gate, not an honor-system
+      # checkbox. Key-less validation builds (private dev / forks) are NOT IS_PUBLISH: they build with
+      # createUpdaterArtifacts:false and no key, so the placeholder is harmless and this guard is skipped.
+      - name: Guard — real updater pubkey on publish (reject placeholder)
+        if: ${{ env.IS_PUBLISH == 'true' }}
+        run: |
+          python3 - <<'PY'
+          import base64, json, sys, pathlib
+          conf = json.loads(pathlib.Path("src-tauri/tauri.conf.json").read_text())
+          pk = conf.get("plugins", {}).get("updater", {}).get("pubkey", "")
+          if not pk:
+              print("::error::plugins.updater.pubkey is empty — a publishing build signs updater "
+                    "artifacts with the real fleet key, so it needs the matching real pubkey committed.")
+              sys.exit(1)
+          try:
+              decoded = base64.b64decode(pk).decode("utf-8", "replace")
+          except Exception as e:  # noqa: BLE001 — any decode failure is a bad/placeholder key
+              print(f"::error::plugins.updater.pubkey is not valid base64 ({e}) — commit the real "
+                    "minisign public key from `npx tauri signer generate`.")
+              sys.exit(1)
+          # The committed fail-closed placeholder decodes to a minisign key whose untrusted-comment
+          # line reads 'MediaSearchAgent updater public key PLACEHOLDER - TODO replace in M-7/S-4 ...'.
+          if "PLACEHOLDER" in decoded:
+              print("::error::plugins.updater.pubkey in src-tauri/tauri.conf.json is still the committed "
+                    "PLACEHOLDER (decodes to a 'PLACEHOLDER - TODO replace in M-7/S-4' minisign key). A "
+                    "publishing run signs artifacts with the REAL private key; shipping the placeholder "
+                    "public key means clients cannot verify the signature and auto-update fails for every "
+                    "release. Paste the real fleet updater public key (see RELEASING.md → Desktop app: "
+                    "signed auto-update) before cutting a signed release.")
+              sys.exit(1)
+          print("Updater pubkey OK on publish path (not the committed placeholder).")
+          PY
+
       - run: echo "Proceeding on ${{ github.repository }} (event=${{ github.event_name }}, ref=${{ github.ref_name }})"
 
   # ── Test gate (PRIVATE only) ────────────────────────────────────────────────
@@ -77,7 +174,7 @@ jobs:
   test:
     name: Quick Tests (Ubuntu)
     needs: preflight
-    if: github.repository == 'kumraj/media-search-agent'
+    if: github.repository_owner != 'openara-ai'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -115,7 +212,7 @@ jobs:
   integration:
     name: Full Integration (Ubuntu)
     needs: preflight
-    if: github.repository == 'kumraj/media-search-agent'
+    if: github.repository_owner != 'openara-ai'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -146,7 +243,7 @@ jobs:
   macos-test:
     name: Unit Tests (macOS)
     needs: preflight
-    if: github.repository == 'kumraj/media-search-agent'
+    if: github.repository_owner != 'openara-ai'
     runs-on: macos-14
     timeout-minutes: 20
     steps:
@@ -184,7 +281,7 @@ jobs:
 
   windows-test:
     needs: preflight
-    if: github.repository == 'kumraj/media-search-agent'
+    if: github.repository_owner != 'openara-ai'
     uses: ./.github/workflows/windows-test.yml
 
   # ── BVT gate ────────────────────────────────────────────────────────────────
@@ -236,62 +333,15 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # ── macOS shell bundle — build + BVT ──────────────────────────────────────────
-  build-macos-shell-bundle:
-    name: Build macOS Shell Bundle + Run BVT
-    runs-on: macos-14
-    timeout-minutes: 90
-    needs: [build-ui]
-    # Explicit guard REQUIRED — without it this job inherits the implicit success()
-    # gate and is skipped on staging/public when the private-only test jobs skip (that
-    # "skipped" status propagates past build-ui). Run whenever build-ui succeeded.
-    if: ${{ !cancelled() && needs.build-ui.result == 'success' }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Extract version from tag
-        id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-
-      - name: Download React UI dist
-        uses: actions/download-artifact@v4
-        with:
-          name: ui-dist
-          path: src/msa_apps/ui/dist
-
-      - name: Build macOS bundle
-        run: bash installer/macos/shell/build-bundle.sh --version "${{ steps.version.outputs.version }}" --platform macos
-
-      # BVT: validate the exact release-candidate bundle we are about to upload,
-      # by installing it the way an end user would and running the real-media
-      # harness against the installed tools. Build-once: this is the same artifact
-      # that ships, not a separate 0.0.0-ci rebuild (which is what bvt.yml does for
-      # standalone manual runs).
-      - name: Cache bundle model artifacts
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}/msa-macos-home/Library/Caches/MediaSearchAgent
-          key: ${{ runner.os }}-${{ runner.arch }}-bundle-models-v1
-
-      - name: Validate macOS bundle install (BVT)
-        run: |
-          BUNDLE=$(ls dist/shell/MediaSearchAgent-*-macos-arm64.tar.gz)
-          bash tests/real_media/scripts/validate-installed-bundle-macos.sh "$BUNDLE"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos-shell-bundle
-          path: dist/shell/MediaSearchAgent-*-macos-*.tar.gz
-          if-no-files-found: error
-          retention-days: 1
-
   # ── Linux shell bundle — build + BVT ──────────────────────────────────────────
   build-linux-shell-bundle:
     name: Build Linux Shell Bundle + Run BVT
     runs-on: ubuntu-latest
     timeout-minutes: 75
     needs: [build-ui]
-    # Explicit guard required — see build-macos-shell-bundle.
+    # Explicit guard required (the #158/#159 skipped-status trap): re-assert build-ui success
+    # rather than lean on the implicit success() gate, which a skipped private-only test job
+    # would otherwise propagate here. Same pattern as the desktop jobs below.
     if: ${{ !cancelled() && needs.build-ui.result == 'success' }}
     steps:
       - uses: actions/checkout@v4
@@ -328,14 +378,160 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # ── Windows shell bundle — build + BVT ────────────────────────────────────────
-  build-windows-shell-bundle:
-    name: Build Windows Shell Bundle + Run BVT
+  # ── Tauri desktop app — macOS (build + signed updater artifacts on the publishing repos) ─────
+  # M-7/S-4 spec item 1. Builds the Tauri desktop bundle ALONGSIDE the legacy shell-bundle jobs
+  # (those keep running until S-5 retirement; the Linux bundle job stays permanently). Own explicit
+  # `needs.build-ui.result == 'success'` guard — the #158/#159 skipped-status trap: every downstream
+  # job must RE-ASSERT the guard, never rely on transitive skip semantics. Decision (c): call
+  # `npx tauri build` directly (bypass the vendored build-app.sh); force createUpdaterArtifacts:true
+  # on the publishing repos only, so a key-less validation build (private/forks) still succeeds
+  # (committed createUpdaterArtifacts is false). NOT run on the PR (release.yml is tag-triggered) —
+  # validated at tag time on staging (human-only DoD).
+  build-desktop-macos:
+    name: Build macOS Desktop (Tauri) + BVT
+    runs-on: macos-14
+    timeout-minutes: 90
+    needs: [build-ui]
+    if: ${{ !cancelled() && needs.build-ui.result == 'success' }}
+    env:
+      IS_PUBLISH: ${{ github.repository == 'openara-ai/media-search-agent' || github.repository == 'openara-ai/media-search-agent-public-staging' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            src/msa_apps/ui/package-lock.json
+
+      # Root npm ci installs the vendored @tauri-apps/cli (npx tauri); the SPA deps let tauri.conf's
+      # beforeBuildCommand (`npm --prefix src/msa_apps/ui run build`) build the embedded frontend.
+      - name: Install Tauri CLI (root) + SPA deps
+        run: |
+          npm ci
+          npm ci --prefix src/msa_apps/ui
+
+      - name: uv (pinned)
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: '0.5.21'
+
+      # Bash on both runners (Git Bash on Windows) satisfies the bash-only dev-script rule (CLAUDE.md).
+      - name: Stage desktop backend (uv + backend tree + tools + version stamp)
+        shell: bash
+        run: bash scripts/stage-desktop-backend.sh
+
+      # On the publishing repos force createUpdaterArtifacts:true and inject the fleet signing key so
+      # the produced .app.tar.gz + latest.json are signed. Elsewhere (private validation / forks)
+      # build WITHOUT updater artifacts and WITHOUT the key so a key-less build still succeeds. NEVER
+      # pass empty APPLE_* env — MSA signs ad-hoc (tauri.conf macOS.signingIdentity "-"); empty (not
+      # absent) APPLE_* makes Tauri `security import` a missing cert and the bundle fails.
+      - name: Build Tauri desktop bundle
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # Passwordless updater key (minisign, generated without a password): the password
+          # is the literal empty string, not a secret (passwordless minisign updater key).
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: |
+          if [ "$IS_PUBLISH" = "true" ]; then
+            npx tauri build --config '{"bundle":{"createUpdaterArtifacts":true}}'
+          else
+            unset TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+            npx tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          fi
+
+      # Real-media BVT against the freshly-built desktop .dmg (the go-forward shippable
+      # artifact). Runs on validation + publish tags. HARD gate: a BVT failure fails this
+      # build job, so the release is skipped (validated green on the bvt.yml dispatch; the
+      # #171 orphan-on-quit is a non-fatal warning). Legacy shell-bundle jobs still run
+      # alongside; their retirement is tracked separately.
+      - name: Cache desktop BVT model artifacts
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/msa-desktop-home/Library/Caches/MediaSearchAgent
+          key: ${{ runner.os }}-${{ runner.arch }}-desktop-bvt-models-v1
+      - name: Validate desktop install (real-media BVT)
+        shell: bash
+        run: |
+          DMG=$(ls src-tauri/target/release/bundle/dmg/*.dmg | head -1)
+          bash tests/real_media/scripts/validate-installed-desktop-macos.sh "$DMG"
+
+      # Upload the freshly-built, BVT-validated .dmg for manual testing. VALIDATION path only
+      # (private dev / forks) — the publish path below already uploads signed artifacts and
+      # attaches them to the Release, so this would be redundant there. NOTE: a validation build
+      # is key-less (unsigned, no updater artifacts), so this .dmg is for functional
+      # install/index/launch testing; the self-update E2E still needs the signed public build.
+      - name: Upload built desktop installer for testing (validation only)
+        if: ${{ env.IS_PUBLISH != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-macos-installer
+          path: src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: warn
+          retention-days: 7
+
+      # Collect the signed updater artifact + installer under the canonical asset names the thin
+      # bootstrap (install.sh) + manual-download docs expect, and emit a per-platform latest.json
+      # fragment (the release job merges the two fragments into latest.json). Publish repos only —
+      # a validation build produces no .sig.
+      - name: Collect desktop artifacts + updater manifest (publish only)
+        if: ${{ env.IS_PUBLISH == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="src-tauri/target/release/bundle"
+          out="dist/desktop"; mkdir -p "$out"
+          # Single source of truth: the version the app was ACTUALLY built with — the stamped
+          # tauri.conf.json version (stage-desktop-backend.sh preserves the -rc* suffix). Artifact
+          # names, the download URL, and the latest.json fragment all derive from it, so the
+          # manifest version == the in-app version, suffix included (rc1 != rc2 for self-update).
+          appver="$(jq -r '.version' src-tauri/tauri.conf.json)"
+          { [ -n "$appver" ] && [ "$appver" != "null" ]; } || { echo "::error::could not read stamped app version from tauri.conf.json"; exit 1; }
+          appgz="$(ls "$bundle"/macos/*.app.tar.gz 2>/dev/null | head -1 || true)"
+          { [ -n "$appgz" ] && [ -f "$appgz" ] && [ -f "$appgz.sig" ]; } \
+            || { echo "::error::macOS updater artifact (.app.tar.gz) or its .sig is missing"; exit 1; }
+          cp "$appgz"     "$out/MediaSearchAgent_${appver}_aarch64.app.tar.gz"
+          cp "$appgz.sig" "$out/MediaSearchAgent_${appver}_aarch64.app.tar.gz.sig"
+          dmg="$(ls "$bundle"/dmg/*.dmg 2>/dev/null | head -1 || true)"
+          if [ -n "$dmg" ]; then cp "$dmg" "$out/MediaSearchAgent_${appver}_aarch64.dmg"; else echo "no .dmg produced (updater artifact still complete)"; fi
+          url="https://github.com/openara-ai/media-search-agent/releases/download/${GITHUB_REF_NAME}/MediaSearchAgent_${appver}_aarch64.app.tar.gz"
+          sig="$(jq -Rs . < "$out/MediaSearchAgent_${appver}_aarch64.app.tar.gz.sig")"
+          printf '{"version":"%s","platforms":{"darwin-aarch64":{"signature":%s,"url":"%s"}}}\n' "$appver" "$sig" "$url" > "$out/latest-darwin.json"
+
+      - name: Upload desktop artifacts (macOS)
+        if: ${{ env.IS_PUBLISH == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-macos
+          path: dist/desktop
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── Tauri desktop app — Windows (build + signed updater artifacts on the publishing repos) ────
+  # See build-desktop-macos. NSIS per-user installer + signed setup.exe/.sig. Git Bash runs the
+  # bash steps on windows-latest.
+  build-desktop-windows:
+    name: Build Windows Desktop (Tauri) + BVT
     runs-on: windows-latest
     timeout-minutes: 90
     needs: [build-ui]
-    # Explicit guard required — see build-macos-shell-bundle.
     if: ${{ !cancelled() && needs.build-ui.result == 'success' }}
+    env:
+      IS_PUBLISH: ${{ github.repository == 'openara-ai/media-search-agent' || github.repository == 'openara-ai/media-search-agent-public-staging' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -344,53 +540,104 @@ jobs:
         shell: bash
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Download React UI dist
-        uses: actions/download-artifact@v4
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          name: ui-dist
-          path: src/msa_apps/ui/dist
+          workspaces: src-tauri
 
-      - name: Set up .NET SDK
-        uses: actions/setup-dotnet@v4
+      - uses: actions/setup-node@v4
         with:
-          dotnet-version: '8.0.x'
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            src/msa_apps/ui/package-lock.json
 
-      # build-bundle.sh's final step calls `zip`, which isn't on windows-latest
-      # Git Bash by default. Install it via Chocolatey so the script's POSIX
-      # zip path keeps working without a script-side rewrite.
-      - name: Install zip (for build-bundle.sh)
-        run: choco install zip --no-progress -y
-        shell: powershell
+      - name: Install Tauri CLI (root) + SPA deps
+        run: |
+          npm ci
+          npm ci --prefix src/msa_apps/ui
 
-      - name: Build Windows bundle
+      - name: uv (pinned)
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: '0.5.21'
+
+      - name: Stage desktop backend (uv + backend tree + tools + version stamp)
         shell: bash
-        run: bash installer/windows-native/shell/build-bundle.sh --version "${{ steps.version.outputs.version }}"
+        run: bash scripts/stage-desktop-backend.sh
 
-      # BVT: validate the exact release-candidate bundle (see macOS job for rationale).
-      - name: Cache bundle model artifacts
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}\msa-app\Cache
-          key: ${{ runner.os }}-bundle-models-v1
+      - name: Build Tauri desktop bundle
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # Passwordless updater key (minisign, generated without a password): the password
+          # is the literal empty string, not a secret (passwordless minisign updater key).
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: |
+          if [ "$IS_PUBLISH" = "true" ]; then
+            npx tauri build --config '{"bundle":{"createUpdaterArtifacts":true}}'
+          else
+            unset TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+            npx tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          fi
 
-      - name: Validate Windows bundle install (BVT)
+      # Real-media BVT against the freshly-built setup.exe (-Ci: install + index + UI-launch
+      # the app + ephemeral-port discovery + the full runtime suite + orphan/uninstall teardown;
+      # the CORS preflight + NVIDIA-torch checks stay on the Hyper-V real host). HARD gate.
+      - name: Validate desktop install (real-media BVT, CI)
         shell: powershell
         run: |
-          $zip = Get-ChildItem dist/shell/MediaSearchAgent-*-windows-x86_64.zip | Select-Object -First 1
-          & powershell -ExecutionPolicy Bypass -File tests/real_media/scripts/validate-installed-bundle-windows.ps1 -Bundle $zip.FullName
+          $setup = Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          & powershell -ExecutionPolicy Bypass -File tests/real_media/scripts/validate-installed-desktop-windows.ps1 -Ci -Setup $setup.FullName
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - uses: actions/upload-artifact@v4
+      # Upload the freshly-built, BVT-validated setup.exe for manual testing (VALIDATION path
+      # only; see the macOS job). Key-less/unsigned on this path — functional testing only.
+      - name: Upload built desktop installer for testing (validation only)
+        if: ${{ env.IS_PUBLISH != 'true' }}
+        uses: actions/upload-artifact@v4
         with:
-          name: windows-shell-bundle
-          path: dist/shell/MediaSearchAgent-*-windows-*.zip
+          name: desktop-windows-installer
+          path: src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Collect desktop artifacts + updater manifest (publish only)
+        if: ${{ env.IS_PUBLISH == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="src-tauri/target/release/bundle"
+          out="dist/desktop"; mkdir -p "$out"
+          # Single source of truth (see the macOS job): the stamped tauri.conf.json version, which
+          # NSIS already embeds in the setup.exe basename (MediaSearchAgent_<appver>_x64-setup.exe).
+          appver="$(jq -r '.version' src-tauri/tauri.conf.json)"
+          { [ -n "$appver" ] && [ "$appver" != "null" ]; } || { echo "::error::could not read stamped app version from tauri.conf.json"; exit 1; }
+          setup="$(ls "$bundle"/nsis/*-setup.exe 2>/dev/null | head -1 || true)"
+          { [ -n "$setup" ] && [ -f "$setup" ]; } || { echo "::error::Windows NSIS setup.exe is missing"; exit 1; }
+          [ -f "$setup.sig" ] || { echo "::error::Windows updater .sig is missing"; exit 1; }
+          cp "$setup"     "$out/$(basename "$setup")"          # already MediaSearchAgent_<appver>_x64-setup.exe
+          cp "$setup.sig" "$out/$(basename "$setup").sig"
+          url="https://github.com/openara-ai/media-search-agent/releases/download/${GITHUB_REF_NAME}/$(basename "$setup")"
+          sig="$(jq -Rs . < "$setup.sig")"
+          printf '{"version":"%s","platforms":{"windows-x86_64":{"signature":%s,"url":"%s"}}}\n' "$appver" "$sig" "$url" > "$out/latest-windows.json"
+
+      - name: Upload desktop artifacts (Windows)
+        if: ${{ env.IS_PUBLISH == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-windows
+          path: dist/desktop
           if-no-files-found: error
           retention-days: 1
 
   # ── GitHub Release ────────────────────────────────────────────────────────────
   release:
     name: Publish GitHub Release
-    needs: [build-macos-shell-bundle, build-linux-shell-bundle, build-windows-shell-bundle]
+    needs: [build-linux-shell-bundle, build-desktop-macos, build-desktop-windows]
     # Publish only on the two openara-ai mirrors — never on the private dev repo (a
     # tag-push there is a validation run that must NOT cut a Release), and never on a
     # fork. Use a POSITIVE allowlist, not `!= private`: preflight admits workflow_dispatch
@@ -405,9 +652,9 @@ jobs:
       ${{ !cancelled()
           && (github.repository == 'openara-ai/media-search-agent'
               || github.repository == 'openara-ai/media-search-agent-public-staging')
-          && needs.build-macos-shell-bundle.result == 'success'
           && needs.build-linux-shell-bundle.result == 'success'
-          && needs.build-windows-shell-bundle.result == 'success' }}
+          && needs.build-desktop-macos.result == 'success'
+          && needs.build-desktop-windows.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -444,23 +691,24 @@ jobs:
             echo "CHANGELOG_EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Download macOS shell bundle
-        uses: actions/download-artifact@v4
-        with:
-          name: macos-shell-bundle
-          path: dist/shell
-
       - name: Download Linux shell bundle
         uses: actions/download-artifact@v4
         with:
           name: linux-shell-bundle
           path: dist/shell
 
-      - name: Download Windows shell bundle
+      # Tauri desktop installers + signed updater artifacts (.app.tar.gz/.sig, setup.exe/.sig,
+      # .dmg) + the per-platform latest.json fragments (M-7/S-4).
+      - name: Download macOS desktop artifacts
         uses: actions/download-artifact@v4
         with:
-          name: windows-shell-bundle
-          path: dist/shell
+          name: desktop-macos
+          path: dist/desktop
+      - name: Download Windows desktop artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: desktop-windows
+          path: dist/desktop
 
       # Stage the bootstrap installer scripts as top-level release assets so
       # the GitHub one-liner works:
@@ -472,6 +720,63 @@ jobs:
           cp installer/macos/shell/install.sh         dist/installers/install.sh
           cp installer/windows-native/shell/install.ps1 dist/installers/install.ps1
 
+      # Assemble the single release-asset directory, merge the updater manifest, and generate
+      # SHA256SUMS over ALL assets (Tauri desktop installers + legacy shell bundles + bootstraps).
+      # The thin bootstraps hard-fail if their target isn't listed (M-7/S-4 items 3 + 5).
+      - name: Assemble release assets + latest.json + SHA256SUMS
+        run: |
+          set -euo pipefail
+          rel="dist/release"; mkdir -p "$rel"
+          # Thin one-liner bootstraps + the Linux shell bundle (the only shell bundle still shipped;
+          # macOS/Windows are desktop-app only).
+          cp dist/installers/install.sh dist/installers/install.ps1 "$rel"/
+          cp dist/shell/MediaSearchAgent-*-linux-*.tar.gz   "$rel"/
+          # Tauri desktop installers + signed updater artifacts.
+          cp dist/desktop/MediaSearchAgent_*_aarch64.app.tar.gz     "$rel"/
+          cp dist/desktop/MediaSearchAgent_*_aarch64.app.tar.gz.sig "$rel"/
+          cp dist/desktop/MediaSearchAgent_*_x64-setup.exe          "$rel"/
+          cp dist/desktop/MediaSearchAgent_*_x64-setup.exe.sig      "$rel"/
+          if ls dist/desktop/MediaSearchAgent_*_aarch64.dmg >/dev/null 2>&1; then
+            cp dist/desktop/MediaSearchAgent_*_aarch64.dmg "$rel"/
+          fi
+          # latest.json version = the version the desktop app was ACTUALLY built with. Each
+          # per-platform fragment carries the stamped tauri.conf.json version (the single source of
+          # truth) — NOT re-derived from the tag — so the manifest version equals the running app's
+          # version the in-app updater compares against, -rc* suffix included. Refuse to publish if
+          # the two platforms disagree (a build-time version drift).
+          dver="$(jq -r '.version' dist/desktop/latest-darwin.json)"
+          wver="$(jq -r '.version' dist/desktop/latest-windows.json)"
+          if [ -z "$dver" ] || [ "$dver" = "null" ] || [ "$dver" != "$wver" ]; then
+            echo "::error::desktop app version mismatch across platforms (darwin='$dver' windows='$wver')"; exit 1
+          fi
+          echo "APP_VERSION=$dver" >> "$GITHUB_ENV"
+          # Assemble the updater manifest from the two per-platform fragments (each carries its
+          # version + .sig contents + release download URL). The in-app updater reads this latest.json.
+          jq -s '{version: (.[0].version), pub_date: $d, platforms: (map(.platforms) | add)}' \
+            --arg d "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            dist/desktop/latest-darwin.json dist/desktop/latest-windows.json > "$rel/latest.json"
+          # SHA256SUMS over every published asset. Written to a temp then moved in, so the glob never
+          # includes SHA256SUMS.txt itself; two-space `<hash>  <basename>` format the bootstraps parse.
+          ( cd "$rel" && sha256sum -- * > "$RUNNER_TEMP/SHA256SUMS.txt" && mv "$RUNNER_TEMP/SHA256SUMS.txt" SHA256SUMS.txt )
+          echo "Release assets:"; ls -1 "$rel"
+
+      # Fail the publish if SHA256SUMS.txt is missing/empty or is not listing the assets the thin
+      # bootstraps look up by name (M-7/S-4 item 3 + 5).
+      - name: Guard — SHA256SUMS.txt exists and lists the key assets
+        run: |
+          set -euo pipefail
+          sums="dist/release/SHA256SUMS.txt"
+          [ -s "$sums" ] || { echo "::error::SHA256SUMS.txt is missing or empty — refusing to publish"; exit 1; }
+          # Assets are named by the built app version (APP_VERSION, exported by the assemble step
+          # from the stamped tauri.conf.json) — the single source of truth, -rc* suffix included.
+          check() { awk -v n="$1" '$2==n{found=1} END{exit found?0:1}' "$sums" \
+            || { echo "::error::SHA256SUMS.txt has no entry for $1"; exit 1; }; }
+          check "MediaSearchAgent_${APP_VERSION}_aarch64.app.tar.gz"
+          check "MediaSearchAgent_${APP_VERSION}_x64-setup.exe"
+          check "install.sh"
+          check "install.ps1"
+          echo "SHA256SUMS.txt OK:"; cat "$sums"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -481,7 +786,14 @@ jobs:
           # Tag with a hyphen (vX.Y.Z-rc1, -beta, etc.) is treated as
           # prerelease; plain semver (vX.Y.Z) is a normal release. Without
           # this, /releases/latest/ would never resolve to the only release
-          # we have.
+          # we have. CONSEQUENCE (M-7/S-4 F-7): because /releases/latest serves
+          # only the latest NON-prerelease release, the in-app updater endpoint
+          # (…/releases/latest/download/latest.json) never sees an RC manifest —
+          # so a self-update E2E CANNOT be proven with two hyphenated RC tags on
+          # this channel. See RELEASING.md → "Self-update E2E" options (i)/(ii)
+          # for the two defensible proofs (consecutive stable releases, or a
+          # dedicated PUBLIC updater-E2E repo via `tauri build --config` endpoint
+          # override); staging is private and not anonymously resolvable.
           prerelease: ${{ contains(github.ref_name, '-') }}
           # The install one-liner below is PINNED to the public repo, not
           # ${{ github.repository }}. Staging is private, so its release assets aren't
@@ -516,31 +828,38 @@ jobs:
 
             ### Manual download
 
-            If you'd rather download and run the bundle yourself:
+            Desktop app (recommended — self-updating):
+
+            | Platform | Installer |
+            |---|---|
+            | macOS (Apple Silicon) | `MediaSearchAgent_${{ steps.version.outputs.version }}_aarch64.dmg` |
+            | Windows (x86_64) | `MediaSearchAgent_${{ steps.version.outputs.version }}_x64-setup.exe` |
+
+            Shell bundle (Linux only — macOS and Windows use the desktop app above):
 
             | Platform | Bundle |
             |---|---|
-            | macOS (Apple Silicon + Intel) | `MediaSearchAgent-${{ steps.version.outputs.version }}-macos-arm64.tar.gz` |
             | Linux (x86_64) | `MediaSearchAgent-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz` |
-            | Windows (x86_64) | `MediaSearchAgent-${{ steps.version.outputs.version }}-windows-x86_64.zip` |
 
-            Then point the installer at it:
+            Then point the installer at the bundle:
             ```bash
-            bash install.sh --bundle ./MediaSearchAgent-${{ steps.version.outputs.version }}-<platform>-<arch>.tar.gz
+            bash install.sh --bundle ./MediaSearchAgent-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz
             ```
+
+            Every asset is checksummed in `SHA256SUMS.txt`; the one-liner installers verify the
+            download against it and hard-fail on a mismatch.
 
             ### Requirements
 
             - **macOS**: macOS 12 Monterey or later. The installer will prompt you to install Xcode Command Line Tools if needed — click **Install**, wait for it to complete, then re-run the installer.
-            - **Windows**: Windows 10 version 2004+ or Windows 11. No pre-installed Python required — the installer manages a standalone CPython 3.12 via `uv`. WSL2 is **not** required.
+            - **Windows**: Windows 11 or later. No pre-installed Python required — the installer manages a standalone CPython 3.12 via `uv`. WSL2 is **not** required.
 
             ### Known limitations (v0.x)
 
             - First launch takes 2–5 minutes while ML models download (~2 GB)
-            - No auto-update — re-run the one-liner to upgrade
+            - The macOS and Windows desktop apps update themselves (signed auto-update). The Linux
+              shell bundle and browser/headless installs upgrade by re-running the one-liner.
+          # Everything the assembly step staged: bootstraps + legacy shell bundles + Tauri desktop
+          # installers + signed updater artifacts (.sig) + latest.json + SHA256SUMS.txt.
           files: |
-            dist/installers/install.sh
-            dist/installers/install.ps1
-            dist/shell/MediaSearchAgent-*-macos-*.tar.gz
-            dist/shell/MediaSearchAgent-*-linux-*.tar.gz
-            dist/shell/MediaSearchAgent-*-windows-*.zip
+            dist/release/*

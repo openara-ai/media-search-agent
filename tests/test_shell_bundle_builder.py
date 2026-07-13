@@ -50,6 +50,44 @@ def test_pep440_version_normalizes_release_labels():
     assert _pep440_version("v0.2.0") == "0.2.0"
 
 
+def _semver_version(version: str) -> str:
+    # Use POSIX path so Git Bash on Windows doesn't interpret backslashes as escapes.
+    script = f"source {VERSION_HELPER.as_posix()}; semver_version {version!r}"
+    return subprocess.check_output([_bash_executable(), "-c", script], text=True).strip()
+
+
+def test_semver_version_strips_leading_v_but_keeps_base():
+    assert _semver_version("v0.4.0") == "0.4.0"
+    assert _semver_version("0.4.0") == "0.4.0"
+
+
+def test_semver_version_preserves_prerelease_suffix():
+    # The Tauri app-version stamp must keep the SemVer pre-release so the updater can order
+    # rc1 < rc2 < final; a stripped X.Y.Z made -rc1/-rc2 stamp identically and broke self-update.
+    assert _semver_version("v0.4.0-rc1") == "0.4.0-rc1"
+    assert _semver_version("v0.4.0-rc2") == "0.4.0-rc2"
+    assert _semver_version("v1.2.3-beta.1") == "1.2.3-beta.1"
+
+
+def test_semver_version_preserves_build_metadata():
+    assert _semver_version("v0.4.0+abc") == "0.4.0+abc"
+
+
+def test_semver_version_contrasts_with_pep440_for_prerelease():
+    # semver_version keeps the SemVer pre-release ('-rc1'); pep440_version rewrites it to a
+    # PEP 440 local segment ('+rc1'). The Tauri stamp needs the former (orderable), so the two
+    # helpers must diverge on a pre-release tag.
+    tag = "v0.4.0-rc1"
+    assert _semver_version(tag) == "0.4.0-rc1"
+    assert _pep440_version(tag) == "0.4.0+rc1"
+    assert _semver_version(tag) != _pep440_version(tag)
+
+
+def test_semver_version_falls_back_to_zero_on_non_semver():
+    assert _semver_version("ci-test") == "0.0.0"
+    assert _semver_version("main") == "0.0.0"
+
+
 def test_shell_builders_use_shared_version_normalizer():
     macos_text = _read(SCRIPT)
     windows_text = _read(REPO_ROOT / "installer" / "windows-native" / "shell" / "build-bundle.sh")

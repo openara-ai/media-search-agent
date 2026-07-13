@@ -4,20 +4,19 @@ name: Test macOS Shell Installer
 # runs a post-install smoke test, exercises `msa uninstall`, and uploads the
 # full install log as an artifact so failures can be diagnosed.
 #
+# SOFT-RETIRED in M-7/S-3: this job smokes the LEGACY macOS shell-bundle install
+# contract. S-3 (spec S-3.3) made `installer/macos/shell/install.sh` the thin Tauri
+# bootstrap (GUI install downloads the .app; the `msa` launcher + venv now exist only
+# on the `--headless` path), so the shell-bundle flow this job asserts no longer runs
+# on macOS. Coverage of the new thin/headless model lives in
+# `tests/test_macos_native_installer.py`. Trigger is now manual-only so it stops
+# blocking PRs; TODO(M-7/S-5 item 4): delete this workflow as part of legacy retirement.
+#
 # Triggers:
-#   - workflow_dispatch   — run manually at any time
-#   - pull_request        — when installer or build-script files change
+#   - workflow_dispatch   — run manually at any time (the legacy path it needs is retired)
 
 on:
   workflow_dispatch:
-  pull_request:
-    paths:
-      - "installer/macos/shell/**"
-      - "installer/macos/build-bundle.sh"
-      - "installer/macos/config.macos.yaml.template"
-      - "scripts/start.sh"
-      - "scripts/stop.sh"
-      - "scripts/lib/**"
 
 permissions:
   contents: read

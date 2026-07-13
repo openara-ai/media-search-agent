@@ -8,8 +8,8 @@ Uninstallation must cleanly remove the application without destroying user data
 (media index, thumbnails, embedded Qdrant data, config) without explicit consent, and must not touch shared system
 resources (WSL2 distro, shared Python tooling / caches) that other tools or projects may depend on.
 
-Uninstallation is delivered alongside the installer in the same phase — not deferred.
-Phase 1A includes uninstall scripts as first-class deliverables.
+Uninstallation is delivered alongside the installer in the same release — not deferred.
+The initial installer release includes uninstall scripts as first-class deliverables.
 
 ## Decision
 
@@ -98,8 +98,8 @@ It never touches Tier 3 resources regardless of user input.
 
 ## Consequences
 
-- `scripts/uninstall.sh` and `scripts/uninstall.ps1` are Phase 1A deliverables,
-  not deferred to a later phase.
+- `scripts/uninstall.sh` and `scripts/uninstall.ps1` ship with the initial installer,
+  not deferred to a later release.
 - The macOS `.dmg` must always contain both the installer and the uninstaller.
 - The uninstaller must handle the case where services are not running (idempotent stop).
 - If persistent app data is preserved (Tier 2 default) and the user reinstalls, the installer

@@ -78,16 +78,16 @@ single lightweight container.
 - Keeps the ML Python stack fully native (direct CUDA/MPS access) while isolating
   Qdrant's storage and network in a container.
 - Docker Desktop is already a widely available prerequisite on both Windows and macOS.
-- A future milestone may migrate to a pinned native Qdrant binary for a zero-Docker
-  install experience, but that is deferred until after the prerelease milestone.
+- A future release may migrate to a pinned native Qdrant binary for a zero-Docker
+  install experience, but that is deferred until after the initial public release.
 
 ## Platform-Specific Notes
 
 ### Windows
 
-**Two supported runtimes as of Phase 4B:**
+**Two supported Windows runtimes:**
 
-#### Windows Native Python (Phase 4B — recommended for new installs)
+#### Windows Native Python (recommended for new installs)
 
 A spike confirmed the full ML stack runs natively on Windows Python 3.12
 with the following constraints:
@@ -108,7 +108,7 @@ fixes it during setup.
 Path UX: `resolve_for_access()` is a no-op on `win32` — stored Windows paths (e.g.
 `D:\Photos`) are used directly for file I/O. No path translation layer needed.
 
-#### Windows via WSL2 (Phase 3B — legacy, still supported)
+#### Windows via WSL2 (legacy, still supported)
 
 WSL2 provides a Linux environment with full CUDA passthrough. This is the original
 deployment path. The browser UI is accessed from Windows at `http://localhost:8000`.
@@ -123,8 +123,8 @@ and better UX (no `/mnt/d/` path confusion).
 - InsightFace compiles with Xcode CLT — no special toolchain needed.
 - All binary dependencies (exiftool, mediainfo) are bundled in the installer;
   Homebrew is not required.
-- Qdrant is embedded via `qdrant-client path=` mode (Phase 2F complete). Docker is
-  not required on macOS.
+- Qdrant is embedded via `qdrant-client path=` mode (migration to embedded mode
+  complete). Docker is not required on macOS.
 
 ## Consequences
 

@@ -296,11 +296,8 @@ def run_index(config, stop_event=None):
                 f"{orphan_faces} face row(s) lack face_embedding entries. The DB was "
                 "likely indexed before the FAISS->SQLite migration. Face search will "
                 "return 'not found' for these faces until embeddings are regenerated. "
-                "Two recovery paths: (a) run internal/scripts/port_faiss_to_sqlite.py to import "
-                "vectors from legacy index/face_vec.faiss while preserving manual "
-                "labels (face.person_id), or (b) run the indexer with "
-                "--reprocess-faces to re-detect from images (faster than option a if "
-                "FAISS files were lost, but drops any manual labels)."
+                "Recovery: run the indexer with --reprocess-faces to re-detect faces "
+                "from images (this drops any manual person labels)."
             )
     except Exception as exc:
         logger.debug(f"Could not check orphan face_embedding count: {exc}")
@@ -311,7 +308,6 @@ def run_index(config, stop_event=None):
     # Embeddings are stored as BLOBs in the image_embedding /
     # keyframe_embedding / face_embedding tables, written per file
     # in the same per-batch SQLite transaction as the metadata.
-    # See internal/docs/storage/SQLITE_INCREMENTAL_VISIBILITY_PLAN.md (Stage 3 / Part B).
     image_embedding_count = 0
     face_embedding_count = 0
     keyframe_embedding_count = 0

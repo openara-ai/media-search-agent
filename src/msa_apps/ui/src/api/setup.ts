@@ -27,8 +27,20 @@ export interface SetupWSUpdate {
   models: Record<string, ModelDownloadState>
 }
 
+import { apiUrl } from '../lib/apiBase'
+
 export async function fetchSetupStatus(): Promise<SetupStatus> {
-  const res = await fetch('/api/setup/status')
+  const res = await fetch(apiUrl('/api/setup/status'))
   if (!res.ok) throw new Error(`setup/status ${res.status}`)
   return res.json()
+}
+
+/**
+ * Re-trigger the first-launch model downloads (resets errored models and restarts the background
+ * worker). The setup screen's Retry button calls this BEFORE reloading — a plain reload only
+ * re-subscribes to the manager's held complete/error state and never restarts a failed download.
+ */
+export async function retrySetup(): Promise<void> {
+  const res = await fetch(apiUrl('/api/setup/retry'), { method: 'POST' })
+  if (!res.ok) throw new Error(`setup/retry ${res.status}`)
 }

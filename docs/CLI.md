@@ -1,14 +1,19 @@
 # Command-line interface
 
-Media Search Agent ships with a single `msa` command. The browser UI at
-<http://localhost:8000> is the primary surface for everyday use, but the
-CLI is the most direct way to run the indexer, control the API server,
-and check what's installed and running.
+Media Search Agent ships a single `msa` command on installs that run in
+the browser: Linux installs, and servers set up with the headless flag
+(see [INSTALL.md](INSTALL.md#install--linux-and-servers--headless)). It's
+the most direct way to run the indexer, control the API server, and check
+what's installed and running.
 
-After install (see [INSTALL.md](INSTALL.md)) the launcher lives at
-`~/.local/bin/msa` (macOS shell install / Linux) or is dropped on `PATH`
-by the Windows bootstrap. Run `msa` with no arguments to see top-level
-help.
+The **desktop app** on macOS and Windows does not install the CLI — the
+app manages its own runtime, indexing runs from the **Indexer** page, and
+updates are automatic, so there's nothing for a CLI to do. (A dev checkout
+also gets `msa` via `scripts/dev-setup.sh`.)
+
+After a headless/Linux install the launcher lives at `~/.local/bin/msa`
+(macOS/Linux) or is dropped on `PATH` by the Windows bootstrap. Run `msa`
+with no arguments to see top-level help.
 
 ## Top-level commands
 
@@ -52,9 +57,9 @@ changed.
 
 ## `msa api`
 
-Foreground API server with a small set of lifecycle subcommands. The
-installed app normally launches the server for you, so you'll mostly use
-this when developing or troubleshooting.
+Foreground API server with a small set of lifecycle subcommands. On
+headless and Linux installs this is how you start the app; the browser UI
+is then at <http://localhost:8000>.
 
 ```bash
 msa api start                       # foreground; Ctrl+C to stop

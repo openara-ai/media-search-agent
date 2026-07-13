@@ -172,3 +172,44 @@ re-introduces the bug that motivated this section.
   instead of ad-hoc local names.
 - `MSA_*` is the canonical prefix for cross-process environment variables; bare
   directory names are local-script vocabulary only.
+
+## Amendment: app-private runtime path for the Tauri desktop shell
+
+The Tauri desktop shell ([ADR-012](ADR-012-desktop-shell-tauri.md)) moves the **runtime**
+(the bundled-`uv` CPython, the venv, the uv cache, and the extracted `uv` binary) out of
+the app bundle and into a **shell-owned app-private directory**, keyed by the bundle
+**identifier** `ai.openara.mediasearchagent`. This does not change any user-data location:
+`config.yaml`, `index/`, thumbnails, cache, and logs stay exactly where the per-platform
+map in section 6 puts them (keyed by the `MediaSearchAgent` name). The provisioning shim
+exports the `MSA_*` env (section 4) so `msa_settings` resolves those user directories
+unchanged — the DataDir survives a migration byte-identical.
+
+The app-private root is the vendored supervisor's `app_local_data_dir()` (Tauri):
+
+| Platform | App-private runtime root | Contents |
+|---|---|---|
+| macOS | `~/Library/Application Support/ai.openara.mediasearchagent/` | `.venv/`, `python/` (`UV_PYTHON_INSTALL_DIR`), `uv-cache/` (`UV_CACHE_DIR`), `bin/uv` |
+| Windows | `%LOCALAPPDATA%\ai.openara.mediasearchagent\` | same |
+| Linux | `~/.local/share/ai.openara.mediasearchagent/` | same (shell path is macOS/Windows; Linux stays on the legacy bundle) |
+
+Note the **identifier**-keyed runtime root (`ai.openara.mediasearchagent`) is intentionally
+distinct from the **name**-keyed user-data root (`MediaSearchAgent`, section 6): the runtime
+is disposable and app-owned (a single directory removal is a Tier-1 runtime uninstall), the
+user data is durable and user-owned. The exact paths above are derived from the vendored
+`app_private_dir()` in `src-tauri/src/main.rs`; they are runtime-verified on a packaged
+launch as part of the desktop-shell human definition-of-done.
+
+### Note: the identifier boundary also protects legacy migration
+
+The first Tauri install migrates away the **legacy** shell-bundle runtime, which lived under
+the **name**-keyed `%LOCALAPPDATA%\MediaSearchAgent` (Windows) — the SAME dir the new Tauri app
+installs into (`productName` == `MediaSearchAgent`). The migration
+(`src-tauri/backend/app/migration.py` + the NSIS `NSIS_HOOK_PREINSTALL` in the project-owned
+`packaging/windows/msa-installer-hooks.nsh`) removes only the named legacy children (`repo\`,
+`.venv\`, `uv\`, `bin\`, `Cache\models\`, `logs\`, `start.ps1`, `stop.ps1`, `version.txt`) plus
+the Start-Menu shortcut, scheduled task, HKCU Run value and PATH entry — **never** a wholesale
+removal of the root, and **never** the name-keyed DataDir `%USERPROFILE%\MediaSearchAgent`
+(config.yaml + index). Because the new runtime is **identifier**-keyed
+(`ai.openara.mediasearchagent`) it can never collide with the legacy name-keyed AppDir; the
+first-run belt-and-braces sweep additionally refuses `bin\`/`backend\` when the legacy root
+resolves to the running install dir, so it can never delete the live app's own resources.

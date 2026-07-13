@@ -1,3 +1,5 @@
+import { apiUrl } from '../lib/apiBase'
+
 export interface Face {
   face_id: string
   media_id: string | null
@@ -48,25 +50,25 @@ export async function getFaces(params?: {
   if (params?.labeled && params.labeled !== 'all') q.set('labeled', params.labeled)
   if (params?.limit != null) q.set('limit', String(params.limit))
   if (params?.offset != null) q.set('offset', String(params.offset))
-  const res = await fetch(`/faces?${q}`)
+  const res = await fetch(apiUrl(`/faces?${q}`))
   if (!res.ok) throw new Error(`Faces fetch failed: ${res.status}`)
   return res.json()
 }
 
 export async function getPeople(): Promise<PeopleResponse> {
-  const res = await fetch('/people')
+  const res = await fetch(apiUrl('/people'))
   if (!res.ok) throw new Error(`People fetch failed: ${res.status}`)
   return res.json()
 }
 
 export async function getTags(): Promise<TagsResponse> {
-  const res = await fetch('/tags')
+  const res = await fetch(apiUrl('/tags'))
   if (!res.ok) throw new Error(`Tags fetch failed: ${res.status}`)
   return res.json()
 }
 
 export async function createPerson(name: string): Promise<Person> {
-  const res = await fetch('/people', {
+  const res = await fetch(apiUrl('/people'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name }),
@@ -79,7 +81,7 @@ export async function createPerson(name: string): Promise<Person> {
 }
 
 export async function renamePerson(personId: string, name: string): Promise<Person> {
-  const res = await fetch(`/people/${encodeURIComponent(personId)}`, {
+  const res = await fetch(apiUrl(`/people/${encodeURIComponent(personId)}`), {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name }),
@@ -95,7 +97,7 @@ export async function mergePeople(
   targetId: string,
   sourceId: string,
 ): Promise<{ reassigned: number; target_id: string }> {
-  const res = await fetch(`/people/${encodeURIComponent(targetId)}/merge`, {
+  const res = await fetch(apiUrl(`/people/${encodeURIComponent(targetId)}/merge`), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ source_id: sourceId }),
@@ -111,7 +113,7 @@ export async function labelFace(
   faceId: string,
   opts: { person_id?: string; name?: string },
 ): Promise<{ face_id: string; person_id: string; person_name: string | null }> {
-  const res = await fetch(`/faces/${encodeURIComponent(faceId)}/label`, {
+  const res = await fetch(apiUrl(`/faces/${encodeURIComponent(faceId)}/label`), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(opts),
@@ -127,7 +129,7 @@ export async function labelFacesBatch(
   faceIds: string[],
   opts: { person_id?: string; name?: string },
 ): Promise<{ labeled: number; person_id: string; person_name: string | null }> {
-  const res = await fetch('/faces/label-batch', {
+  const res = await fetch(apiUrl('/faces/label-batch'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ face_ids: faceIds, ...opts }),
@@ -140,7 +142,7 @@ export async function labelFacesBatch(
 }
 
 export async function unlabelFace(faceId: string): Promise<void> {
-  const res = await fetch(`/faces/${encodeURIComponent(faceId)}/label`, { method: 'DELETE' })
+  const res = await fetch(apiUrl(`/faces/${encodeURIComponent(faceId)}/label`), { method: 'DELETE' })
   if (!res.ok) throw new Error(`Unlabel failed: ${res.status}`)
 }
 
@@ -156,13 +158,13 @@ export interface MediaInfo {
 }
 
 export async function getMediaInfo(mediaId: string): Promise<MediaInfo> {
-  const res = await fetch(`/media/${encodeURIComponent(mediaId)}/info`)
+  const res = await fetch(apiUrl(`/media/${encodeURIComponent(mediaId)}/info`))
   if (!res.ok) throw new Error(`Media info fetch failed: ${res.status}`)
   return res.json()
 }
 
 export async function findSimilarFaces(faceId: string, topK = 20): Promise<FaceSimilarMatch[]> {
-  const res = await fetch('/faces/search', {
+  const res = await fetch(apiUrl('/faces/search'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ face_id: faceId, top_k: topK }),

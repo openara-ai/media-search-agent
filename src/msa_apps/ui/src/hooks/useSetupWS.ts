@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import type { ModelDownloadState, SetupWSUpdate } from '../api/setup'
+import { wsUrl } from '../lib/apiBase'
 
 export interface SetupWSState {
   models: Record<string, ModelDownloadState> | null
@@ -20,8 +21,7 @@ export function useSetupWS(): SetupWSState {
 
     function connect() {
       if (closed) return
-      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-      ws = new WebSocket(`${proto}//${location.host}/ws/setup`)
+      ws = new WebSocket(wsUrl('/ws/setup'))
 
       ws.onmessage = (e) => {
         try {
