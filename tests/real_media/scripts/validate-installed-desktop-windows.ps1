@@ -327,7 +327,16 @@ try {
         $env:MSA_REALDATA_FACE_THUMB_DIR = Join-Path $dataDir "data\face_thumbnails"
         # Ranker ledger only when the (private) ranker wheel is actually installed, else the
         # end-to-end capture test skips cleanly (mirrors the macOS/bundle harnesses).
-        & $VenvPython -c "import msa_ranker.serving" 2>$null
+        # NCE-001: on the mirrored tree the wheel is absent and the probe legitimately fails;
+        # under EAP=Stop its ImportError traceback on stderr terminates the script despite
+        # 2>$null, so run the best-effort probe under EAP=Continue restored in finally.
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & $VenvPython -c "import msa_ranker.serving" 2>$null
+        } finally {
+            $ErrorActionPreference = $prevEAP
+        }
         if ($LASTEXITCODE -eq 0) { $env:MSA_REALDATA_LEDGER_DIR = $ledgerDir }
         & $VenvPython -m pytest (Join-Path $testRoot "test_real_media_runtime.py") -v
         if ($LASTEXITCODE -ne 0) { Fail "runtime real-media suite failed" }
