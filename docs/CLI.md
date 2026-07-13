@@ -8,8 +8,8 @@ what's installed and running.
 
 The **desktop app** on macOS and Windows does not install the CLI — the
 app manages its own runtime, indexing runs from the **Indexer** page, and
-updates are automatic, so there's nothing for a CLI to do. (A dev checkout
-also gets `msa` via `scripts/dev-setup.sh`.)
+updating is just installing a newer release, so there's nothing for a CLI
+to do. (A dev checkout also gets `msa` via `scripts/dev-setup.sh`.)
 
 After a headless/Linux install the launcher lives at `~/.local/bin/msa`
 (macOS/Linux) or is dropped on `PATH` by the Windows bootstrap. Run `msa`

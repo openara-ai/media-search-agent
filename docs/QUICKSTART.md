@@ -42,8 +42,8 @@ the app (a running indexing job keeps going in the background and reconnects
 when you relaunch). On Linux, the UI lives in your browser at
 <http://localhost:8000>.
 
-The desktop app keeps itself up to date automatically — see
-[INSTALL.md](INSTALL.md#updating).
+The app never updates itself or checks for new versions on its own — you
+choose when to install a newer release; see [INSTALL.md](INSTALL.md#updating).
 
 ## 3. Add a media folder
 

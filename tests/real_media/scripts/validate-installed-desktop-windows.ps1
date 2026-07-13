@@ -44,7 +44,7 @@
       8. Silent uninstall -> app-private runtime removed.
 
     Documented deviations from the raw user flow: /S silent install (same NSIS payload,
-    no UI); MSA_DISABLE_UPDATER=1 (validate THIS build, not an updated one); hard process
+    no UI); hard process
     kill on quit (a user clicks close). Headless-provision coverage (install.ps1
     -Headless) left this harness when Launch #1 took over cold provisioning - re-cover
     that path separately if the headless install regresses.
@@ -182,11 +182,8 @@ function Stop-AppAndReapOrphans([object] $Gui) {
 
 if (-not (Test-Path $Setup)) { Fail "Setup installer not found: $Setup" }
 
-# The desktop app self-updates on launch (main.rs check_for_updates). Disable it for the BVT so
-# we validate THIS freshly-built setup.exe, not a version the updater swaps in mid-run: a
-# branch-dispatch build stamps 0.0.0 (no reachable tag) and would otherwise pull the latest
-# public release. Set before any launch so both Launch #1 (cold) and #2 inherit it.
-$env:MSA_DISABLE_UPDATER = '1'
+# The shell no longer auto-updates (ADR-012 section 5: no automatic update check at launch), so the
+# BVT structurally validates THIS freshly-built setup.exe - there is nothing to self-update, no gate.
 
 # -- Step 1: silent install (the user's NSIS payload; NO pre-provisioning) ---------------
 # setup.exe /S runs the exact installer payload a user runs (minus the UI). Provisioning is

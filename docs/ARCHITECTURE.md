@@ -241,10 +241,10 @@ The mechanics that matter:
   orphaned Python processes either way. The indexer is the deliberate
   exception: it runs as a detached process, survives a window close, and the
   app re-attaches to it on relaunch.
-- **Auto-update** — at launch the supervisor checks GitHub Releases,
-  verifies the new bundle's minisign signature, and installs it in the
-  background; the update applies on the next start. Failures are ignored
-  (never block launch).
+- **No automatic updates** — the shell makes no unsolicited network request
+  at launch; updating means installing a newer release yourself. The Tauri
+  updater plugin stays registered but dormant, with minisign signature
+  verification wired for a future user-initiated update check.
 
 ## Process boundaries
 

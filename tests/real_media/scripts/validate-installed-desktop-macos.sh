@@ -40,10 +40,8 @@ RUN_ROOT="${RUNNER_TEMP:-$(mktemp -d)}"
 export HOME="$RUN_ROOT/msa-desktop-home"
 mkdir -p "$HOME/Applications"
 
-# The desktop app self-updates on launch (main.rs check_for_updates). Disable it for the BVT so
-# we validate THIS freshly-built .app, not a version the updater swaps in mid-run. Exported
-# before launch_app so every app process inherits it; real user installs never set this.
-export MSA_DISABLE_UPDATER=1
+# The shell no longer auto-updates (ADR-012 §5: no automatic update check at launch), so the BVT
+# structurally validates THIS freshly-built .app — there is nothing to self-update, no gate needed.
 
 # Desktop / Tauri layout (identifier-keyed app-private dir per ADR-009).
 IDENT="ai.openara.mediasearchagent"

@@ -28,7 +28,7 @@ This project was developed using agentic workflow with AI coding agents as code 
 - 📍 **GPS & metadata** — EXIF location (including GoPro GPS data), camera, lens, timestamp all parsed and searchable.
 - 🔒 **Fully offline** — Apple Silicon MPS, NVIDIA CUDA, or CPU. Nothing phones home.
 - ⚡ **Fast** — embedded Qdrant for vector search, SQLite for metadata. No external services.
-- 🖥️ **Native desktop app** — self-contained app on macOS and Windows with signed auto-update; Linux and servers run the same engine headless in the browser.
+- 🖥️ **Native desktop app** — self-contained app on macOS and Windows; Linux and servers run the same engine headless in the browser.
 
 ## Quick start
 
@@ -94,6 +94,8 @@ see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   from its project GitHub releases. After that, the app works fully offline.
 - **Your media stays on disk.** The app reads from your library; it does not
   upload, copy, or relocate your files.
+- **Updates are on your terms.** The app never checks for updates or contacts external
+  servers on its own — you decide when to download and install a new version.
 
 ## Documentation
 

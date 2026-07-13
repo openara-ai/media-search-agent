@@ -254,65 +254,25 @@ fn provision_python(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(venv_py)
 }
 
-/// Self-update check (template-owned). Queries the configured updater endpoint; if a
-/// newer SIGNED build is published, downloads + verifies + installs it. Wrapped so a
-/// misconfigured/offline updater NEVER prevents launch (fail-soft).
-fn check_for_updates(handle: tauri::AppHandle) {
-    // Never self-update during a BVT: the harness must validate the freshly-built binary, not
-    // a version the updater silently swaps in mid-run. The branch-dispatch BVT builds at
-    // version 0.0.0 (bvt.yml's shallow checkout has no reachable git tag), so the live endpoint
-    // would otherwise "upgrade" it to the latest public release while the runtime suite polls
-    // /health — validating a different binary than the one under test. The
-    // validate-installed-desktop-{macos,windows} harnesses set MSA_DISABLE_UPDATER; real user
-    // installs never do, so end users keep auto-update. Fail-safe: absent flag = updater on.
-    if std::env::var_os("MSA_DISABLE_UPDATER").is_some() {
-        eprintln!("[updater] disabled via MSA_DISABLE_UPDATER (CI/BVT validation build)");
-        return;
-    }
-    use tauri_plugin_updater::UpdaterExt;
-    tauri::async_runtime::spawn(async move {
-        let updater = match handle.updater() {
-            Ok(u) => u,
-            Err(e) => {
-                eprintln!("[updater] not configured: {e:?}");
-                return;
-            }
-        };
-        match updater.check().await {
-            Ok(Some(update)) => {
-                eprintln!(
-                    "[updater] UPDATE AVAILABLE: {} -> {}",
-                    update.current_version, update.version
-                );
-                match update.download_and_install(|_chunk, _total| {}, || {}).await {
-                    Ok(_) => eprintln!(
-                        "[updater] installed {} into the user-writable app dir (no admin) — relaunch to run it",
-                        update.version
-                    ),
-                    Err(e) => eprintln!("[updater] download/install FAILED: {e:?}"),
-                }
-            }
-            Ok(None) => eprintln!("[updater] no update available (already latest)"),
-            Err(e) => eprintln!("[updater] check failed (offline or no endpoint): {e:?}"),
-        }
-    });
-}
-
 fn main() {
     let cfg: AppConfig = serde_json::from_str(APP_CONFIG).expect("invalid app.config.json");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        // Updater plugin registered but INERT: it makes no network call unless `.check()` is
+        // invoked, and nothing invokes it automatically (no launch-time check — see setup()).
+        // Kept registered as the seam for a future user-initiated "Check for updates" action.
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Sidecars(Mutex::new(Vec::new())))
         .setup(move |app| {
             let handle = app.handle().clone();
             let mut api_base = String::new();
 
-            // Self-update (design §7 / installer §5): ask the GitHub-Release (or local
-            // stand-in) endpoint if a newer signed build exists, and apply it. No admin
-            // needed — the app lives in user-writable ~/Applications. Fail-soft.
-            check_for_updates(app.handle().clone());
+            // INVARIANT — no automatic update check / no phone-home (ADR-012): the shell makes
+            // NO unsolicited network request at launch. Updates are user-initiated. The updater
+            // plugin registered above stays inert (no network call unless `.check()` runs), so a
+            // future user-clicked "Check for updates" can drive it from an explicit command.
+            // Do NOT reintroduce a launch-time check here. Guard: tests/test_updater_no_auto_check.py.
 
             // The backend Python source ships as a bundle resource; `-m app` finds it via
             // PYTHONPATH. (Read-only in the signed bundle — PYTHONDONTWRITEBYTECODE avoids

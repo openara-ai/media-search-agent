@@ -13,33 +13,18 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   Curate the real user-visible entries here before cutting the release.
 -->
 
-## [0.4.1] - 2026-07-12
+## [0.4.2] - 2026-07-13
 
 ### Added
-- macOS and Windows: the desktop app now updates itself. When a newer version is published,
-  it is downloaded, signature-verified, and applied on the next relaunch — no need to re-run
-  the installer. (Linux and browser/headless installs still upgrade by re-running the
-  one-liner.)
-- First launch of the desktop app shows staged setup progress (Python runtime, ML
-  libraries, model downloads) in a single splash, and resumes where it left off if
-  interrupted.
-- Settings: a diagnostics section shows the installed app version, the backend port,
-  and the desktop log location.
+- macOS and Windows: a native desktop app (Linux and servers still run headless in the browser).
+- First launch shows staged setup progress and resumes if interrupted.
+- Settings: a diagnostics section (app version, backend port, log location).
 
 ### Changed
-- Windows/macOS install moved to a native desktop app: the one-line command is
-  now a thin bootstrap that fetches, verifies (SHA-256), and installs the app, which
-  then finishes first-run setup itself. A `--headless` / `-Headless` option provisions
-  without a GUI for servers/CI (`msa api start` still serves the browser UI).
-- Windows: Windows 11 or later is now required (previously Windows 10 version 2004+).
-  The installer no longer bundles a WebView2 runtime for Windows 10 — Windows 11
-  ships it.
-- Windows: upgrading from an older install now cleans up the previous background
-  runtime (repo, virtual environment, tray, scheduled task, PATH entry, model cache)
-  automatically. Your index and configuration are never moved or deleted.
-- Windows: the one-line installer's `-AppDir`, `-DataDir`, `-Bundle`, `-SkipAutoStart`,
-  and `-AllowDowngrade` options were removed; the desktop installer is per-user with
-  fixed locations (`-Version`, `-Setup`, `-Headless`, `-SkipLaunch` remain).
+- Updates are user-controlled — the app never checks for or installs updates on its own; install the latest release to update.
+- macOS/Windows install is now a thin bootstrap that fetches, verifies (SHA-256), and installs the app; `--headless`/`-Headless` provisions without a GUI.
+- Windows 11 or later is now required (was Windows 10 2004+); upgrading cleans up the old background runtime automatically (index and config untouched).
+- Windows one-line installer options trimmed to `-Version`, `-Setup`, `-Headless`, `-SkipLaunch` (per-user fixed locations).
 
 ## [0.3.2] - 2026-06-14
 
@@ -87,8 +72,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   live progress; and one-line installers for macOS, Linux, and Windows (no Docker,
   embedded Qdrant). Fully offline.
 
-[Unreleased]: https://github.com/openara-ai/media-search-agent/compare/v0.4.1...HEAD
-[0.4.1]: https://github.com/openara-ai/media-search-agent/compare/v0.3.2...v0.4.1
+[Unreleased]: https://github.com/openara-ai/media-search-agent/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/openara-ai/media-search-agent/compare/v0.3.2...v0.4.2
 [0.3.2]: https://github.com/openara-ai/media-search-agent/compare/v0.3.0...v0.3.2
 [0.3.0]: https://github.com/openara-ai/media-search-agent/compare/v0.2.6...v0.3.0
 [0.2.6]: https://github.com/openara-ai/media-search-agent/compare/v0.2.0...v0.2.6

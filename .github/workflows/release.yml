@@ -812,53 +812,37 @@ jobs:
 
             ### Install
 
-            One-liner install (recommended). Pulls the matching script from this release.
+            macOS and Windows install a **native desktop app**; Linux runs headless in your browser.
 
-            **macOS / Linux**
+            **macOS (Apple Silicon)** — download `MediaSearchAgent_${{ steps.version.outputs.version }}_aarch64.dmg` below, open it, and drag **MediaSearchAgent** into Applications. The app sets itself up on first launch.
+
+            **Windows 11** — download `MediaSearchAgent_${{ steps.version.outputs.version }}_x64-setup.exe` below and run it (per-user, no admin / UAC). Launch **MediaSearchAgent** from the Start menu.
+
+            **Linux (and servers / headless)** — one line; serves the UI in your browser at <http://localhost:8000> (add `--headless` for servers/CI):
             ```bash
             curl -fsSL https://github.com/openara-ai/media-search-agent/releases/download/${{ github.ref_name }}/install.sh | bash
             ```
 
-            **Windows (PowerShell 5.1+)**
-            ```powershell
-            powershell -c "[Net.ServicePointManager]::SecurityProtocol = 'Tls12'; irm https://github.com/openara-ai/media-search-agent/releases/download/${{ github.ref_name }}/install.ps1 | iex"
-            ```
-
-            The installer downloads the matching shell bundle for your platform from this release, sets up a Python environment under your user account (no admin / UAC required), and starts the service on <http://localhost:8000>.
-
-            ### Manual download
-
-            Desktop app (recommended — self-updating):
-
-            | Platform | Installer |
-            |---|---|
-            | macOS (Apple Silicon) | `MediaSearchAgent_${{ steps.version.outputs.version }}_aarch64.dmg` |
-            | Windows (x86_64) | `MediaSearchAgent_${{ steps.version.outputs.version }}_x64-setup.exe` |
-
-            Shell bundle (Linux only — macOS and Windows use the desktop app above):
-
-            | Platform | Bundle |
-            |---|---|
-            | Linux (x86_64) | `MediaSearchAgent-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz` |
-
-            Then point the installer at the bundle:
+            The Linux installer downloads the shell bundle from this release and sets up a Python environment under your user account (no admin required). To install from a local file instead:
             ```bash
             bash install.sh --bundle ./MediaSearchAgent-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz
             ```
 
-            Every asset is checksummed in `SHA256SUMS.txt`; the one-liner installers verify the
-            download against it and hard-fail on a mismatch.
+            Every asset is checksummed in `SHA256SUMS.txt`; the Linux installer verifies its
+            download against it and hard-fails on a mismatch.
 
             ### Requirements
 
-            - **macOS**: macOS 12 Monterey or later. The installer will prompt you to install Xcode Command Line Tools if needed — click **Install**, wait for it to complete, then re-run the installer.
-            - **Windows**: Windows 11 or later. No pre-installed Python required — the installer manages a standalone CPython 3.12 via `uv`. WSL2 is **not** required.
+            - **macOS**: macOS 12 Monterey or later, Apple Silicon. Self-contained — no Xcode, Homebrew, or system Python required.
+            - **Windows**: Windows 11 or later (x86_64). No pre-installed Python required — the app manages a standalone CPython 3.12 via `uv`. WSL2 is **not** required.
+            - **Linux**: x86_64, glibc 2.31+ (Ubuntu 22.04 / Fedora 36 or newer).
 
             ### Known limitations (v0.x)
 
-            - First launch takes 2–5 minutes while ML models download (~2 GB)
-            - The macOS and Windows desktop apps update themselves (signed auto-update). The Linux
-              shell bundle and browser/headless installs upgrade by re-running the one-liner.
+            - First launch runs a one-time setup — Python runtime, ML libraries, and model
+              weights (~3.5 GB total, sized to your hardware) — with progress shown; allow
+              several minutes and keep ~5 GB of disk free.
+            - The Linux shell bundle and browser/headless installs upgrade by re-running the one-liner.
           # Everything the assembly step staged: bootstraps + legacy shell bundles + Tauri desktop
           # installers + signed updater artifacts (.sig) + latest.json + SHA256SUMS.txt.
           files: |

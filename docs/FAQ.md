@@ -9,7 +9,9 @@ If your question isn't here, check the [Quick Start](QUICKSTART.md), the
 **Does any of my data leave my machine?**
 No. All ML inference (CLIP, object detection, faces) runs locally. The app has
 no telemetry and no analytics. The only network calls are the model downloads
-on first run (or on config changes), after which the app works offline.
+on first run (or on config changes), after which the app works offline. The app
+never checks for updates or contacts external servers. You decide when to
+install a new version.
 
 **Where is my media stored?**
 On disk, exactly where you put it. The app reads from your library; it never
@@ -119,11 +121,11 @@ the roadmap.
 ## Running the app
 
 **How do I update?**
-On macOS and Windows you don't do anything — the desktop app checks for a
-new release at launch, verifies its signature, and installs it in the
-background; the update takes effect the next time you start the app. On
-Linux and headless installs, re-run the install one-liner — it upgrades in
-place and preserves your config, index, and labeled people.
+You decide when — the app never updates itself or checks for new versions in the
+background. On macOS and Windows, download the latest release and install it over
+your current version (drag the new app into Applications on macOS; run the new
+setup on Windows). On Linux and headless installs, re-run the install one-liner.
+Your config, index, and labeled people are always preserved.
 
 **How do I uninstall?**
 macOS: drag the app to the Trash. Windows: **Settings → Apps →

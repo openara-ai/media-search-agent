@@ -1,7 +1,6 @@
-# ADR-012: Desktop Shell (Tauri) — Supervisor + Sidecar, Vendored Verbatim
+# ADR-012: Desktop Shell (Tauri) — Supervisor + Sidecar
 
 Status: Accepted (desktop-shell work in progress; the initial increment landed the shell + backend/SPA sidecar contract).
-Amended in a later revision — §3 vendoring discipline restated as a guideline, not an invariant.
 
 Supersedes in part: [ADR-004](ADR-004-installer-design.md) (macOS Platypus menu-bar app
 and the Windows PowerShell launcher/tray are replaced by the Tauri shell on macOS and
@@ -18,19 +17,18 @@ MSA renders in a browser tab the app does not control, and the one-line installe
 *everything* (download, venv, torch, config, tray, auto-start) in a terminal before the
 user sees anything. That posture carried three native UI codebases in three languages (a
 Swift menu-bar app, a .NET tray, a WinForms splash) purely to bridge "installed" to
-"browser open", plus fixed-port fragility, browser-handoff choreography, and no
-auto-update.
+"browser open", plus fixed-port fragility and browser-handoff choreography.
 
-The desktop-app-template (validated by its reference spike and by a sibling FastAPI +
-uvicorn + Vite/React product's production adoption) replaces all of that with one vendored
-Rust supervisor and a native window, and adds signed auto-update. MSA adopts it for macOS
-and Windows.
+A Rust supervisor hosting a native window replaces all of that: one process that owns the
+window, spawns and supervises the Python sidecar, and resolves a free port. (The design is
+validated by a reference spike and by a sibling FastAPI + uvicorn + Vite/React product in
+production.) MSA uses it for macOS and Windows.
 
 ## Decision
 
 ### 1. Supervisor + sidecar
 
-The shell is a **supervisor** (vendored Rust) that owns a native window and the lifecycle
+The shell is a **supervisor** (Rust) that owns a native window and the lifecycle
 of a **sidecar** (a process that serves HTTP on a loopback port). The shell knows nothing
 about Python or MSA. The **sidecar contract** is five obligations: take a port
 (`SIDECAR_PORT`), signal ready (HTTP 200 on the config's `ready_path`, MSA's `/health`),
@@ -47,7 +45,7 @@ exit cleanly (SIGTERM → prompt exit), answer CORS preflight, bind `127.0.0.1` 
   the shim binds on `SIDECAR_PORT` within milliseconds, serving `/health` with
   `status=provisioning` + stage + pct until uvicorn takes the same port. This neutralizes
   the supervisor's 120 s readiness budget vs MSA's multi-gigabyte first run, with zero
-  vendored-Rust change.
+  change to the Rust shell.
 
 ### 2. The two seams
 
@@ -59,63 +57,39 @@ exit cleanly (SIGTERM → prompt exit), answer CORS preflight, bind `127.0.0.1` 
   (`src/msa_apps/ui/src/lib/apiBase.ts`). An empty-string fallback keeps plain browser /
   dev mode byte-identical.
 
-### 3. Vendoring discipline (the shell is copied, not forked)
+### 3. The shell is a generic unit; MSA authors ~zero Rust
 
 `src-tauri/` (the Rust supervisor, `Cargo.toml`/`.lock`, `build.rs`, `capabilities/`),
-`scripts/build-backend.{sh,ps1}`, `scripts/build-app.{sh,ps1}`, the template baseline of
-`packaging/windows/installer-hooks.nsh`, and the root Tauri `package.json` are a **vendored
-unit**: synced from a pinned template commit recorded in `src-tauri/.template-version`. The
-default posture is adopt-as-is: a change that belongs in the template is preferably fixed
-upstream first, re-vendored, and the pin bumped. MSA authors ~zero Rust in practice. The current
-pin is the spike at `main@b047bae`.
+`scripts/build-backend.{sh,ps1}`, `scripts/build-app.{sh,ps1}`, the baseline
+`packaging/windows/installer-hooks.nsh`, and the root Tauri `package.json` form a
+**self-contained shell unit**, deliberately kept generic: it knows nothing about Python or
+MSA, and MSA authors ~zero Rust in it. Its provenance and any local divergence are recorded
+in `src-tauri/.template-version`.
 
 **Project-owned / instantiated files** (edited for MSA, kept in sync manually):
 `app.config.json`, `src-tauri/tauri.conf.json`, `src-tauri/tauri.windows.conf.json`,
 `src-tauri/icons/`, the provisioning shim `src-tauri/backend/app/`, the backend sidecar
 entry, the thin bootstraps, and the release-workflow changes.
 
-Known project-identity deviations (tracked in `.template-version`): the vendored
-`Cargo.toml`/root `package.json` originally carried the template's crate/package name; these
-were subsequently de-templated to `media-search-agent` (crate name is the default binary
-name — an earlier build shipped the wrong executable name; see the consumer-friction log). The bundle
-name + identifier come from `tauri.conf.json` (`MediaSearchAgent` /
-`ai.openara.mediasearchagent`). `scripts/build-app.sh` calls the vendored
-`build-backend.sh`, which stages only a pure-stdlib shim; MSA's real staging is the
+**Divergence policy.** Keeping the shell unit generic is a *guideline*, not a contract: MSA
+may hand-edit files in it when the generic baseline does not fit or would block progress. The
+discipline that remains is small — record each divergence in `src-tauri/.template-version` so
+it is explainable later, and prefer a generic fix for changes any consumer of the shell would
+want (better, but not a precondition for fixing MSA).
+
+Project-identity values are set only where they matter and deferred otherwise. Known
+deviations: the crate/package name is `media-search-agent` (the crate name is the default
+binary name — an earlier build shipped under the wrong executable name), while `Cargo.toml`'s
+version stays at its `0.1.0` default (the user-visible version comes from `tauri.conf.json`
+and the backend, not the crate — see §4). The bundle name + identifier come from
+`tauri.conf.json` (`MediaSearchAgent` / `ai.openara.mediasearchagent`). Backend staging is the
 project-owned `scripts/stage-desktop-backend.sh` (backend source tree + optional wheels +
-exiftool/mediainfo + config template). Wiring `build-app.sh` to the wrapper is an
-upstream/re-vendor task.
-
-#### Amendment: vendoring is a guideline, not an invariant
-
-As originally written, this section made the vendored unit **read-only** ("never
-hand-edited", fix-upstream-first as a precondition). In practice that invariant produced
-more friction than the reuse it protected: the app shipped under the template's binary name
-because the "clean" path forbade renaming the crate, and
-the strict reading discouraged local fixes the project plainly needed. That inverts the
-template's intent.
-
-**Restated intent:** the desktop-app-template is a *guideline*, not a contract. Projects
-adopt it as far as it fits, and are **free to diverge locally** — including hand-editing
-files in the vendored unit — when the template does not fit or upstream turnaround would
-block progress. The discipline that remains:
-
-- **Record divergences.** Ideally each divergence gets an entry in the project's
-  consumer-friction log (`desktop-app-template-friction.md`) — that log exists precisely
-  to feed template improvements back upstream —
-  plus a note in `src-tauri/.template-version` so a future re-vendor diff is explainable.
-  If logging a divergence would itself block progress (e.g. for an automated agent
-  mid-task), a `.template-version` note or a clear commit-message mention is an acceptable
-  minimum; backfill the friction-log entry later.
-- **Prefer upstream-first for template-shaped fixes.** When a change is generic (useful to
-  any consumer), fixing the template and re-vendoring is still the better path — it just is
-  no longer a *precondition* for fixing MSA.
-- **Re-vendor consciously.** A re-vendor must reconcile recorded divergences rather than
-  silently overwrite them; `.template-version` is the checklist.
+exiftool/mediainfo + config template), not the generic `build-backend.sh` stub.
 
 ### 4. Instantiation values (the desync-risk surface)
 
-`tauri.conf.json`, `app.config.json`, and `Cargo.toml` duplicate values the template does
-not yet single-source. The authoritative table:
+`tauri.conf.json`, `app.config.json`, and `Cargo.toml` duplicate values that are not yet
+single-sourced. The authoritative table:
 
 | Field | Value | Where |
 |---|---|---|
@@ -137,37 +111,28 @@ tag fails. The same step asserts the updater endpoint targets the public repo.
 
 **Consequence — do not read `window.__APP_VERSION__` for user-facing version display.** The
 preflight and stamping cover `tauri.conf.json`, *not* `src-tauri/Cargo.toml`. But the supervisor
-injects `window.__APP_VERSION__` from `env!("CARGO_PKG_VERSION")` (Cargo.toml), which stays at the
-template's `0.1.0` in every packaged build — it is a deferred project-identity value (§3), not a
+injects `window.__APP_VERSION__` from `env!("CARGO_PKG_VERSION")` (Cargo.toml), which stays at its
+`0.1.0` default in every packaged build — it is a deferred project-identity value (§3), not a
 stamped one. UI that shows the app version must therefore source it from the backend `app_version`
 (`GET /diagnostics` → `_APP_VERSION`, git-tag-derived via `importlib.metadata`), which is correct in
 both shell and browser mode. This bit the Settings › About section: preferring the injected
 seam would have shown `0.1.0` on every release. If a future change stamps `Cargo.toml` at build (or
 folds it into the release preflight), the seam becomes trustworthy and this note can retire.
 
-### 5. Updater signing — minisign placeholder first, real keypair before release
+### 5. No automatic updates
 
-The updater plugin verifies full-bundle downloads with a minisign public key committed in
-`tauri.conf.json`. **The initial increment wires a clearly-marked PLACEHOLDER pubkey** (its
-decoded comment flags it as a placeholder to be replaced before signed releases; an all-zero
-key so verification always fails closed — and the supervisor's updater check is fail-soft, so
-it never blocks launch).
+The shell does not check for or install updates on its own — it makes no unsolicited network
+request at launch. MSA is a local-first appliance; update timing is the user's decision. To
+update, the user installs a newer release the same way as the first install (macOS/Windows:
+over the current version; Linux: re-run the installer).
 
-**This supersedes the earlier spec's "generate the keypair up front" wording.** The developer
-generates the real minisign keypair and custodies the **private** key as a GitHub Actions
-secret (never committed) before the signed-release work, when the release pipeline first produces signed
-updater artifacts. `createUpdaterArtifacts` is committed `false` and forced `true` only on
-the release path, so key-less contributor builds still succeed. `plugins` is never empty
-(an empty block panics the app at launch).
-
-**A later increment wired this end to end.** The release workflow's desktop-build jobs run
-`npx tauri build --config` (bypassing the vendored `build-app.sh`), forcing
-`createUpdaterArtifacts:true` and injecting `TAURI_SIGNING_PRIVATE_KEY` /
-`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` **only on the publishing repos**; they upload the signed
-`.app.tar.gz` / `setup.exe` + `.sig` and an assembled `latest.json`, plus a `SHA256SUMS.txt`
-over all release assets. The updater resolves `latest.json` **anonymously — which works only
-on the public repo**, so a preflight asserts the endpoint host is the public repo and the
-self-update end-to-end proof is run there.
+The Tauri updater plugin is configured but inert — registered so a future *user-initiated*
+"Check for updates" can use it, and it verifies downloads against a minisign public key in
+`tauri.conf.json` (a fail-closed placeholder until a real keypair is generated). Two build
+constraints keep key-less contributor builds working: `createUpdaterArtifacts` is committed
+`false` (the release pipeline forces it `true` and injects the signing key only on the
+publishing repos), and the `plugins` block is never empty (an empty block panics the app at
+launch). This signing / `latest.json` machinery is dormant until the manual check is wired.
 
 ### 6. Path ownership
 
@@ -215,9 +180,10 @@ unattended-safe path from double-click to searchable UI:
   (on-success).
 - Browser/dev mode, the `msa` CLI, the WSL2 dev flow, SQLite path conventions (ADR-007),
   the Linux shell-bundle path, and the three-repo staged release gating are all preserved.
-- The release pipeline adds tag-triggered Tauri desktop-installer jobs + signed
-  updater artifacts + `latest.json` + a `SHA256SUMS.txt` over all assets, without forking the
-  three-repo gate; the legacy shell-bundle jobs keep running in parallel until a later increment retires the
+- The release pipeline adds tag-triggered Tauri desktop-installer jobs + a `SHA256SUMS.txt`
+  over all assets, without forking the three-repo gate; it can also produce signed update
+  artifacts + `latest.json`, but these stay dormant (the shell does not auto-update — see §5).
+  The legacy shell-bundle jobs keep running in parallel until a later increment retires the
   macOS/Windows legacy path (the Linux bundle stays). The thin one-liner bootstraps hard-fail
   on a missing/mismatched checksum.
 - v1 deliberately drops auto-start-at-login and tray (mitigated by a close-while-indexing

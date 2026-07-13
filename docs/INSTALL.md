@@ -1,9 +1,9 @@
 # Installation
 
 Media Search Agent installs as a **native desktop app** on macOS and Windows —
-a self-contained, self-updating app that manages its own Python runtime and
-ML stack. Linux (and servers) run the same engine headless, serving the UI in
-your browser at port 8000.
+a self-contained app that manages its own Python runtime and ML stack. Linux
+(and servers) run the same engine headless, serving the UI in your browser at
+port 8000.
 
 No admin rights, no `git`, no Node, no system Python required on any platform.
 All ML inference (CLIP, RT-DETR, facenet-pytorch) happens on your machine.
@@ -158,10 +158,13 @@ Your media folders are never copied or written to.
 
 ## Updating
 
-**macOS and Windows** — the desktop app updates itself. At launch it checks
-the releases feed, verifies the new build's signature, and installs it in the
-background; the update takes effect the next time you start the app. No
-prompts, no admin rights. After an update, the next launch may briefly
+The app never updates itself or checks for new versions in the background — you
+choose when to update.
+
+**macOS and Windows** — download the latest release and install it over your
+current version (drag the new **MediaSearchAgent** into Applications on macOS;
+run the new setup on Windows). No admin rights required. Your index,
+configuration, and labeled people are preserved; the next launch may briefly
 re-check dependencies (fast — everything is cached).
 
 **Linux / headless** — re-run the install one-liner. It upgrades in place and
