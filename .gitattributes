@@ -1,0 +1,14 @@
+# Default: normalize all text files to LF
+* text=auto
+
+# Force LF for scripts (important for cross-platform)
+*.sh    text eol=lf
+*.ps1   text eol=lf
+
+# Windows-specific files
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# Exclude from `git archive` (used by installer/windows/build.sh to create app.tar.gz)
+# These are large sample/test assets not needed in the installer.
+data/sample_photos/  export-ignore
