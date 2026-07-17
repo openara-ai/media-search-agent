@@ -18,6 +18,8 @@ No cloud. No subscription.
 
 This project was developed using agentic workflow with AI coding agents as code authors. See [AGENTIC_DEVELOPMENT.md](docs/AGENTIC_DEVELOPMENT.md) for the playbook: spikes, ADRs, multi-agent code review, guardrails, per-agent instruction files.
 
+📖 **The story:** [Discovering Forgotten Moments](https://theagenticnotes.substack.com/p/discovering-forgotten-moments) — why I built this, and what a lifetime of photos and videos looked like once it was searchable. Part of [The Agentic Notes](https://theagenticnotes.substack.com), where each openara.ai project gets its build story, one at a time.
+
 
 ## Highlights
 
