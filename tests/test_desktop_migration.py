@@ -500,3 +500,76 @@ def test_nsh_and_python_share_the_identity_and_datadir_guard():
     assert "MediaSearchAgent" in text
     # The hook documents that it never touches the DataDir.
     assert "%USERPROFILE%\\MediaSearchAgent" in text or "DataDir" in text
+
+
+def _nsh_code_lines(macro_name: str) -> list[str]:
+    """Code lines (comments stripped) of one hook macro in the project-owned .nsh."""
+    block = NSH.read_text(encoding="utf-8").split(f"!macro {macro_name}")[1].split("!macroend")[0]
+    return [ln.strip() for ln in block.splitlines() if ln.strip() and not ln.strip().startswith(";")]
+
+
+_NSH_DESTRUCTIVE = ("RMDir", "Delete", "DeleteRegValue", "nsExec", "IfFileExists")
+
+
+def test_nsh_preinstall_migration_is_gated_on_positive_legacy_markers():
+    """#191: desktop->desktop updates share the legacy name-keyed root, so an ungated PREINSTALL
+    migration wipes the LIVE Cache\\models + logs on every update. The block must be keyed on
+    POSITIVE legacy markers (version.txt / start.ps1 / repo\\ — files only the legacy shell-bundle
+    layout wrote), NOT on the absence of uninstall.exe, which would misfire on a
+    reinstall-after-uninstall and delete a model cache the Tier-2 uninstall kept (ADR-005)."""
+    code = _nsh_code_lines("NSIS_HOOK_PREINSTALL")
+    gate = code.index('${If} ${FileExists} "$LOCALAPPDATA\\MediaSearchAgent\\version.txt"')
+    assert '${OrIf} ${FileExists} "$LOCALAPPDATA\\MediaSearchAgent\\start.ps1"' in code[gate + 1 : gate + 3]
+    assert '${OrIf} ${FileExists} "$LOCALAPPDATA\\MediaSearchAgent\\repo\\*.*"' in code[gate + 1 : gate + 3]
+    assert not [ln for ln in code[:gate] if ln.startswith(_NSH_DESTRUCTIVE)], (
+        "destructive op before the legacy-marker gate"
+    )
+    end = code.index("${EndIf}")
+    assert not [ln for ln in code[end:] if ln.startswith(_NSH_DESTRUCTIVE)], (
+        "destructive op after ${EndIf}"
+    )
+    # The migration body itself lives inside the gate.
+    assert any(ln.startswith("RMDir /r") for ln in code[gate:end])
+
+
+def test_nsh_postuninstall_tier1_is_gated_on_update_mode():
+    """#191: the in-app updater (dormant, ADR-012 §5) launches installers with /UPDATE and the
+    installer forwards it to the old uninstaller; Tier-1 removal of the provisioned runtime must
+    be skipped then — mirroring the template's own $UpdateMode gating of shortcut/app-data
+    deletion. (A manual interactive update is indistinguishable from a real uninstall in-hook —
+    NSIS uninstallers always see _?= — and keeps full-uninstall semantics deliberately.)"""
+    code = _nsh_code_lines("NSIS_HOOK_POSTUNINSTALL")
+    gate = code.index("${If} $UpdateMode <> 1")
+    assert not [ln for ln in code[:gate] if ln.startswith(_NSH_DESTRUCTIVE)], (
+        "destructive op before the $UpdateMode gate"
+    )
+    end = code.index("${EndIf}")
+    assert not [ln for ln in code[end:] if ln.startswith(_NSH_DESTRUCTIVE)], (
+        "destructive op after ${EndIf}"
+    )
+    # Tier-1 removal itself lives inside the gate.
+    assert any(ln.startswith("RMDir /r") for ln in code[gate:end])
+
+
+def test_nsh_postuninstall_stops_detached_indexer_before_runtime_removal():
+    """Closing the app window during an index leaves `msa index run` detached
+    (tracked at %LOCALAPPDATA%\\MediaSearchAgent\\logs\\run\\indexer.pid). The
+    Windows POSTUNINSTALL must cooperatively stop it — with an identity check so a
+    stale/reused PID is never force-killed — BEFORE removing the app-private venv
+    it runs from, or it corrupts the DB / orphans the job."""
+    code = _nsh_code_lines("NSIS_HOOK_POSTUNINSTALL")
+    stop = [i for i, ln in enumerate(code) if "indexer.stop" in ln]
+    assert stop, "POSTUNINSTALL must write the indexer.stop sentinel"
+    stop_idx = stop[0]
+    runtime_rm = next(
+        i for i, ln in enumerate(code) if ln.startswith('RMDir /r "$LOCALAPPDATA\\${MSA_APPID}"')
+    )
+    assert stop_idx < runtime_rm, "the indexer stop must precede the runtime RMDir"
+    stop_line = code[stop_idx]
+    assert "indexer.pid" in stop_line, "must read the tracked PID file"
+    # Identity check: only signal a process whose CommandLine looks like the indexer.
+    for token in ("-match 'msa'", "-match 'index'", "-match 'run'", "Stop-Process"):
+        assert token in stop_line, f"stop step must include {token!r} (identity-checked kill)"
+    # The stop lives inside the $UpdateMode <> 1 no-update gate (never on an update).
+    gate = code.index("${If} $UpdateMode <> 1")
+    assert stop_idx > gate

@@ -14,6 +14,7 @@ Covers:
 - GET /indexer/status — returns expected shape
 - GET /indexer/stats — returns expected shape (zeros for empty DB)
 """
+import sys
 import pytest
 import yaml
 import sqlite3
@@ -97,6 +98,47 @@ def client(db, tmp_path, monkeypatch):
 
 
 # ── GET /diagnostics ──────────────────────────────────────────────────────────
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX ~/.local/bin launcher + symlinks")
+class TestCliDiagnosticsLauncherIdentity:
+    """The cli block must report launcher_installed / on_path as True only when the
+    launcher actually points at THIS app-private msa — an unrelated ~/.local/bin/msa
+    (or a different msa on PATH) must not be reported as installed (PR #196)."""
+
+    def _fake_runtime(self, tmp_path, monkeypatch):
+        import sys as _sys
+        venv_bin = tmp_path / "venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        msa_exe = venv_bin / "msa"
+        msa_exe.write_text("#!/bin/sh\n"); msa_exe.chmod(0o755)
+        monkeypatch.setattr(_sys, "executable", str(venv_bin / "python"))
+        home = tmp_path / "home"; (home / ".local" / "bin").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        return msa_exe, home / ".local" / "bin" / "msa"
+
+    def test_unrelated_launcher_is_not_reported_installed(self, tmp_path, monkeypatch):
+        from msa_apps.search_api.app import _cli_diagnostics
+        _msa, launcher = self._fake_runtime(tmp_path, monkeypatch)
+        launcher.write_text("#!/bin/sh\nexec /usr/bin/other \"$@\"\n"); launcher.chmod(0o755)
+        assert _cli_diagnostics(str)["launcher_installed"] is False
+
+    def test_our_symlink_is_reported_installed(self, tmp_path, monkeypatch):
+        from msa_apps.search_api.app import _cli_diagnostics
+        msa_exe, launcher = self._fake_runtime(tmp_path, monkeypatch)
+        launcher.symlink_to(msa_exe)
+        assert _cli_diagnostics(str)["launcher_installed"] is True
+
+    def test_our_wrapper_script_is_reported_installed(self, tmp_path, monkeypatch):
+        from msa_apps.search_api.app import _cli_diagnostics
+        msa_exe, launcher = self._fake_runtime(tmp_path, monkeypatch)
+        launcher.write_text(f'#!/bin/sh\nexec "{msa_exe}" "$@"\n'); launcher.chmod(0o755)
+        assert _cli_diagnostics(str)["launcher_installed"] is True
+
+    def test_absent_launcher_is_not_installed(self, tmp_path, monkeypatch):
+        from msa_apps.search_api.app import _cli_diagnostics
+        self._fake_runtime(tmp_path, monkeypatch)
+        assert _cli_diagnostics(str)["launcher_installed"] is False
+
 
 class TestDiagnostics:
     def test_returns_200(self, client):

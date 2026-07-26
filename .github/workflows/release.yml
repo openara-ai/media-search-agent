@@ -719,6 +719,9 @@ jobs:
           mkdir -p dist/installers
           cp installer/macos/shell/install.sh         dist/installers/install.sh
           cp installer/windows-native/shell/install.ps1 dist/installers/install.ps1
+          # Desktop uninstaller (macOS; ADR-005 tiers) — served for the one-liner the
+          # in-app Settings "Uninstall" instructions point at (M-7/S-5.1).
+          cp scripts/uninstall-desktop.sh             dist/installers/uninstall-desktop.sh
 
       # Assemble the single release-asset directory, merge the updater manifest, and generate
       # SHA256SUMS over ALL assets (Tauri desktop installers + legacy shell bundles + bootstraps).
@@ -729,7 +732,7 @@ jobs:
           rel="dist/release"; mkdir -p "$rel"
           # Thin one-liner bootstraps + the Linux shell bundle (the only shell bundle still shipped;
           # macOS/Windows are desktop-app only).
-          cp dist/installers/install.sh dist/installers/install.ps1 "$rel"/
+          cp dist/installers/install.sh dist/installers/install.ps1 dist/installers/uninstall-desktop.sh "$rel"/
           cp dist/shell/MediaSearchAgent-*-linux-*.tar.gz   "$rel"/
           # Tauri desktop installers + signed updater artifacts.
           cp dist/desktop/MediaSearchAgent_*_aarch64.app.tar.gz     "$rel"/
@@ -775,6 +778,7 @@ jobs:
           check "MediaSearchAgent_${APP_VERSION}_x64-setup.exe"
           check "install.sh"
           check "install.ps1"
+          check "uninstall-desktop.sh"
           echo "SHA256SUMS.txt OK:"; cat "$sums"
 
       - name: Create GitHub Release

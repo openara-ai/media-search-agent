@@ -3,7 +3,7 @@ import { useInfiniteQuery, useQuery, useMutation, useQueryClient } from '@tansta
 import {
   Tag, Search, X, Loader2, Check, ChevronDown, ArrowLeft, ChevronRight, Expand, UserCircle, AlertTriangle,
 } from 'lucide-react'
-import { useIndexerRunning } from '../hooks/useIndexerStatus'
+import { useIndexerPhase } from '../hooks/useIndexerStatus'
 import {
   getFaces, getPeople, labelFace, labelFacesBatch, unlabelFace, renamePerson, findSimilarFaces, getMediaInfo,
   type Face, type Person, type FaceSimilarMatch, type MediaInfo,
@@ -1158,7 +1158,7 @@ function OverviewView({
 
 export function PeoplePage() {
   const qc = useQueryClient()
-  const indexerRunning = useIndexerRunning()
+  const { running: indexerRunning, phase: indexerPhase } = useIndexerPhase()
   const [mode, setMode] = useState<'overview' | 'browse' | 'similar'>('overview')
   const [similarSource, setSimilarSource] = useState<Face | null>(null)
   const [backTo, setBackTo] = useState<'overview' | 'browse'>('overview')
@@ -1190,7 +1190,9 @@ export function PeoplePage() {
   const similarBanner = indexerRunning && (
     <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 text-amber-800 dark:text-amber-300 text-sm mb-4">
       <AlertTriangle size={15} className="shrink-0" />
-      Indexer is running — face similarity search is temporarily unavailable while the database is locked.
+      {indexerPhase === 'exporting'
+        ? 'Finalizing index — face search resumes shortly.'
+        : 'Indexing in progress — face results reflect your library before this run.'}
     </div>
   )
 

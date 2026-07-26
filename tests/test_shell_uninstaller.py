@@ -368,9 +368,6 @@ class TestUninstallBundled:
             "so users can uninstall without the original install script."
         )
 
-    def test_uninstall_ps1_in_windows_bundle(self):
-        text = _read(REPO_ROOT / "installer" / "windows-native" / "shell" / "build-bundle.sh")
-        assert "uninstall.ps1" in text, (
-            "build-bundle.sh must copy uninstall.ps1 into the Windows bundle "
-            "so users can uninstall without the original install script."
-        )
+    # The Windows shell bundle + its build-bundle.sh were retired in M-7/S-5.5
+    # (Windows is desktop-app only); the Tauri NSIS uninstaller replaces uninstall.ps1
+    # bundling (covered by tests/test_desktop_uninstaller.py).

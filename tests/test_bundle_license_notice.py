@@ -44,50 +44,15 @@ class TestMacOsLinuxShellBundle:
         )
 
 
-# ── shell bundle: Windows (installer/windows-native/shell/build-bundle.sh) ───
-
-class TestWindowsShellBundle:
-    SCRIPT = REPO_ROOT / "installer" / "windows-native" / "shell" / "build-bundle.sh"
-
-    def test_script_exists(self):
-        assert self.SCRIPT.exists(), f"Build script not found: {self.SCRIPT}"
-
-    def test_license_in_git_archive(self):
-        text = _read(self.SCRIPT)
-        assert "LICENSE" in text, (
-            "installer/windows-native/shell/build-bundle.sh must include LICENSE "
-            "in the git archive command so it is present in the Windows shell bundle."
-        )
-
-    def test_notice_in_git_archive(self):
-        text = _read(self.SCRIPT)
-        assert "NOTICE" in text, (
-            "installer/windows-native/shell/build-bundle.sh must include NOTICE "
-            "in the git archive command so it is present in the Windows shell bundle."
-        )
+# Windows is desktop-app only (M-7): the legacy Windows shell bundle + its
+# build-bundle.sh were retired in M-7/S-5.5, so there is no Windows shell-bundle
+# LICENSE/NOTICE check anymore. The Tauri installer's license bundling is covered
+# by the desktop build path.
 
 
-# ── GUI bundle: macOS .pkg (installer/macos/build.sh) ────────────────────────
-
-class TestMacOsPkgBundle:
-    SCRIPT = REPO_ROOT / "installer" / "macos" / "build.sh"
-
-    def test_script_exists(self):
-        assert self.SCRIPT.exists(), f"Build script not found: {self.SCRIPT}"
-
-    def test_license_in_package_paths(self):
-        text = _read(self.SCRIPT)
-        # LICENSE must appear in the PACKAGE_PATHS array block
-        assert "LICENSE" in text, (
-            "installer/macos/build.sh must include LICENSE in PACKAGE_PATHS so it "
-            "is present in the macOS .pkg installer payload."
-        )
-
-    def test_notice_in_package_paths(self):
-        text = _read(self.SCRIPT)
-        assert "NOTICE" in text, (
-            "installer/macos/build.sh must include NOTICE in PACKAGE_PATHS so it "
-            "is present in the macOS .pkg installer payload."
-        )
+# The legacy macOS .pkg/.dmg (Platypus) installer + installer/macos/build.sh were
+# retired in M-7/S-5.5 (macOS ships as the Tauri desktop app), so there is no
+# .pkg PACKAGE_PATHS LICENSE/NOTICE check anymore. The Tauri bundle's license
+# inclusion is handled by the desktop build path.
 
 

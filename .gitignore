@@ -72,9 +72,6 @@ installer/windows-native/assets/app.zip
 installer/windows-native/assets/ui-dist.zip
 installer/windows-native/assets/uv.exe
 
-installer/windows-native/tray/bin/
-installer/windows-native/tray/obj/
-
 
 # macOS installer: downloaded static binaries (fetched by build.sh at build time)
 installer/macos/bin/

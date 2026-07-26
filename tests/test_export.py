@@ -196,7 +196,23 @@ class TestExportImages:
             mock_config.server.qdrant_api_key = None
             mock_config.qdrant_recreate_collections_on_export = False
 
-            mock_qdrant_client.get_collection.return_value = MagicMock(points_count=100)
+            # Model a real client: once delete_collection ran, the
+            # collection is GONE and get_collection raises not-found.
+            # (PR #205 round 2: a collection surviving its recreate-deletion
+            # now raises instead of silently reusing the stale points, so
+            # the fake must actually delete.)
+            deleted = {"done": False}
+
+            def _get_collection(name, *a, **k):
+                if deleted["done"]:
+                    raise ValueError(f"Collection {name} not found")
+                return MagicMock(points_count=100)
+
+            def _delete_collection(name, *a, **k):
+                deleted["done"] = True
+
+            mock_qdrant_client.get_collection.side_effect = _get_collection
+            mock_qdrant_client.delete_collection.side_effect = _delete_collection
 
             stats = export_images_to_qdrant(
                 sample_image_embeddings,
@@ -205,6 +221,9 @@ class TestExportImages:
             )
 
             assert mock_qdrant_client.delete_collection.called
+            assert mock_qdrant_client.create_collection.called, (
+                "recreate must create the collection anew after deletion"
+            )
 
 
 class TestExportVideoFrames:
@@ -373,8 +392,8 @@ class TestDoQdrantExport:
         return ns
 
     def test_export_returns_true_when_images_exported(self, temp_workspace, sample_sqlite_db, sample_image_embeddings, mock_qdrant_client):
-        """_do_qdrant_export returns True when image/video collections actually
-        wrote points (sent > 0)."""
+        """_do_qdrant_export is truthy (record_ok) when image/video
+        collections actually wrote points (sent > 0)."""
         from msa_indexer import pipeline
 
         config = self._make_config(temp_workspace, sample_sqlite_db, sample_image_embeddings)
@@ -383,7 +402,8 @@ class TestDoQdrantExport:
              patch.object(pipeline, 'export_video_frames_to_qdrant', return_value={'sent': 0}):
             result = pipeline._do_qdrant_export(config, export_all=True)
 
-        assert result is True
+        assert bool(result) is True
+        assert result.image_sent == 1
 
     def test_export_returns_false_when_nothing_exported(self, temp_workspace, sample_sqlite_db, sample_image_embeddings, mock_qdrant_client):
         """_do_qdrant_export must NOT signal a successful export when both
@@ -400,10 +420,10 @@ class TestDoQdrantExport:
              patch.object(pipeline, 'export_video_frames_to_qdrant', return_value={'sent': 0}):
             result = pipeline._do_qdrant_export(config, export_all=True)
 
-        assert result is False
+        assert bool(result) is False
 
     def test_export_returns_false_in_reprocessing_mode(self, temp_workspace, sample_sqlite_db, sample_image_embeddings, mock_qdrant_client):
-        """_do_qdrant_export returns False when images are skipped due to a reprocessing flag.
+        """_do_qdrant_export is falsy when images are skipped due to a reprocessing flag.
 
         This is the IDX-001 scenario: a reprocess run must not advance the Qdrant version
         because the image/video collections were not updated.
@@ -418,7 +438,7 @@ class TestDoQdrantExport:
         with patch.object(pipeline, 'export_images_to_qdrant') as mock_img:
             result = pipeline._do_qdrant_export(config, export_all=False)
 
-        assert result is False
+        assert bool(result) is False
         mock_img.assert_not_called()
 
     def test_export_raises_on_image_export_failure(self, temp_workspace, sample_sqlite_db, sample_image_embeddings, mock_qdrant_client):
@@ -431,9 +451,13 @@ class TestDoQdrantExport:
             with pytest.raises(Exception, match="qdrant down"):
                 pipeline._do_qdrant_export(config, export_all=True)
 
-    def test_face_export_failure_does_not_affect_return_value(self, temp_workspace, sample_sqlite_db, sample_image_embeddings, mock_qdrant_client):
-        """Face export failures are swallowed; _do_qdrant_export still returns True
-        when image/video export wrote points (version recording is safe)."""
+    def test_face_export_failure_blocks_the_version_record(self, temp_workspace, sample_sqlite_db, sample_image_embeddings, mock_qdrant_client):
+        """M-8/S-3 §4.2 WIDENED GATE (inverts the pre-S-3 contract): a face
+        export failure is no longer swallowed — under delta export the old
+        tolerate-and-record behavior would advance the watermark past dirty
+        face_embedding stamps and face tombstones, permanently skipping
+        them. The outcome must be record-blocking while image/video results
+        stay intact for logging."""
         from msa_indexer import pipeline
 
         config = self._make_config(
@@ -446,7 +470,9 @@ class TestDoQdrantExport:
              patch('msa_indexer.db.qdrant_export.export_faces_to_qdrant', side_effect=Exception("face fail")):
             result = pipeline._do_qdrant_export(config, export_all=True)
 
-        assert result is True
+        assert bool(result) is False, "face failure must block the version record (R8)"
+        assert result.images_ok is True
+        assert result.faces_ok is False
 
 
 class TestRunExport:

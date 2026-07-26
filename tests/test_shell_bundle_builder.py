@@ -8,11 +8,12 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "installer" / "macos" / "shell" / "build-bundle.sh"
 VERSION_HELPER = REPO_ROOT / "scripts" / "lib" / "version.sh"
+# Windows is desktop-app only (M-7): start.ps1/stop.ps1 + the Windows shell
+# build-bundle.sh were retired in M-7/S-5.5. Only the thin bootstrap install/uninstall
+# scripts remain on the Windows shell surface.
 WINDOWS_SHELL_SCRIPTS = [
     REPO_ROOT / "installer" / "windows-native" / "shell" / "install.ps1",
     REPO_ROOT / "installer" / "windows-native" / "shell" / "uninstall.ps1",
-    REPO_ROOT / "installer" / "windows-native" / "start.ps1",
-    REPO_ROOT / "installer" / "windows-native" / "stop.ps1",
 ]
 
 
@@ -88,14 +89,11 @@ def test_semver_version_falls_back_to_zero_on_non_semver():
     assert _semver_version("main") == "0.0.0"
 
 
-def test_shell_builders_use_shared_version_normalizer():
+def test_shell_builder_uses_shared_version_normalizer():
+    # Only the macOS/Linux shell builder remains (Windows shell bundle retired, S-5.5).
     macos_text = _read(SCRIPT)
-    windows_text = _read(REPO_ROOT / "installer" / "windows-native" / "shell" / "build-bundle.sh")
-
     assert 'source "$REPO_ROOT/scripts/lib/version.sh"' in macos_text
-    assert 'source "$REPO_ROOT/scripts/lib/version.sh"' in windows_text
     assert 's=$(echo "$v"' not in macos_text
-    assert 's=$(echo "$v"' not in windows_text
 
 
 def test_linux_bundle_uses_binary_mediainfo_package_not_source_tarball():
@@ -116,25 +114,6 @@ def test_windows_shell_powershell_scripts_are_ascii_only():
             ) from exc
 
 
-def test_windows_shell_bundle_includes_start_and_stop_scripts():
-    text = _read(REPO_ROOT / "installer" / "windows-native" / "shell" / "build-bundle.sh")
-
-    assert 'cp "$REPO_ROOT/installer/windows-native/start.ps1" "$BUNDLE_DIR/start.ps1"' in text
-    assert 'cp "$REPO_ROOT/installer/windows-native/stop.ps1" "$BUNDLE_DIR/stop.ps1"' in text
-
-
-def test_windows_shell_bundle_supports_working_tree_mode():
-    text = _read(REPO_ROOT / "installer" / "windows-native" / "shell" / "build-bundle.sh")
-
-    assert "--dirty" in text
-    assert 'echo "    Source: working tree (--dirty)"' in text
-    assert "--exclude='src/msa_apps/ui/node_modules'" in text
-    assert "--exclude='src/msa_apps/ui/dist'" in text
-    assert 'git -C "$REPO_ROOT" archive HEAD \\' in text
-
-
-def test_windows_shell_bundle_does_not_include_ffprobe():
-    """GoPro GPS extraction uses ExifTool directly; ffprobe is no longer bundled."""
-    text = _read(REPO_ROOT / "installer" / "windows-native" / "shell" / "build-bundle.sh")
-    assert "ffprobe.exe" not in text
-    assert "ffmpeg.exe" not in text
+# The legacy Windows shell bundle + its build-bundle.sh were retired in M-7/S-5.5
+# (Windows is desktop-app only). The start/stop-script inclusion, working-tree mode,
+# and ffprobe-exclusion checks that lived here asserted on that deleted builder.

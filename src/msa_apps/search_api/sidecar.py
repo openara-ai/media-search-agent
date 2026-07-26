@@ -240,6 +240,20 @@ def _supervisor_present(
     return parent_alive(pid)
 
 
+def _safe_stderr(text: str) -> None:
+    """Write+flush to stderr without ever raising. The sidecar's stderr is a pipe whose read end
+    the supervisor holds, so the moment the supervisor dies every stderr write raises
+    ``BrokenPipeError`` — and most of this module's stderr writes happen exactly when the
+    supervisor may be gone. A diagnostic write must never abort the code path that exits or
+    reaps the process (the field orphan: the watchdog's stderr write killed the watchdog thread
+    before ``exit_fn(0)`` ran, leaving a live backend holding the port + instance lock)."""
+    try:
+        sys.stderr.write(text)
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def _watchdog_tick(pid: int, *, alive: Callable[[int], bool], on_dead: Callable[[], None]) -> bool:
     """One liveness check: if ``pid`` is gone, fire ``on_dead`` and report dead. Factored out
     so the decision is unit-testable without spawning a thread or exiting the interpreter."""
@@ -268,14 +282,29 @@ def start_parent_watchdog(
     )
 
     def _on_dead() -> None:
-        sys.stderr.write(f"[sidecar] supervisor pid {pid} is gone - exiting\n")
-        sys.stderr.flush()
-        exit_fn(0)
+        # The reap must be unstoppable. By the time this fires the supervisor is dead, so
+        # stderr (a pipe it held) raises EPIPE on write — which used to kill this thread
+        # before exit_fn(0) ran, leaving a live orphan holding the port + instance lock.
+        # Diagnostics go to the unified log (a file handler — safe) and a never-raising
+        # stderr write; the finally guarantees the exit regardless.
+        try:
+            _log.info("supervisor pid %d is gone — exiting", pid)
+            _safe_stderr(f"[sidecar] supervisor pid {pid} is gone - exiting\n")
+        finally:
+            exit_fn(0)
 
     def _loop() -> None:
+        warned = False
         while True:
-            if _watchdog_tick(pid, alive=_alive, on_dead=_on_dead):
-                return  # _on_dead already exited; only reached if exit_fn is a test stub
+            try:
+                if _watchdog_tick(pid, alive=_alive, on_dead=_on_dead):
+                    return  # _on_dead already exited; only reached if exit_fn is a test stub
+            except Exception:
+                # A probe failure must not kill the watchdog thread — a silently dead
+                # watchdog is exactly how orphans happen. Warn once, keep polling.
+                if not warned:
+                    warned = True
+                    _log.warning("parent-watchdog probe failed; still polling", exc_info=True)
             sleep(interval)
 
     thread = threading.Thread(target=_loop, name="parent-watchdog", daemon=True)
@@ -438,8 +467,7 @@ def _serve(
                 sleep(delay)
                 continue
             _log.error("could not bind%s after %d attempts: %r — startup failure", where, attempts, exc)
-            sys.stderr.write(f"[sidecar] could not bind {host}:{port}: {exc!r}\n")
-            sys.stderr.flush()
+            _safe_stderr(f"[sidecar] could not bind {host}:{port}: {exc!r}\n")
             exit_fn(1)
             return
 
@@ -482,8 +510,7 @@ def _serve(
                 "uvicorn worker crashed during startup%s — not a bind race; not retrying",
                 where, exc_info=exc,
             )
-            sys.stderr.write(f"[sidecar] uvicorn worker crashed during startup: {exc!r}\n")
-            sys.stderr.flush()
+            _safe_stderr(f"[sidecar] uvicorn worker crashed during startup: {exc!r}\n")
             exit_fn(1)
             return
 
@@ -500,6 +527,5 @@ def _serve(
             "uvicorn exited before becoming ready%s after %d attempts — startup failure",
             where, attempts,
         )
-        sys.stderr.write("[sidecar] uvicorn exited before becoming ready - startup failure\n")
-        sys.stderr.flush()
+        _safe_stderr("[sidecar] uvicorn exited before becoming ready - startup failure\n")
         exit_fn(1)

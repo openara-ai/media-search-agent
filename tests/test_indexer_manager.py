@@ -1,5 +1,6 @@
 import subprocess
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -9,6 +10,11 @@ def test_start_does_not_force_export_to_qdrant(tmp_path, monkeypatch):
     from msa_apps.search_api import indexer_manager as mod
 
     monkeypatch.setattr(mod.IndexerManager, "_restore_from_pid_file", lambda self: None)
+    # The watcher is process-lifetime as of the M-8/S-2 idle-export fix;
+    # neutralize its loop so this test doesn't leak a polling thread.
+    monkeypatch.setattr(
+        mod.IndexerManager, "_handoff_watcher_loop", lambda self: None, raising=False
+    )
 
     manager = mod.IndexerManager()
 
@@ -54,14 +60,32 @@ def _isolate_run_dir(monkeypatch, tmp_path):
     run_dir = tmp_path / "run"
     run_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(mod, "_RUN_DIR", run_dir)
+    # The qdrant.request/qdrant.granted files use the config-anchored
+    # _handoff_run_dir() (round-5), not _RUN_DIR — pin them to the same tmp
+    # dir through the top-precedence env override so the real resolution
+    # chain runs without loading a real config.
+    monkeypatch.setenv("MSA_QDRANT_HANDOFF_DIR", str(run_dir))
     monkeypatch.setattr(mod, "_INDEXER_PID_FILE", run_dir / "indexer.pid")
     monkeypatch.setattr(
         mod, "_INDEXER_STOP_FILE", run_dir / "indexer.stop", raising=False
+    )
+    monkeypatch.setattr(
+        mod, "_INDEXER_STARTED_FILE", run_dir / "indexer.started", raising=False
     )
     # _monitor reopens the shared Qdrant client after the subprocess exits; we
     # don't want that side-effect (it would try to open a real DB on disk).
     monkeypatch.setattr(
         "msa_query.storage.qdrant_client.reopen_shared_client", lambda: None
+    )
+    # The M-8/S-2 handoff watcher is process-lifetime (started from __init__
+    # so an idle API can grant `msa index export`), and the managers built
+    # here are never explicitly stopped. A real watcher thread would outlive
+    # its test polling this tmp run dir. Neutralize the loop body; the gate
+    # logic in _start_handoff_watcher (kill switch, idempotence, thread
+    # bookkeeping) still runs. Watcher behavior itself is covered by
+    # tests/test_qdrant_handoff.py with a joined lifecycle.
+    monkeypatch.setattr(
+        mod.IndexerManager, "_handoff_watcher_loop", lambda self: None, raising=False
     )
     return mod, run_dir
 
@@ -225,7 +249,7 @@ def test_get_status_respects_stop_when_monitor_hasnt_run_yet(tmp_path, monkeypat
     # that exits immediately).
     proc = subprocess.Popen([sys.executable, "-c", "pass"])
     proc.wait(timeout=5)
-    mod._write_pid(proc.pid)
+    mod._write_pid(proc.pid, datetime.now())
 
     status = mgr.get_status()
     assert status["status"] == "stopped", (
@@ -378,3 +402,176 @@ def test_stop_doesnt_override_classification_of_already_dead_process(tmp_path, m
         "would see a stale sentinel and abort immediately (mitigated by "
         "start()'s defensive sweep, but still misleading)."
     )
+
+
+def test_restore_preserves_real_start_time_for_continuous_elapsed(tmp_path, monkeypatch):
+    """#169: a detached indexer that survives an app restart must show a CONTINUOUS
+    elapsed timer on re-attach. _write_pid persists the real start time; the restore
+    path reads it back instead of approximating started_at as 'now' (which reset the
+    timer to zero). The developer observed this on macOS: the index kept running but
+    the timer restarted.
+    """
+    mod, run_dir = _isolate_run_dir(monkeypatch, tmp_path)
+
+    # A live PID the restore path will accept as a running indexer.
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        real_start = datetime.now() - timedelta(hours=2)
+        mod._write_pid(proc.pid, real_start)
+        monkeypatch.setattr(mod, "_pid_alive", lambda pid: True)
+        monkeypatch.setattr(mod.IndexerManager, "_pid_is_indexer", lambda self, pid: True)
+        # Don't spawn the real monitor thread (it would poll the fake indexer).
+        monkeypatch.setattr(mod.IndexerManager, "_monitor_pid", lambda self, pid: None)
+
+        mgr = mod.IndexerManager()  # __init__ calls _restore_from_pid_file
+
+        assert mgr._started_at == real_start, (
+            "restore must reuse the persisted real start time, not reset it to now"
+        )
+        status = mgr.get_status()
+        # ~2h elapsed, continuous across the restart — not a fresh ~0s.
+        assert status["elapsed_seconds"] >= 2 * 3600 - 5
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_restore_falls_back_to_now_when_started_file_absent(tmp_path, monkeypatch):
+    """Older runs (or a failed started-file write) have no persisted start time; the
+    restore path must still work, degrading to the prior approximate-now behaviour
+    rather than crashing."""
+    mod, run_dir = _isolate_run_dir(monkeypatch, tmp_path)
+
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        # Write only the PID file, no started file (simulates a pre-fix / degraded run).
+        (run_dir / "indexer.pid").write_text(str(proc.pid))
+        assert not (run_dir / "indexer.started").exists()
+        monkeypatch.setattr(mod, "_pid_alive", lambda pid: True)
+        monkeypatch.setattr(mod.IndexerManager, "_pid_is_indexer", lambda self, pid: True)
+        monkeypatch.setattr(mod.IndexerManager, "_monitor_pid", lambda self, pid: None)
+
+        before = datetime.now()
+        mgr = mod.IndexerManager()
+        assert mgr._started_at is not None and mgr._started_at >= before - timedelta(seconds=5)
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_start_keeps_shared_client_open_with_handoff_enabled(tmp_path, monkeypatch):
+    """M-8/S-2: with the sentinel-file handoff enabled (default), start() must
+    NOT close the shared Qdrant client — search stays available for the whole
+    run and the lock is released only for the export window by the watcher."""
+    import msa_query.storage.qdrant_client as qc
+
+    mod, run_dir = _isolate_run_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(mod.IndexerManager, "_restore_from_pid_file", lambda self: None)
+    monkeypatch.delenv("MSA_QDRANT_HANDOFF", raising=False)
+
+    class _Client:
+        def close(self):
+            raise AssertionError("start() must not close the shared client under the handoff")
+
+    qc._blocked = False
+    qc._shared = _Client()
+    try:
+        mgr = mod.IndexerManager()
+        log_dir = tmp_path / "logs"
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("media_sources: []\n")
+        fake_proc = MagicMock()
+        fake_proc.pid = 12345
+        with patch("msa_settings.load_config", return_value=SimpleNamespace(log_dir=log_dir)), \
+             patch("subprocess.Popen", return_value=fake_proc) as mock_popen, \
+             patch("threading.Thread", return_value=MagicMock()):
+            mgr.start(str(config_path), str(tmp_path / ".venv" / "bin"))
+
+        assert qc.is_blocked() is False, "search must stay available right after start()"
+        assert qc._shared is not None, "shared client must survive start()"
+        # The subprocess handshake is pointed at the API's own run dir.
+        sub_env = mock_popen.call_args.kwargs["env"]
+        assert sub_env["MSA_QDRANT_HANDOFF_DIR"] == str(run_dir)
+    finally:
+        qc._blocked = False
+        qc._shared = None
+        qc._inflight = 0
+
+
+def test_start_kill_switch_off_restores_close_at_start(tmp_path, monkeypatch):
+    """MSA_QDRANT_HANDOFF=off must restore the legacy behavior: the shared
+    client is closed before the subprocess launches (search blocked all run)."""
+    import msa_query.storage.qdrant_client as qc
+
+    mod, run_dir = _isolate_run_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(mod.IndexerManager, "_restore_from_pid_file", lambda self: None)
+    monkeypatch.setenv("MSA_QDRANT_HANDOFF", "off")
+
+    class _Client:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    dummy = _Client()
+    qc._blocked = False
+    qc._shared = dummy
+    try:
+        mgr = mod.IndexerManager()
+        log_dir = tmp_path / "logs"
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("media_sources: []\n")
+        fake_proc = MagicMock()
+        fake_proc.pid = 12345
+        with patch("msa_settings.load_config", return_value=SimpleNamespace(log_dir=log_dir)), \
+             patch("subprocess.Popen", return_value=fake_proc), \
+             patch("threading.Thread", return_value=MagicMock()):
+            mgr.start(str(config_path), str(tmp_path / ".venv" / "bin"))
+
+        assert dummy.closed is True, "kill switch off: start() must close the shared client"
+        assert qc.is_blocked() is True
+        assert mgr._handoff_thread is None, "kill switch off: no handoff watcher"
+    finally:
+        qc._blocked = False
+        qc._shared = None
+        qc._inflight = 0
+
+
+def test_start_clears_stale_handshake_files(tmp_path, monkeypatch):
+    """A leftover qdrant.request/qdrant.granted from a crashed run must be
+    swept by start() — otherwise the fresh watcher would grant a window
+    nobody asked for (same keystone idiom as the stale stop sentinel)."""
+    from msa_indexer.db import qdrant_handoff as ho
+
+    mod, run_dir = _isolate_run_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(mod.IndexerManager, "_restore_from_pid_file", lambda self: None)
+
+    ho.write_request("stale", run_dir)
+    ho.write_grant("stale", run_dir)
+
+    mgr = mod.IndexerManager()
+    log_dir = tmp_path / "logs"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("media_sources: []\n")
+    fake_proc = MagicMock()
+    fake_proc.pid = 12345
+    with patch("msa_settings.load_config", return_value=SimpleNamespace(log_dir=log_dir)), \
+         patch("subprocess.Popen", return_value=fake_proc), \
+         patch("threading.Thread", return_value=MagicMock()):
+        mgr.start(str(config_path), str(tmp_path / ".venv" / "bin"))
+
+    assert not (run_dir / "qdrant.request").exists()
+    assert not (run_dir / "qdrant.granted").exists()
+
+
+def test_clear_pid_removes_started_file(tmp_path, monkeypatch):
+    """The started file shares the PID's lifecycle — _clear_pid removes both so a
+    stale start time can't leak into the next run's restore."""
+    mod, run_dir = _isolate_run_dir(monkeypatch, tmp_path)
+    mod._write_pid(4242, datetime.now())
+    assert (run_dir / "indexer.pid").exists()
+    assert (run_dir / "indexer.started").exists()
+    mod._clear_pid()
+    assert not (run_dir / "indexer.pid").exists()
+    assert not (run_dir / "indexer.started").exists()

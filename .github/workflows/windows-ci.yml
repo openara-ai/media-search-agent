@@ -1,0 +1,67 @@
+name: Windows CI
+
+# Automatic Windows validation, split out of ci.yml so it can carry its own
+# trigger cadence. Windows runners are slow and metered, so windows-test no
+# longer runs on every push to main. It runs only when it earns the cost:
+#
+#   • push to main touching code the Windows run can validate differently from
+#     Linux — the paths below — for immediate signal
+#   • manual workflow_dispatch
+#
+# What the paths cover: the Windows unit job (windows-test.yml) runs the fast
+# pytest suite on a real Windows interpreter plus PSScriptAnalyzer on the
+# installer. The added signal over Linux comes from the Python modules with
+# os.name/sys.platform branches (path/env resolution, process spawn/stop,
+# WindowsPath, cp1252) and from the Windows-only tests. Those live in a handful
+# of concentrated dirs — listed below — not across all of src/. Deliberately
+# excluded: src/msa_apps/ui/** (Vitest runs identically on Linux) and
+# src-tauri/src/** Rust (not compiled by this job — the release build gates it).
+#
+# This path list is a BEST-EFFORT early-warning subset — deliberately NOT an
+# exhaustive enumeration of every Windows-relevant path, which proved
+# unmaintainable: the Windows suite also runs Git-Bash/MSYS shell scripts
+# (scripts/*.sh) and can be affected by encoding/path behavior in otherwise
+# platform-neutral code, and that surface keeps growing. Chasing it in a paths
+# filter is not worth the cost. So, by design:
+#
+#   • These paths give fast, per-push Windows signal for the most common cases.
+#   • release.yml calls windows-test.yml directly and runs the FULL Windows suite
+#     before any installer ships — THAT is the completeness guarantee, not this
+#     filter. A Windows-only regression in a path not listed here surfaces at the
+#     next release rather than at merge; that latency is an accepted trade for
+#     cost. Please don't expand this list toward completeness — see PR #210.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      # Python modules with real Windows branches, exercised by the Windows pytest run
+      - 'src/msa_settings/**'
+      - 'src/msa_apps/search_api/**'
+      - 'src/msa_cli/**'
+      - 'src/msa_indexer/db/**'          # qdrant_handoff.py win32 pid_alive() — used by indexer_manager cleanup_stale
+      - 'src-tauri/backend/app/**'
+      # Windows-only test coverage (skipif os.name != "nt") + Python deps + packaging
+      - 'tests/test_config_paths.py'
+      - 'tests/requirements-ci.txt'
+      - 'pyproject.toml'
+      # Windows-specific inputs the Windows job reads: installer PS lint, the ExifTool
+      # version pin (windows-test.yml downloads a Windows-only archive), and pipeline defs
+      - 'installer/windows-native/**'
+      - 'scripts/versions.env'
+      - '.github/workflows/windows-test.yml'
+      - '.github/workflows/windows-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # event_name keeps a path-triggered push from cancelling a workflow_dispatch
+  # run on the same ref (see the matching note in ci.yml).
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  windows-test:
+    uses: ./.github/workflows/windows-test.yml

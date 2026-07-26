@@ -427,6 +427,78 @@ def test_ensure_dependencies_noop_without_sidecar_port(tmp_path):
     assert provision.ensure_dependencies({}, project=project) is None
 
 
+def test_ensure_dependencies_app_step_installs_from_writable_copy(tmp_path):
+    """The app step must never build from the staged tree in place: setuptools writes
+    ``src/<pkg>.egg-info`` into the tree it builds, and the staged tree lives inside the app
+    bundle — read-only when macOS App Translocation runs a quarantined app straight from the
+    DMG (the field first-run failure: uv exit 1, "could not create
+    'src/media_search_agent.egg-info': Read-only file system"). The install must target a
+    complete, writable temp copy, and clean it up afterwards."""
+    project = _stage_project(tmp_path)
+    root, exe = _stage_root(tmp_path)
+    seen = {}
+
+    def runner(cmd, env, log_path, on_line=None):
+        joined = " ".join(cmd)
+        # the app step is the only --no-deps install whose target is a directory
+        # (facenet is a requirement spec; the ranker, when staged, is a .whl)
+        if "--no-deps" in joined and "facenet" not in joined and not cmd[-1].endswith(".whl"):
+            target = Path(cmd[-1])
+            seen["target"] = target
+            seen["complete_when_run"] = (target / "pyproject.toml").exists()
+        return 0
+
+    provision.ensure_dependencies(
+        {"SIDECAR_PORT": "5000", "MSA_TORCH_VARIANT": "cpu"},
+        exe=exe, project=project, runner=runner, nvidia_detector=lambda: False,
+    )
+    assert seen["target"] != project                 # not in place
+    assert project not in seen["target"].parents     # not anywhere under the staged tree
+    assert seen["complete_when_run"] is True         # the copy was complete when uv ran
+    assert not seen["target"].exists()               # temp copy removed after the step
+
+
+def test_ensure_dependencies_skips_app_copy_when_app_step_completed(tmp_path, monkeypatch):
+    """A resume where the app step already finished (the interrupt hit a LATER step) must not
+    copy the staged tree at all — the copy would be discarded unused, and the disk budget
+    credits completed steps, so the wasted copy could fail an otherwise valid low-space
+    resume."""
+    project = _stage_project(tmp_path)
+    root, exe = _stage_root(tmp_path)
+    env = {"SIDECAR_PORT": "5000", "MSA_TORCH_VARIANT": "cpu"}
+
+    # First launch: interrupt AFTER the app step succeeds (facenet, the 4th step, fails).
+    calls1 = []
+
+    def runner_fail_on_facenet(cmd, e, l, on_line=None):
+        calls1.append(cmd)
+        return 1 if "facenet" in " ".join(cmd) else 0
+
+    with pytest.raises(provision.ProvisionError):
+        provision.ensure_dependencies(
+            env, exe=exe, project=project, runner=runner_fail_on_facenet,
+            nvidia_detector=lambda: False,
+        )
+    assert any("msa-app-build-" in " ".join(c) for c in calls1)  # app ran (from the copy)
+
+    # Resume: the app step is in the completed ledger — no staged-tree copy may happen.
+    copies = []
+    real_copytree = provision.shutil.copytree
+    monkeypatch.setattr(
+        provision.shutil, "copytree",
+        lambda *a, **k: copies.append(a) or real_copytree(*a, **k),
+    )
+    calls2 = []
+    provision.ensure_dependencies(
+        env, exe=exe, project=project,
+        runner=lambda c, e, l, on_line=None: calls2.append(c) or 0,
+        nvidia_detector=lambda: False,
+    )
+    assert copies == []                                              # no copy on resume
+    assert not any("msa-app-build-" in " ".join(c) for c in calls2)  # app step skipped
+    assert any("facenet" in " ".join(c) for c in calls2)             # the failed step reran
+
+
 def test_ensure_dependencies_installs_in_spec_order(tmp_path, monkeypatch):
     project = _stage_project(tmp_path)
     root, exe = _stage_root(tmp_path)
@@ -450,7 +522,8 @@ def test_ensure_dependencies_installs_in_spec_order(tmp_path, monkeypatch):
     assert "torch" in joined[0] and "torchvision" in joined[0]
     assert "--index-url" not in joined[0]  # cpu variant
     assert "-r" in joined[1]
-    assert "--no-deps" in joined[2] and str(project) in joined[2]
+    assert "--no-deps" in joined[2] and "msa-app-build-" in joined[2]  # app: from the temp copy
+    assert str(project) not in joined[2]  # never in place — the bundle tree may be read-only
     assert "facenet-pytorch>=2.6.0" in joined[3]
     # marker written -> a second call is a no-op (runner not invoked again)
     calls.clear()
@@ -520,7 +593,7 @@ def test_ensure_dependencies_resumes_past_completed_steps(tmp_path):
     joined2 = [" ".join(c) for c in calls2]
     assert not any("torchvision" in j for j in joined2)   # torch skipped on resume
     assert not any(" -r " in f" {j} " for j in joined2)   # reqs skipped on resume
-    assert any("--no-deps" in j and str(project) in j for j in joined2)  # app ran
+    assert any("--no-deps" in j and "msa-app-build-" in j for j in joined2)  # app ran (temp copy)
     assert any("facenet-pytorch" in j for j in joined2)   # facenet ran
     assert provision._read_marker(marker) is not None     # all-done marker now written
 
@@ -919,6 +992,9 @@ def test_main_arms_reaper_before_ensure_dependencies(
         raise RuntimeError("boom")  # route through the failure fallback (which must not block)
 
     monkeypatch.setattr(provision, "ensure_dependencies", fake_ensure)
+    # This test exercises reaper ordering, not the host's provisioning eligibility. Keep the
+    # real disk-space preflight from making the result depend on available CI runner space.
+    monkeypatch.setattr(provision, "preflight_system", lambda **_kwargs: None)
     monkeypatch.setattr(shim, "_hold_error_state_inline", lambda: None)
     monkeypatch.setenv("SIDECAR_PORT", str(free_tcp_port))
     monkeypatch.setenv("SUPERVISOR_PID", str(os.getpid()))  # our own pid ⇒ watchdog sees it alive

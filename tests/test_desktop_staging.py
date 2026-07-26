@@ -87,7 +87,8 @@ def test_windows_branch_stages_native_exiftool_exe_and_files_dir():
     # macOS/Linux layout: the pure-Perl script + its module lib/ stay.
     assert '"$BIN_DIR/exiftool"' in text
     assert '"$BIN_DIR/lib"' in text
-    # Hard-fail guards mirror installer/windows-native/shell/build-bundle.sh.
+    # Hard-fail guards on the staged native exiftool (the pattern proven by the
+    # legacy Windows shell bundle, retired M-7/S-5.5).
     assert "exiftool(-k).exe not found" in text
     assert "exiftool_files/ not found" in text
     # The zip carries Windows read-only attrs; chmod -R u+w keeps the cleanup rm from failing.
@@ -144,6 +145,20 @@ def test_script_excludes_ui_build_products():
     text = _read(SCRIPT)
     assert "--exclude='src/msa_apps/ui/node_modules'" in text
     assert "--exclude='src/msa_apps/ui/dist'" in text
+
+
+def test_desktop_bvt_accepts_an_explicit_prerelease_artifact_version():
+    workflow = _read(REPO_ROOT / ".github" / "workflows" / "bvt.yml")
+
+    assert "artifact_version:" in workflow
+    assert "Optional SemVer prerelease for uploaded desktop installers" in workflow
+    # Both desktop platform jobs validate the input and export the existing staging override.
+    assert workflow.count("Configure BVT artifact version") == 2
+    assert workflow.count("ARTIFACT_VERSION: ${{ inputs.artifact_version }}") == 2
+    assert workflow.count("MSA_STAGE_VERSION=$ARTIFACT_VERSION") == 2
+    assert workflow.count("0.4.3-bvt.1") >= 2
+    # An omitted input intentionally preserves the existing routine-BVT version.
+    assert workflow.count('ARTIFACT_VERSION="0.0.0"') == 2
 
 
 # ── functional: --source-only (no network) ───────────────────────────────────

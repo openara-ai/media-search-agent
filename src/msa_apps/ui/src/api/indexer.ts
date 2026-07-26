@@ -117,6 +117,17 @@ export interface Diagnostics {
   /** App/package version reported by the backend (fallback when the desktop shell
    *  hasn't injected window.__APP_VERSION__, e.g. browser / dev mode). */
   app_version?: string
+  /** The optional `msa` command-line tool tier (opt-in for desktop installs). */
+  cli?: {
+    /** Path to the installed `msa` console script in the app-private venv, or null. */
+    msa_path: string | null
+    /** POSIX opt-in symlink location (~/.local/bin/msa); null on Windows. */
+    launcher_path: string | null
+    /** Whether the opt-in launcher already exists at launcher_path. */
+    launcher_installed: boolean
+    /** Whether `msa` already resolves on PATH in the backend's environment. */
+    on_path: boolean
+  }
 }
 
 export async function getDiagnostics(): Promise<Diagnostics> {

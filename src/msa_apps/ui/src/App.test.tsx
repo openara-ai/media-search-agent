@@ -9,6 +9,7 @@ import { queryClient } from './lib/queryClient'
 vi.mock('@/pages/BrowsePage', () => ({ BrowsePage: () => <div>Browse</div> }))
 vi.mock('./hooks/useIndexerStatus', () => ({
   useIndexerStatus: vi.fn(() => ({ status: null, connected: false })),
+  useIndexerRunning: vi.fn(() => false),
 }))
 vi.mock('./hooks/useSetupWS', () => ({
   useSetupWS: vi.fn(() => ({ models: null, complete: false })),

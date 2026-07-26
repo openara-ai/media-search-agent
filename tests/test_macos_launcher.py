@@ -2,8 +2,11 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SWIFT_LAUNCHER = REPO_ROOT / "installer" / "macos" / "launcher_app" / "main.swift"
-MACOS_BUILD = REPO_ROOT / "installer" / "macos" / "build.sh"
+# The Swift menu-bar launcher (launcher_app/main.swift) and the .pkg/Platypus
+# build (build.sh) were retired in M-7/S-5.5 (macOS ships as the Tauri desktop
+# app; the menu bar returns Tauri-native in M-8). Their tests are removed. What
+# remains here still covers the kept surfaces: scripts/start.sh (browser/Linux
+# mode) and the thin macOS bootstrap installer/macos/shell/install.sh.
 MACOS_SHELL_INSTALL = REPO_ROOT / "installer" / "macos" / "shell" / "install.sh"
 START_SH = REPO_ROOT / "scripts" / "start.sh"
 
@@ -11,66 +14,6 @@ START_SH = REPO_ROOT / "scripts" / "start.sh"
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
-
-def test_swift_launcher_opens_launch_url():
-    text = _read(SWIFT_LAUNCHER)
-
-    assert 'kLaunchURL   = "http://localhost:\\(kAPIPort)/?launch=1"' in text
-    assert 'NSWorkspace.shared.open(url)' in text
-
-
-def test_swift_launcher_waits_for_ready_before_opening_browser():
-    """The Swift launcher polls /health and opens the browser only when ready."""
-    text = _read(SWIFT_LAUNCHER)
-
-    assert 'waitForReadyThenOpen' in text
-    assert 'checkHealth' in text
-    assert 'runShellSync(paths.startSH, args: ["--no-browser"])' in text
-    assert "appendLauncherLog" in text
-    assert "catch {" in text
-    assert "p.waitUntilExit()" in text
-    assert "exited with status" in text
-
-
-def test_swift_launcher_is_one_shot_browser_launcher_on_launch():
-    """On launch: start or replace the API, then open the browser automatically."""
-    text = _read(SWIFT_LAUNCHER)
-
-    assert "DispatchQueue.global(qos: .userInitiated).async" in text
-    assert 'runShellSync(paths.startSH, args: ["--no-browser"])' in text
-    assert "DispatchQueue.main.async" in text
-    assert 'waitForReadyThenOpen(url)' in text
-
-
-def test_macos_build_uses_swift_launcher():
-    """build.sh compiles the Swift launcher directly — no Platypus dependency."""
-    text = _read(MACOS_BUILD)
-
-    assert '_build_swift_launcher' in text
-    assert 'swiftc -framework AppKit' in text
-    assert 'launcher_app/main.swift' in text
-
-
-def test_macos_build_only_archives_runtime_script_subset():
-    text = _read(MACOS_BUILD)
-
-    assert "PACKAGE_PATHS=(" in text
-    assert "README.md" in text
-    assert "scripts/setup.sh" in text
-    assert "scripts/start.sh" in text
-    assert "scripts/stop.sh" in text
-    assert "scripts/lib/common.sh" in text
-    assert 'archive --format=tar HEAD "${PACKAGE_PATHS[@]}"' in text
-    assert "src/ scripts/" not in text
-
-
-def test_macos_build_requires_mediainfo_for_arm64_and_dylib():
-    """build.sh is arm64-only; it must thin the universal binary and extract the dylib."""
-    text = _read(MACOS_BUILD)
-
-    assert '! -f "$BIN_DIR/mediainfo" || ! -f "$LIB_DIR/libmediainfo.dylib"' in text
-    assert 'lipo -thin arm64' in text
-    assert '"$LIB_DIR/libmediainfo.dylib"' in text
 
 def test_start_sh_uses_launch_splash_url_when_opening_browser():
     text = _read(START_SH)
@@ -88,22 +31,6 @@ def test_start_sh_validates_uvicorn_ownership_before_stopping_processes():
     assert '_pid_listens_on_port "$pid" "$API_PORT"' in text
     assert 'lsof -nP -tiTCP:"$port" -sTCP:LISTEN' in text
     assert "xargs kill -9" not in text
-
-
-def test_swift_launcher_cli_opens_in_user_data_folder():
-    """The 'Open CLI' menu must drop the shell into the user data folder
-    (where config.yaml lives), not the .app bundle's Resources directory
-    (which contains bin/, scripts/, src/)."""
-    text = _read(SWIFT_LAUNCHER)
-
-    # launchCLI() builds a .command script that cd's into the user data folder.
-    assert 'let dataDir = paths.dataDir' in text
-    assert 'cd "\\(dataDir)"' in text
-    # The data folder is created if missing so cd cannot fail.
-    assert 'createDirectory(' in text
-    assert 'atPath: paths.dataDir' in text
-    # Regression guard: the old buggy cd-into-msaRoot must not return.
-    assert 'cd "\\(root)"' not in text
 
 
 def test_macos_shell_installer_unloads_launch_agent_by_label():

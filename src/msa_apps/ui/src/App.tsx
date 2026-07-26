@@ -10,6 +10,8 @@ import { PeoplePage } from '@/pages/PeoplePage'
 import { IndexerPage } from '@/pages/IndexerPage'
 import { SettingsPage } from '@/pages/SettingsPage'
 import { StartupGate } from '@/components/StartupGate'
+import { useIndexerRunning } from '@/hooks/useIndexerStatus'
+import { useCloseWhileIndexingGuard } from '@/hooks/useCloseWhileIndexing'
 
 function RootRedirect() {
   const { search } = useLocation()
@@ -35,6 +37,9 @@ function MainApp() {
 
 function AppInner() {
   const [launchSplashVisible, setLaunchSplashVisible] = useState(false)
+
+  // Disclose that a running index survives the window close (shell mode only; #169).
+  useCloseWhileIndexingGuard(useIndexerRunning())
 
   useEffect(() => {
     const url = new URL(window.location.href)

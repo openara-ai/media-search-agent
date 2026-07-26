@@ -1,6 +1,25 @@
 # ADR-004: Installer and Launcher Design
 
-Status: Partially superseded — see "Later update" below
+Status: Superseded on macOS + Windows by the Tauri desktop shell (ADR-012);
+Linux shell-bundle path retained. See "Later update" notes below.
+
+## Later update: macOS + Windows move to the Tauri desktop app (M-7)
+
+The desktop shell (ADR-012) replaced the platform-specific installer/launcher
+designs on macOS and Windows. As of M-7/S-5.5 the legacy artifacts this ADR
+described are **retired and deleted**:
+
+- macOS: the `.pkg`/Platypus menu-bar app and its build toolchain
+  (`installer/macos/build.sh`, `launcher_app/`, `notarize.sh`, payload/assets).
+- Windows: the WinForms tray, the `start.ps1`/`stop.ps1` launchers, and the
+  Windows shell-bundle builder.
+
+macOS and Windows now ship as the Tauri desktop app (native window +
+ephemeral-port sidecar backend); uninstall follows the ADR-005 tiers via the
+NSIS hook (Windows) and `scripts/uninstall-desktop.sh` (macOS). A native
+menu-bar/tray control surface is planned to return Tauri-native (M-8), not as
+the retired Platypus/WinForms code. The **Linux** shell-bundle path (one-line
+bootstrap + `msa`/browser mode) is unchanged and retained.
 
 ## Later update: Windows pivot to shell bundles
 

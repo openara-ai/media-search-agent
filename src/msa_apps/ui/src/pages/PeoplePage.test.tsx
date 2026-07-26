@@ -75,7 +75,15 @@ const idleWS: WSMessage = {
 
 const runningWS: WSMessage = {
   type: 'update',
-  status: { status: 'running', run_id: 'r1', started_at: null, finished_at: null, elapsed_seconds: 5, return_code: null },
+  status: { status: 'running', run_id: 'r1', started_at: null, finished_at: null, elapsed_seconds: 5, return_code: null, summary: { phase: 'processing' } },
+  log: [],
+}
+
+// M-8/S-2: the Qdrant lock window (export step) — the only slice of a run
+// where face search is briefly unavailable.
+const exportingWS: WSMessage = {
+  type: 'update',
+  status: { status: 'running', run_id: 'r1', started_at: null, finished_at: null, elapsed_seconds: 5, return_code: null, summary: { phase: 'exporting' } },
   log: [],
 }
 
@@ -143,32 +151,38 @@ describe('PeoplePage', () => {
     })
   })
 
-  describe('indexer-running banner (similar-faces view)', () => {
-    it('does not show warning banner in overview when indexer is idle', async () => {
+  describe('indexer phase-aware banner (similar-faces view, M-8/S-2)', () => {
+    it('does not show a banner in overview when indexer is idle', async () => {
       MockWebSocket.pendingMessage = idleWS
       renderPage()
       await waitFor(() => expect(screen.getByText('Alice')).toBeTruthy())
-      expect(screen.queryByText(/indexer is running/i)).toBeNull()
+      expect(screen.queryByText(/indexing in progress/i)).toBeNull()
+      expect(screen.queryByText(/finalizing index/i)).toBeNull()
     })
 
-    it('shows warning banner when entering similar-faces view while indexer is running', async () => {
+    it('pre-export phases: banner says face results reflect the pre-run library', async () => {
       MockWebSocket.pendingMessage = runningWS
       renderPage()
       await waitFor(() => expect(screen.getByText('Alice')).toBeTruthy())
       await userEvent.click(screen.getAllByRole('button', { name: 'Alice' })[0])
       await waitFor(() =>
-        expect(screen.getByText(/indexer is running/i)).toBeTruthy()
+        expect(screen.getByText(/indexing in progress — face results reflect your library before this run/i)).toBeTruthy()
       )
+      // Face search now works during the long tail of a run — the pre-S-2
+      // "temporarily unavailable while the database is locked" text is false.
+      expect(screen.queryByText(/temporarily unavailable/i)).toBeNull()
+      expect(screen.queryByText(/database is locked/i)).toBeNull()
     })
 
-    it('warning banner on similar-faces view mentions database locked', async () => {
-      MockWebSocket.pendingMessage = runningWS
+    it('exporting phase: banner flips to the finalizing message', async () => {
+      MockWebSocket.pendingMessage = exportingWS
       renderPage()
       await waitFor(() => expect(screen.getByText('Alice')).toBeTruthy())
       await userEvent.click(screen.getAllByRole('button', { name: 'Alice' })[0])
       await waitFor(() =>
-        expect(screen.getByText(/database is locked/i)).toBeTruthy()
+        expect(screen.getByText(/finalizing index — face search resumes shortly/i)).toBeTruthy()
       )
+      expect(screen.queryByText(/indexing in progress/i)).toBeNull()
     })
 
     it('shows person name as known-section title instead of "Known"', async () => {

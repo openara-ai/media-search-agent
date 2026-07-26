@@ -13,6 +13,46 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   Curate the real user-visible entries here before cutting the release.
 -->
 
+## [0.5.0] - 2026-07-25
+
+### Added
+- Incremental search-index (Qdrant) export: after a run that changed a handful
+  of files, the indexer now uploads only those files' vectors instead of
+  re-uploading the whole library — the export step after a small change drops
+  from minutes to seconds on large libraries. Deleting media now also removes
+  its entries from the search index on the next runs, and label or rename
+  changes made while no indexer is running are picked up and exported by the
+  next run automatically. The first export after upgrading may still be a full
+  one; every export after that is incremental. `msa index export` and
+  `msa index export --recreate` still perform full exports for repair.
+- Incremental indexing fast path in the indexer: re-index runs skip re-reading
+  files whose size and modification time are unchanged, so a no-op run over a
+  large library finishes in seconds-to-minutes instead of re-reading every byte.
+  The first run after upgrading rebuilds this state and is as slow as before;
+  every run after is fast.
+- The indexer now handles moved or renamed files without re-processing them,
+  and detects deleted files: after two consecutive complete scans, removed
+  media disappears from browse and search. Both behaviors are configurable via
+  the new `incremental:` section in `config.yaml` (`fingerprint_enabled`,
+  `deletion_sweep`).
+- New `msa index run --verify-content` option re-reads every file's content to
+  repair the fast-path records — the safety net for files modified without a
+  size or timestamp change.
+- Settings: an **Uninstall** section with clean, platform-aware removal — the app and its private runtime go, your index and configuration are kept by default.
+- Settings: an optional **Command-line tool** section to add the `msa` command to your PATH for headless indexing (`msa index run`).
+- Closing the window while an index is running now asks first and explains that indexing keeps running in the background if you quit.
+- Search stays available while the indexer runs. Results reflect your library
+  as of the previous run, and a banner says so; only the brief final
+  "Finalizing index" step still pauses search, after which new content
+  appears. Face labeling and person rename/merge return a clear "try again in
+  a moment" response during that finalizing window instead of being silently
+  skipped.
+
+### Fixed
+- Search results no longer include media whose files were deleted from disk.
+- Updating the app on Windows no longer re-downloads the ML models.
+- The indexing timer now shows the true elapsed time after the app is reopened mid-run, instead of restarting from zero.
+
 ## [0.4.2] - 2026-07-13
 
 ### Added
@@ -72,7 +112,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   live progress; and one-line installers for macOS, Linux, and Windows (no Docker,
   embedded Qdrant). Fully offline.
 
-[Unreleased]: https://github.com/openara-ai/media-search-agent/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/openara-ai/media-search-agent/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/openara-ai/media-search-agent/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/openara-ai/media-search-agent/compare/v0.3.2...v0.4.2
 [0.3.2]: https://github.com/openara-ai/media-search-agent/compare/v0.3.0...v0.3.2
 [0.3.0]: https://github.com/openara-ai/media-search-agent/compare/v0.2.6...v0.3.0

@@ -120,6 +120,11 @@ PY
 export MSA_DEVICE="cpu"
 export PATH="$APP_DIR/bin:$PATH"
 echo "exiftool: $(which exiftool) - $(exiftool -ver)"
+
+# Stage the content-unique seed files that BVT Phases C/D (Step 8c) mutate.
+# Must land before the first index run so the seeds are in the baseline.
+bash "$TEST_ROOT/scripts/incremental-phases.sh" seed --fixture-root "$FIXTURE_ROOT"
+
 "$VENV_PY" -m pytest "$TEST_ROOT/test_real_media_fixtures.py" -v -m "not slow"
 
 # Step 8a: Indexer lifecycle stress — interrupted-run clean-exit gate.
@@ -142,8 +147,13 @@ export MSA_INDEXER_COMMIT_BATCH_SECONDS=2
 "$MSA_BIN" index run --config "$CONFIG_PATH" --media-source-override "$FIXTURE_ROOT" \
   >"$LIFECYCLE_LOG" 2>&1 &
 LIFECYCLE_PID=$!
-# Up to 240s for BATCH_COMMIT (cold CLIP load can take 30-60s on CPU runners).
-for _ in $(seq 1 480); do
+# Up to 900s for BATCH_COMMIT. Warm model cache: a cold CLIP *load* is 30-60s on
+# CPU runners and this loop breaks early, so warm runs pay nothing. Cold cache
+# (the first release run on a repo, or after GitHub's 7-day cache eviction — the
+# staging/public case) has no cached model, so the run *downloads* CLIP ViT-L-14
+# (~1.2GB, several minutes) inline before the first commit; budget for that. The
+# desktop validators already tolerate a cold fetch via their ~5-min readiness wait.
+for _ in $(seq 1 1800); do
   if grep -q "BATCH_COMMIT" "$LIFECYCLE_LOG" 2>/dev/null; then break; fi
   if ! kill -0 "$LIFECYCLE_PID" 2>/dev/null; then
     echo "FAIL: indexer exited before BATCH_COMMIT" >&2
@@ -153,7 +163,7 @@ for _ in $(seq 1 480); do
   sleep 0.5
 done
 if ! grep -q "BATCH_COMMIT" "$LIFECYCLE_LOG" 2>/dev/null; then
-  echo "FAIL: no BATCH_COMMIT within 240s" >&2
+  echo "FAIL: no BATCH_COMMIT within 900s" >&2
   tail -n 200 "$LIFECYCLE_LOG" >&2 || true
   kill "$LIFECYCLE_PID" 2>/dev/null || true
   exit 1
@@ -206,6 +216,19 @@ unset MSA_INDEXER_COMMIT_BATCH_SECONDS
 # state and API contracts.
 "$MSA_BIN" index run --config "$CONFIG_PATH" --media-source-override "$FIXTURE_ROOT" --export-to-qdrant
 
+# Step 8c: BVT Phases C/D — incremental indexing (M-8/S-1 plan §6.2).
+# Phase C proves a no-op re-run hashes nothing and skips the export; Phase D
+# mutates the staged fixture copy (EXIF re-inject / move / delete) and
+# asserts the supersede, move, and two-scan tombstone paths via the
+# INDEXER_SUMMARY counters. Runs before the API starts (embedded-Qdrant lock).
+bash "$TEST_ROOT/scripts/incremental-phases.sh" run \
+  --python "$VENV_PY" \
+  --sqlite "$DATA_DIR/index/media.sqlite" \
+  --fixture-root "$FIXTURE_ROOT" \
+  --log-dir "$LOG_DIR" \
+  -- "$MSA_BIN" index run --config "$CONFIG_PATH" --media-source-override "$FIXTURE_ROOT"
+export MSA_REALDATA_INCREMENTAL=1
+
 export MSA_REALDATA_WORKSPACE="$DATA_DIR"
 export MSA_REALDATA_SQLITE_PATH="$DATA_DIR/index/media.sqlite"
 export MSA_REALDATA_FAISS_PATH="$DATA_DIR/index/image_vec.faiss"
@@ -221,7 +244,14 @@ if ls "$APP_DIR"/wheels/msa_ranker-*.whl >/dev/null 2>&1; then
   export MSA_REALDATA_LEDGER_DIR="$LEDGER_DIR"
 fi
 
-"$MSA_BIN" api start --no-browser >"$API_LOG" 2>&1 &
+# MSA_CONFIG_PATH pins the config inside the API process (mirrors the Windows
+# validator's cli.ps1, which sets $env:MSA_CONFIG_PATH): POST /indexer/start
+# (the M-8/S-2 Step 10 gate) derives the spawned indexer's config from it —
+# without it the endpoint falls back to cwd/config.yaml, which does not exist in
+# this validator's working dir. The shell-bundle `msa api start` routes to
+# scripts/start.sh, which reads MSA_CONFIG_PATH — NOT a `--config` flag (that is
+# the Python CLI's; start.sh warns "Unknown argument: --config" — see #216).
+MSA_CONFIG_PATH="$CONFIG_PATH" PYTHONUNBUFFERED=1 "$MSA_BIN" api start --no-browser >"$API_LOG" 2>&1 &
 API_PID=$!
 API_STARTED=1
 
@@ -236,7 +266,28 @@ done
 
 if [[ "$READY" -ne 1 ]]; then
   echo "API did not become ready at $MSA_REALDATA_BASE_URL/health" >&2
-  echo "API log: $API_LOG" >&2
+  echo "===== api start stdout/stderr ($API_LOG) =====" >&2
+  cat "$API_LOG" >&2 2>/dev/null || echo "(empty/absent)" >&2
+  echo "===== LOG_DIR listing ($LOG_DIR) =====" >&2
+  ls -la "$LOG_DIR" >&2 2>/dev/null || true
+  for f in uvicorn.log msa.log qdrant.log; do
+    echo "----- $f (tail 40) -----" >&2
+    tail -40 "$LOG_DIR/$f" >&2 2>/dev/null || echo "(absent)" >&2
+  done
+  echo "===== is the api process alive? (hang vs crash) =====" >&2
+  if [[ -n "$API_PID" ]] && kill -0 "$API_PID" 2>/dev/null; then
+    echo "API_PID $API_PID is ALIVE -> startup HANG (never bound)" >&2
+    ps -o pid,ppid,stat,etime,args -p "$API_PID" >&2 2>/dev/null || true
+    # Dump Python stacks of the hung process if py-spy/faulthandler unavailable: SIGABRT via the venv
+    kill -QUIT "$API_PID" 2>/dev/null || true; sleep 1
+    echo "----- api stdout/stderr after SIGQUIT -----" >&2; tail -40 "$API_LOG" >&2 2>/dev/null || true
+  else
+    echo "API_PID $API_PID is DEAD -> startup CRASH" >&2
+  fi
+  echo "===== isolate: import msa_apps.search_api.app (timeout 90s) =====" >&2
+  timeout 90 "$VENV_PY" -c 'import msa_apps.search_api.app; print("APP MODULE IMPORT OK")' 2>&1 >&2 || echo "APP IMPORT hang/crash (rc=$?)" >&2
+  echo "----- cv2/numpy versions (ruled out, for the record) -----" >&2
+  "$VENV_PY" -c 'import cv2,numpy; print("cv2",cv2.__version__,"numpy",numpy.__version__)' 2>&1 >&2 || true
   exit 1
 fi
 
@@ -253,3 +304,12 @@ curl -fsS --max-time 180 -X POST -H "Content-Type: application/json" \
 # Step 9: Run the runtime test suite against the installed indexed state and
 # live API server, then stop the API in the cleanup trap.
 "$VENV_PY" -m pytest "$TEST_ROOT/test_real_media_runtime.py" -v
+
+# Step 10: M-8/S-2 — search-during-indexing gate (Qdrant lock window,
+# sentinel-file handshake). Starts a fresh indexer run THROUGH the live API
+# (POST /indexer/start) and polls /search for the whole run: every response
+# must be HTTP 200, non-empty during pre-export phases, the mutated seed
+# searchable afterwards, handshake lines in order in the run log, and no
+# "already accessed by another instance" contention.
+export MSA_REALDATA_SEARCH_DURING_INDEXING=1
+"$VENV_PY" -m pytest "$TEST_ROOT/test_real_media_runtime.py" -v -k TestSearchDuringIndexing

@@ -47,6 +47,29 @@ def _cleanup_ui_dist_stub():
             pass
 
 
+@pytest.fixture(autouse=True)
+def _fast_qdrant_handoff(monkeypatch, tmp_path):
+    """Keep the M-8/S-2 Qdrant handshake from stalling in-process unit tests.
+
+    Production keeps the 15 s grant-wait budget (plan L6: headless CLI runs
+    proceed after the timeout). But every unit test that calls run_index
+    in-process would eat that budget too, and the handshake files would land
+    in <cwd>/run — the repo root during a pytest run. Shrink the wait and
+    pin the handshake dir to tmp_path for the test process. This mutates
+    only in-process module state / this process's env: subprocess-driven
+    suites (the real-media BVT) still exercise the real 15 s protocol
+    end-to-end. Handshake-timing tests override these knobs themselves.
+    """
+    monkeypatch.setenv("MSA_QDRANT_HANDOFF_DIR", str(tmp_path / "qdrant-handoff"))
+    try:
+        from msa_indexer.db import qdrant_handoff
+    except ImportError:
+        yield
+        return
+    monkeypatch.setattr(qdrant_handoff, "GRANT_WAIT_SECONDS", 0.25)
+    yield
+
+
 # ============================================================================
 # Test Data Management
 # ============================================================================

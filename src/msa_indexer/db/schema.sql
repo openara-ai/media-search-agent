@@ -1,8 +1,10 @@
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS media (
   media_id TEXT PRIMARY KEY,       -- sha256 of file (or uuid)
-  -- Absolute path on disk (kept for backward compatibility and direct access)
-  path TEXT NOT NULL UNIQUE,
+  -- Absolute path on disk (display/access convenience only; file_fingerprint
+  -- is the authoritative path->content mapping. NOT unique: a tombstoned row
+  -- and its live successor may share a path — §3.1a path-authority migration).
+  path TEXT NOT NULL,
   -- Multi-source support: logical source identifier and path relative to source root
   source_name TEXT,                -- e.g., "sample_photos", "onedrive_photos"
   rel_path TEXT,                   -- path relative to source root (e.g., "album1/IMG_001.jpg")
@@ -21,10 +23,15 @@ CREATE TABLE IF NOT EXISTS media (
   object_detection_done INTEGER DEFAULT 0, -- 1 if object detection has been run, 0 otherwise
   gps_processed INTEGER DEFAULT 0,        -- 1 if GPS metadata has been extracted, 0 otherwise
   gps_data_mode TEXT,
-  embeddings_version TEXT                 -- Model version tag for embeddings (null if not embedded)
+  embeddings_version TEXT,                -- Model version tag for embeddings (null if not embedded)
+  missing_since_scan_id INTEGER,          -- legacy-orphan grace marker (deletion sweep)
+  deleted_seq INTEGER                     -- M-8/S-3: stamp of the deleted=1 transition; drives the Qdrant deletion pass
 );
 -- Optional index to accelerate lookups by (source_name, rel_path)
 CREATE INDEX IF NOT EXISTS idx_media_source_rel ON media(source_name, rel_path);
+-- Non-unique path lookup index (replaces the retired UNIQUE constraint's
+-- implicit index — §3.1a).
+CREATE INDEX IF NOT EXISTS idx_media_path ON media(path);
 -- Browse default sort: ORDER BY ts_utc DESC, plus date-range filters.
 -- Without this, every paginated /media call sorts every matched row.
 CREATE INDEX IF NOT EXISTS idx_media_ts ON media(ts_utc);
@@ -76,12 +83,20 @@ CREATE INDEX IF NOT EXISTS idx_face_media ON face(media_id);
 -- SELECTs) physically cannot pull in the BLOB pages, and so dropping
 -- this table is enough to force a re-embed without losing labels or
 -- metadata.
+-- updated_seq (M-8/S-3): per-row dirty stamp for delta Qdrant export.
+-- 0 = "already in Qdrant"; a payload-relevant write stamps the row with the
+-- pending index_version_seq so `updated_seq > exported_seq` selects exactly
+-- the rows the next export must re-upsert. The covering indexes live in the
+-- additive-migration path (sqlite_store.py), which runs for fresh DBs too —
+-- an index here would fail executescript on a pre-S-3 DB whose column is
+-- added only after schema.sql runs.
 CREATE TABLE IF NOT EXISTS image_embedding (
   media_id        TEXT PRIMARY KEY,
   embedding       BLOB NOT NULL,
   embedding_dim   INTEGER NOT NULL,
   embedding_model TEXT NOT NULL,
   created_at      TEXT DEFAULT (datetime('now')),
+  updated_seq     INTEGER NOT NULL DEFAULT 0,
   FOREIGN KEY (media_id) REFERENCES media(media_id) ON DELETE CASCADE
 );
 
@@ -92,6 +107,7 @@ CREATE TABLE IF NOT EXISTS face_embedding (
   embedding_dim   INTEGER NOT NULL,
   embedding_model TEXT NOT NULL,
   created_at      TEXT DEFAULT (datetime('now')),
+  updated_seq     INTEGER NOT NULL DEFAULT 0,
   FOREIGN KEY (face_id) REFERENCES face(face_id) ON DELETE CASCADE
 );
 
@@ -104,6 +120,7 @@ CREATE TABLE IF NOT EXISTS keyframe_embedding (
   embedding_dim   INTEGER NOT NULL,
   embedding_model TEXT NOT NULL,
   created_at      TEXT DEFAULT (datetime('now')),
+  updated_seq     INTEGER NOT NULL DEFAULT 0,
   FOREIGN KEY (keyframe_id) REFERENCES video_keyframes(id) ON DELETE CASCADE
 );
 
@@ -148,5 +165,43 @@ CREATE INDEX IF NOT EXISTS idx_vkf_video ON video_keyframes(video_id);
 CREATE TABLE IF NOT EXISTS index_state (
   singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
   index_version_seq INTEGER NOT NULL DEFAULT 0,
-  index_version_ts TEXT
+  index_version_ts TEXT,
+  -- M-8/S-3: index_version_seq captured when the S-3 migration ran (fresh
+  -- DBs: 0). Durable input to the first-delta-run guard — delta export
+  -- engages only once a recorded export reaches this seq.
+  s3_migration_seq INTEGER NOT NULL DEFAULT 0,
+  -- M-8/S-3: set (in the same transaction) whenever face rows are deleted
+  -- while their media stays live — the cascade leaves nothing stamped to
+  -- drive point deletion, so the next face export must run in recreate
+  -- mode. Cleared only after that recreate export succeeds.
+  face_recreate_required INTEGER NOT NULL DEFAULT 0
 );
+
+-- One row per indexer walk. completed_at is written only when the walk
+-- finished cleanly (no stop request, every source root walked); the
+-- deletion sweep keys off completed scans only.
+CREATE TABLE IF NOT EXISTS scan_run (
+  scan_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  started_at   TEXT DEFAULT (datetime('now')),
+  completed_at TEXT,                    -- set only on clean full completion
+  sources_json TEXT                     -- JSON: per-source {walked_to_completion, walk_errors}
+);
+
+-- Authoritative path -> content mapping (fingerprint fast-path). One row
+-- per on-disk path; multiple rows may point at one media_id (duplicate
+-- copies). rel_path is POSIX form, same convention as media.rel_path
+-- (ADR-007). On a fingerprint hit (size+mtime match) the stored media_id
+-- is reused without re-hashing the file.
+CREATE TABLE IF NOT EXISTS file_fingerprint (
+  source_name        TEXT NOT NULL,
+  rel_path           TEXT NOT NULL,     -- POSIX form, same convention as media.rel_path (ADR-007)
+  size_bytes         INTEGER NOT NULL,
+  mtime_ns           INTEGER NOT NULL,
+  media_id           TEXT NOT NULL,
+  last_seen_scan_id  INTEGER,
+  missing_since_scan_id INTEGER,        -- first completed scan that did not see this path
+  PRIMARY KEY (source_name, rel_path),
+  FOREIGN KEY (media_id) REFERENCES media(media_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_fp_media ON file_fingerprint(media_id);
+CREATE INDEX IF NOT EXISTS idx_fp_seen ON file_fingerprint(source_name, last_seen_scan_id);

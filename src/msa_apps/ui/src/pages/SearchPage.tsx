@@ -1,7 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import { Search, AlertTriangle } from 'lucide-react'
 import { useSearch } from '../hooks/useSearch'
-import { useIndexerRunning } from '../hooks/useIndexerStatus'
+import { useIndexerPhase } from '../hooks/useIndexerStatus'
 import { MediaCard } from '../components/media/MediaCard'
 import { MediaDetailDrawer } from '../components/media/MediaDetailDrawer'
 import { FilterPanel } from '../components/filters/FilterPanel'
@@ -27,7 +27,7 @@ export function SearchPage() {
   // Snapshot the search_id at click time so an open stays tied to the search that produced
   // the result — a later background refetch changing data.search_id can't re-attribute it.
   const [selectedSearchId, setSelectedSearchId] = useState<string | null>(null)
-  const indexerRunning = useIndexerRunning()
+  const { running: indexerRunning, phase: indexerPhase } = useIndexerPhase()
 
   const debouncedFilters = useDebounce(filters, 300)
   const { data, isFetching, isError } = useSearch(submitted, debouncedFilters)
@@ -47,7 +47,9 @@ export function SearchPage() {
       {indexerRunning && (
         <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 text-amber-800 dark:text-amber-300 text-sm">
           <AlertTriangle size={15} className="shrink-0" />
-          Indexer is running — search is temporarily unavailable while the database is locked.
+          {indexerPhase === 'exporting'
+            ? 'Finalizing index — search resumes shortly.'
+            : 'Indexing in progress — results reflect your library before this run.'}
         </div>
       )}
       {/* Search bar */}

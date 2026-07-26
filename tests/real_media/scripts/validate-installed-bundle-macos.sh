@@ -119,6 +119,11 @@ PY
 export MSA_DEVICE="cpu"
 export PATH="$APP_DIR/bin:$PATH"
 echo "exiftool: $(which exiftool) - $(exiftool -ver)"
+
+# Stage the content-unique seed files that BVT Phases C/D (Step 8c) mutate.
+# Must land before the first index run so the seeds are in the baseline.
+bash "$TEST_ROOT/scripts/incremental-phases.sh" seed --fixture-root "$FIXTURE_ROOT"
+
 "$VENV_PY" -m pytest "$TEST_ROOT/test_real_media_fixtures.py" -v -m "not slow"
 
 # Step 8a: Indexer lifecycle stress — interrupted-run clean-exit gate.
@@ -205,6 +210,19 @@ unset MSA_INDEXER_COMMIT_BATCH_SECONDS
 # state and API contracts.
 "$MSA_BIN" index run --config "$CONFIG_PATH" --media-source-override "$FIXTURE_ROOT" --export-to-qdrant
 
+# Step 8c: BVT Phases C/D — incremental indexing (M-8/S-1 plan §6.2).
+# Phase C proves a no-op re-run hashes nothing and skips the export; Phase D
+# mutates the staged fixture copy (EXIF re-inject / move / delete) and
+# asserts the supersede, move, and two-scan tombstone paths via the
+# INDEXER_SUMMARY counters. Runs before the API starts (embedded-Qdrant lock).
+bash "$TEST_ROOT/scripts/incremental-phases.sh" run \
+  --python "$VENV_PY" \
+  --sqlite "$DATA_DIR/index/media.sqlite" \
+  --fixture-root "$FIXTURE_ROOT" \
+  --log-dir "$LOG_DIR" \
+  -- "$MSA_BIN" index run --config "$CONFIG_PATH" --media-source-override "$FIXTURE_ROOT"
+export MSA_REALDATA_INCREMENTAL=1
+
 export MSA_REALDATA_WORKSPACE="$DATA_DIR"
 export MSA_REALDATA_SQLITE_PATH="$DATA_DIR/index/media.sqlite"
 export MSA_REALDATA_FAISS_PATH="$DATA_DIR/index/image_vec.faiss"
@@ -221,7 +239,11 @@ if ls "$APP_DIR"/wheels/msa_ranker-*.whl >/dev/null 2>&1; then
 fi
 export MSA_CACHE_DIR="$CACHE_DIR"
 
-"$MSA_BIN" api start --no-browser >"$API_LOG" 2>&1 &
+# --config pins MSA_CONFIG_PATH inside the API process (mirrors the Windows
+# validator): POST /indexer/start (the M-8/S-2 Step 10 gate) derives the
+# spawned indexer's config from it — without it the endpoint falls back to
+# cwd/config.yaml, which does not exist in this validator's working dir.
+"$MSA_BIN" api start --no-browser --config "$CONFIG_PATH" >"$API_LOG" 2>&1 &
 API_PID=$!
 API_STARTED=1
 
@@ -254,3 +276,12 @@ curl -fsS --max-time 180 -X POST -H "Content-Type: application/json" \
 # Step 9: Run the runtime test suite against the installed indexed state and
 # live API server, then stop the API in the cleanup trap.
 "$VENV_PY" -m pytest "$TEST_ROOT/test_real_media_runtime.py" -v
+
+# Step 10: M-8/S-2 — search-during-indexing gate (Qdrant lock window,
+# sentinel-file handshake). Starts a fresh indexer run THROUGH the live API
+# (POST /indexer/start) and polls /search for the whole run: every response
+# must be HTTP 200, non-empty during pre-export phases, the mutated seed
+# searchable afterwards, handshake lines in order in the run log, and no
+# "already accessed by another instance" contention.
+export MSA_REALDATA_SEARCH_DURING_INDEXING=1
+"$VENV_PY" -m pytest "$TEST_ROOT/test_real_media_runtime.py" -v -k TestSearchDuringIndexing

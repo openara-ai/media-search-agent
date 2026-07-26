@@ -32,7 +32,15 @@ const idleUpdate: WSMessage = {
 
 const runningUpdate: WSMessage = {
   type: 'update',
-  status: { status: 'running', run_id: 'abc', started_at: null, finished_at: null, elapsed_seconds: 10, return_code: null },
+  status: { status: 'running', run_id: 'abc', started_at: null, finished_at: null, elapsed_seconds: 10, return_code: null, summary: { phase: 'processing' } },
+  log: [],
+}
+
+// M-8/S-2: the Qdrant lock window — the only slice of a run where search is
+// briefly unavailable (sentinel-file handoff).
+const exportingUpdate: WSMessage = {
+  type: 'update',
+  status: { status: 'running', run_id: 'abc', started_at: null, finished_at: null, elapsed_seconds: 10, return_code: null, summary: { phase: 'exporting' } },
   log: [],
 }
 
@@ -65,27 +73,45 @@ afterEach(() => {
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 describe('SearchPage', () => {
-  describe('indexer-running banner', () => {
-    it('does not show warning banner when indexer is idle', async () => {
+  describe('indexer phase-aware banner (M-8/S-2)', () => {
+    it('does not show a banner when indexer is idle', async () => {
       MockWebSocket.pendingMessage = idleUpdate
       renderPage()
       await waitFor(() => expect(screen.getByPlaceholderText(/describe what you're looking for/i)).toBeTruthy())
-      expect(screen.queryByText(/indexer is running/i)).toBeNull()
+      expect(screen.queryByText(/indexing in progress/i)).toBeNull()
+      expect(screen.queryByText(/finalizing index/i)).toBeNull()
     })
 
-    it('shows warning banner when indexer is running', async () => {
+    it('pre-export phases: search works — banner says results reflect the pre-run library', async () => {
       MockWebSocket.pendingMessage = runningUpdate
       renderPage()
       await waitFor(() =>
-        expect(screen.getByText(/indexer is running/i)).toBeTruthy()
+        expect(screen.getByText(/indexing in progress — results reflect your library before this run/i)).toBeTruthy()
       )
+      // The pre-S-2 "search is temporarily unavailable" claim is now false
+      // during the long tail of a run and must never come back.
+      expect(screen.queryByText(/temporarily unavailable/i)).toBeNull()
+      expect(screen.queryByText(/database is locked/i)).toBeNull()
     })
 
-    it('warning banner mentions database locked', async () => {
-      MockWebSocket.pendingMessage = runningUpdate
+    it('exporting phase: banner flips to the finalizing message', async () => {
+      MockWebSocket.pendingMessage = exportingUpdate
       renderPage()
       await waitFor(() =>
-        expect(screen.getByText(/database is locked/i)).toBeTruthy()
+        expect(screen.getByText(/finalizing index — search resumes shortly/i)).toBeTruthy()
+      )
+      expect(screen.queryByText(/indexing in progress/i)).toBeNull()
+    })
+
+    it('running without a summary yet defaults to the pre-export message', async () => {
+      MockWebSocket.pendingMessage = {
+        type: 'update',
+        status: { status: 'running', run_id: 'abc', started_at: null, finished_at: null, elapsed_seconds: 1, return_code: null },
+        log: [],
+      }
+      renderPage()
+      await waitFor(() =>
+        expect(screen.getByText(/indexing in progress/i)).toBeTruthy()
       )
     })
   })

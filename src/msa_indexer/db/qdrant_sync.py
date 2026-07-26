@@ -16,8 +16,13 @@ def _get_qdrant_client() -> Optional[QdrantClient]:
 
     Always constructs a local client from config — msa_indexer must not
     import msa_query (that would reverse the documented dependency direction).
-    The indexer subprocess holds the Qdrant lock exclusively during a run, so
-    there is no contention concern here.
+
+    Fallback only: API-process callers pass ``client=`` explicitly (the shared
+    client via ``shared_client_op()``). Under the sentinel-file handoff the
+    API holds the embedded lock for nearly the entire run, so a per-call
+    client constructed here would contend for the lock; construction fails
+    fast ("already accessed by another instance") and the caller logs a
+    skip rather than deadlocking.
     """
     if S is None:
         return None

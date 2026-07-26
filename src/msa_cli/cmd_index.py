@@ -32,6 +32,7 @@ Examples:
   msa index run --dry-run                               # Scan files and show stats without processing
   msa index run --image-only                            # Process only images (skip videos)
   msa index run --video-only                            # Process only videos (skip images)
+  msa index run --verify-content                        # Re-hash every file, repair fingerprints
   (msa index run --no-console-log </dev/null &) ; tail -f logs/msa.log  # Background + follow log
   msa index stop                                        # Ask the indexer to exit cleanly; wait up to 60s
   msa index stop --wait 120                             # Same; longer wait budget for slow files
@@ -60,6 +61,14 @@ Examples:
                      help="Log to file only, not console (subprocess / background mode)")
     run.add_argument("--dry-run", action="store_true",
                      help="Scan files and show stats without processing (no ML, no DB writes)")
+    run.add_argument("--verify-content", action="store_true",
+                     help=(
+                         "Bypass the fingerprint fast-path for this run: hash every "
+                         "file's content and repair fingerprint records. Use as a "
+                         "periodic reconcile if files may have changed without their "
+                         "size or modification time changing (some in-place editors "
+                         "and sync clients)."
+                     ))
 
     media_type_group = run.add_mutually_exclusive_group()
     media_type_group.add_argument("--image-only", action="store_true",
@@ -105,7 +114,13 @@ Examples:
     export.add_argument("--config", required=False, default=None,
                         help="YAML config file (default: ./config.yaml)")
     export.add_argument("--recreate", action="store_true",
-                        help="Recreate Qdrant collections before exporting")
+                        help=(
+                            "Recreate Qdrant collections before exporting. "
+                            "Also the blunt repair for dangling search entries "
+                            "left by deletions that predate incremental "
+                            "tracking — the routine delta export does not "
+                            "retro-clean those."
+                        ))
     export.add_argument("--dry-run", action="store_true",
                         help="Analyse export readiness without writing")
     export.add_argument("--log-level",
@@ -225,6 +240,10 @@ def handle(args: argparse.Namespace) -> None:
         cfg.export_to_qdrant = getattr(args, "export_to_qdrant", False)
         cfg.image_only = getattr(args, "image_only", False)
         cfg.video_only = getattr(args, "video_only", False)
+        # CLI-only reconcile mode (like the reprocess flags): hash every file
+        # this run, repairing fingerprint state — the safety net for the
+        # size+mtime blind spot (M-8 plan §3.4).
+        cfg.verify_content = getattr(args, "verify_content", False)
 
         if getattr(args, "dry_run", False):
             run_dry_run(cfg)

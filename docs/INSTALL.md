@@ -156,6 +156,15 @@ your data.)
 
 Your media folders are never copied or written to.
 
+## Command-line tool (optional)
+
+The desktop app is self-contained, but power users can opt into an `msa`
+command for headless indexing (`msa index run`) and scripting. Open Settings →
+**Command-line tool** for a one-line command that links `msa` into your PATH
+(on macOS/Linux this is a symlink into `~/.local/bin`; on Windows it points at
+the tool inside the app-private runtime). Uninstalling the app removes the
+link. Headless Linux installs already put `msa` on the PATH.
+
 ## Updating
 
 The app never updates itself or checks for new versions in the background — you
@@ -175,11 +184,17 @@ preserves your config, index, and labeled people.
 Your media library is never touched by any of these steps.
 
 **macOS** — quit the app and drag **MediaSearchAgent** from Applications to
-the Trash. That removes the app itself; to reclaim the rest, delete the
-runtime and data folders listed in the
-[table above](#what-it-installs-and-where) — keep
-`~/Library/Application Support/MediaSearchAgent/` if you want your index and
-labeled people to survive a reinstall.
+the Trash. That removes the app itself but leaves the private runtime (Python,
+venv — several GB) and your data behind. To remove everything cleanly, run the
+uninstaller instead:
+
+```bash
+curl -fsSL https://github.com/openara-ai/media-search-agent/releases/latest/download/uninstall-desktop.sh | bash
+```
+
+It always removes the app and its private runtime, and *keeps* your index,
+configuration, and labeled people by default (pass `--remove-data` to delete
+those too). Settings → **Uninstall** shows this command in the app.
 
 **Windows** — **Settings → Apps → Installed apps → MediaSearchAgent →
 Uninstall**. This removes the app and its private runtime (Python, venv,
@@ -235,7 +250,9 @@ zero items and zero progress at all, check that the path you added is
 readable and contains supported formats (`.jpg`, `.jpeg`, `.png`, `.heic`,
 `.mp4`, `.mov`).
 
-For anything not covered here, check [the FAQ](FAQ.md) or open an issue on
+For startup failures and reading the logs, see the
+[Troubleshooting guide](TROUBLESHOOTING.md). For anything else, check
+[the FAQ](FAQ.md) or open an issue on
 [GitHub](https://github.com/openara-ai/media-search-agent/issues).
 
 ## Install from source (developers)

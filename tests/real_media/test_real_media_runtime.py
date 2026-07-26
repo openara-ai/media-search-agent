@@ -200,14 +200,18 @@ class TestIndexedArtifacts:
     def test_image_embedding_matches_image_media_count(
         self, db_counts: dict[str, int], sqlite_conn: sqlite3.Connection
     ):
-        """Every image-typed media row should have a matching
-        image_embedding row (1:1 cardinality, FK ON DELETE CASCADE).
+        """Every image_embedding row should join to an image-typed media
+        row (no orphans; FK ON DELETE CASCADE intact). Tombstoned media
+        (deleted = 1, from the M-8 deletion sweep / supersede paths —
+        e.g. BVT Phase D) legitimately KEEP their embedding rows so a
+        reappearing file resurrects without re-embedding, so the join
+        deliberately does not filter on deleted.
         """
         joined = int(sqlite_conn.execute(
             """
             SELECT COUNT(*) FROM image_embedding ie
             JOIN media m ON m.media_id = ie.media_id
-            WHERE m.deleted = 0 AND m.mime LIKE 'image/%'
+            WHERE m.mime LIKE 'image/%'
             """
         ).fetchone()[0])
         assert joined == db_counts["image_embedding"], (
@@ -706,4 +710,290 @@ class TestPerBatchCommitTelemetry:
         ]
         assert not offending, (
             f"unexpected commit-overhead WARNING in indexer.log: {offending}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# M-8/S-1 — incremental indexing (BVT Phases C/D, plan §6.2). The harness
+# (run-local.sh / the bundle validators) performs the mutations and the
+# counter assertions; this class carries the API-side contracts so both BVT
+# layers reuse them. Gated on the harness signalling that the phases ran.
+# ---------------------------------------------------------------------------
+
+_INCREMENTAL_RAN = os.environ.get("MSA_REALDATA_INCREMENTAL", "0") == "1"
+_SEED_MOVED_NAME = "incremental_seed_image_02.jpg"
+_SEED_MOVED_REL = "incremental/moved/incremental_seed_image_02.jpg"
+_SEED_DELETED_VIDEO = "incremental_seed_video_01.mp4"
+
+
+@pytest.mark.skipif(
+    not _INCREMENTAL_RAN,
+    reason="incremental Phases C/D did not run (MSA_REALDATA_INCREMENTAL != 1)",
+)
+class TestIncrementalIndexing:
+    def _live_row_by_rel(self, sqlite_conn, name: str):
+        return sqlite_conn.execute(
+            "SELECT media_id, rel_path, path FROM media WHERE rel_path LIKE ? AND deleted = 0",
+            (f"%{name}",),
+        ).fetchall()
+
+    def test_moved_image_row_points_at_new_location(self, sqlite_conn: sqlite3.Connection):
+        live = self._live_row_by_rel(sqlite_conn, _SEED_MOVED_NAME)
+        assert live, f"no live media row for moved seed {_SEED_MOVED_NAME}"
+        assert live[0][1] == _SEED_MOVED_REL, (
+            f"moved image rel_path is {live[0][1]!r}, expected {_SEED_MOVED_REL!r}"
+        )
+
+    def test_deleted_video_tombstoned_in_db(self, sqlite_conn: sqlite3.Connection):
+        rows = sqlite_conn.execute(
+            "SELECT media_id, deleted FROM media WHERE rel_path LIKE ?",
+            (f"%{_SEED_DELETED_VIDEO}",),
+        ).fetchall()
+        assert rows, f"no media row at all for deleted seed {_SEED_DELETED_VIDEO}"
+        assert all(r[1] for r in rows), (
+            f"deleted seed video still has live rows: {[r[0] for r in rows if not r[1]]}"
+        )
+
+    @pytest.mark.skipif(
+        _api_base_url() is None,
+        reason="API runtime checks skipped because MSA_REALDATA_BASE_URL is not set",
+    )
+    def test_moved_image_served_at_new_path_via_api(self, sqlite_conn: sqlite3.Connection):
+        live = self._live_row_by_rel(sqlite_conn, _SEED_MOVED_NAME)
+        assert live, f"no live media row for moved seed {_SEED_MOVED_NAME}"
+        media_id = live[0][0]
+        status, payload = _json_request(f"{_api_base_url()}/media/{media_id}/info")
+        assert status == 200
+        api_path = str(payload.get("path") or "")
+        assert api_path.replace("\\", "/").endswith(_SEED_MOVED_REL), (
+            f"/media info path {api_path!r} does not reflect the move to {_SEED_MOVED_REL!r}"
+        )
+
+    @pytest.mark.skipif(
+        _api_base_url() is None,
+        reason="API runtime checks skipped because MSA_REALDATA_BASE_URL is not set",
+    )
+    def test_deleted_video_absent_from_media_listing(self, sqlite_conn: sqlite3.Connection):
+        rows = sqlite_conn.execute(
+            "SELECT media_id FROM media WHERE rel_path LIKE ?",
+            (f"%{_SEED_DELETED_VIDEO}",),
+        ).fetchall()
+        assert rows, f"no media row for deleted seed {_SEED_DELETED_VIDEO}"
+        deleted_ids = {str(r[0]) for r in rows}
+        status, payload = _json_request(
+            f"{_api_base_url()}/media?media_type=video&limit=200"
+        )
+        assert status == 200
+        listed_ids = {str(item.get("id")) for item in payload.get("items", [])}
+        leaked = deleted_ids & listed_ids
+        assert not leaked, f"tombstoned video leaked into /media listing: {leaked}"
+
+    @pytest.mark.skipif(
+        _api_base_url() is None,
+        reason="API runtime checks skipped because MSA_REALDATA_BASE_URL is not set",
+    )
+    def test_deleted_video_absent_from_search(self, sqlite_conn: sqlite3.Connection):
+        """R6: the tombstoned video's Qdrant points survive until the delta
+        export ships, so the query-path deleted-media filter must drop it."""
+        rows = sqlite_conn.execute(
+            "SELECT media_id FROM media WHERE rel_path LIKE ?",
+            (f"%{_SEED_DELETED_VIDEO}",),
+        ).fetchall()
+        assert rows, f"no media row for deleted seed {_SEED_DELETED_VIDEO}"
+        deleted_ids = {str(r[0]) for r in rows}
+        status, payload = _json_request(
+            f"{_api_base_url()}/search",
+            method="POST",
+            payload={"q": "riding outdoors video"},
+        )
+        assert status == 200
+        results = payload.get("results", payload if isinstance(payload, list) else [])
+        result_ids = {str(r.get("id")) for r in results}
+        leaked = deleted_ids & result_ids
+        assert not leaked, f"tombstoned video leaked into /search results: {leaked}"
+
+
+# ---------------------------------------------------------------------------
+# M-8/S-2 — search availability through a full indexing run (plan §6.2).
+# The Qdrant lock window shrinks to the export step via the sentinel-file
+# handshake; this gate proves it end-to-end: with the API up and fixtures
+# indexed, mutate one staged seed, start a run through the API, and keep
+# searching for the whole run. Gated on the harness setting
+# MSA_REALDATA_SEARCH_DURING_INDEXING=1 (run-local.sh and the three bundle
+# validators do; plain pytest / --skip-index stay green via skip).
+# ---------------------------------------------------------------------------
+
+_SEARCH_DURING_INDEXING = os.environ.get("MSA_REALDATA_SEARCH_DURING_INDEXING", "0") == "1"
+_S2_MUTATE_NAME = "incremental_seed_image_01.jpg"
+# Phases where the handshake guarantees search serves the pre-run index.
+# "exporting" (lock window), "export_blocked", and "complete" (emitted just
+# before the export phase marker and re-emitted after it) are excluded from
+# the non-empty requirement; None means the first summary hasn't landed yet.
+_S2_PRE_EXPORT_PHASES = {"counting", "analyzing", "processing", "commit_stats", None}
+_S2_RUN_DEADLINE_SECONDS = 1500
+
+
+@pytest.mark.skipif(
+    not _SEARCH_DURING_INDEXING,
+    reason="search-during-indexing gate did not run (MSA_REALDATA_SEARCH_DURING_INDEXING != 1)",
+)
+@pytest.mark.skipif(
+    _api_base_url() is None,
+    reason="search-during-indexing gate requires a live API (MSA_REALDATA_BASE_URL)",
+)
+class TestSearchDuringIndexing:
+    @pytest.fixture(scope="class")
+    def run_evidence(self, fixture_root: Path) -> dict:
+        """Drive one full API-started indexing run while polling /search.
+
+        Orchestration: EXIF re-inject one staged seed (the S-1 Phase D
+        idiom, distinct Artist value so the content hash changes), POST
+        /indexer/start, then sample /search every 2 s bracketed by
+        /indexer/status reads until the run leaves 'running'. Evidence is
+        returned for the assertion methods below.
+        """
+        import subprocess
+
+        base = _api_base_url()
+
+        status, payload = _json_request(f"{base}/indexer/status")
+        assert status == 200, f"/indexer/status failed: {payload}"
+        assert payload.get("status") != "running", (
+            "an indexer run is already active — the gate needs to own the whole run"
+        )
+
+        seed = fixture_root / "incremental" / _S2_MUTATE_NAME
+        assert seed.exists(), (
+            f"staged seed fixture missing: {seed} — was incremental-phases.sh seed run?"
+        )
+        subprocess.run(
+            [
+                "exiftool", "-overwrite_original",
+                "-Artist=MSA-BVT-S2-SearchDuringIndexing", str(seed),
+            ],
+            check=True, capture_output=True,
+        )
+
+        status, payload = _json_request(f"{base}/indexer/start", method="POST")
+        assert status == 200, f"POST /indexer/start failed: {payload}"
+
+        samples: list[dict] = []
+        final_status: dict | None = None
+        deadline = time.monotonic() + _S2_RUN_DEADLINE_SECONDS
+        while time.monotonic() < deadline:
+            st_code, st = _json_request(f"{base}/indexer/status")
+            assert st_code == 200
+            if st.get("status") != "running":
+                final_status = st
+                break
+            phase_before = (st.get("summary") or {}).get("phase")
+            s_code, s_payload = _json_request(
+                f"{base}/search", method="POST", payload={"q": "dog"}
+            )
+            st2_code, st2 = _json_request(f"{base}/indexer/status")
+            assert st2_code == 200
+            phase_after = (st2.get("summary") or {}).get("phase")
+            results = s_payload.get("results") if isinstance(s_payload, dict) else None
+            samples.append(
+                {
+                    "phase_before": phase_before,
+                    "phase_after": phase_after,
+                    "http_status": s_code,
+                    "result_count": len(results) if isinstance(results, list) else -1,
+                }
+            )
+            time.sleep(2)
+        assert final_status is not None, (
+            f"indexer run did not finish within {_S2_RUN_DEADLINE_SECONDS}s"
+        )
+
+        lg_code, lg_payload = _json_request(f"{base}/indexer/log?lines=4000")
+        assert lg_code == 200
+        log_lines = list(lg_payload.get("lines") or [])
+
+        post_code, post_payload = _json_request(
+            f"{base}/search", method="POST", payload={"q": "landscape"}
+        )
+
+        return {
+            "samples": samples,
+            "final": final_status,
+            "log": log_lines,
+            "post_search_status": post_code,
+            "post_search": post_payload,
+        }
+
+    def test_every_search_response_is_200(self, run_evidence: dict):
+        bad = [s for s in run_evidence["samples"] if s["http_status"] != 200]
+        assert not bad, f"non-200 /search responses during the run: {bad}"
+
+    def test_search_nonempty_during_pre_export_phases(self, run_evidence: dict):
+        """Search must serve the pre-run index for the whole long tail of the
+        run — only the export window may return empty results."""
+        pre_export = [
+            s
+            for s in run_evidence["samples"]
+            if s["phase_before"] in _S2_PRE_EXPORT_PHASES
+            and s["phase_after"] in _S2_PRE_EXPORT_PHASES
+        ]
+        assert pre_export, (
+            "no /search sample landed fully inside a pre-export phase — with "
+            "model cold-load in the subprocess this window is minutes long, so "
+            f"an empty set means the gate is broken. samples={run_evidence['samples']}"
+        )
+        empty = [s for s in pre_export if s["result_count"] <= 0]
+        assert not empty, (
+            f"/search returned empty results during pre-export phases: {empty} "
+            "(the API surrendered the Qdrant lock outside the export window)"
+        )
+
+    def test_run_reached_complete_with_counters(self, run_evidence: dict):
+        final = run_evidence["final"]
+        assert final.get("status") == "complete", f"terminal status: {final}"
+        summary = final.get("summary") or {}
+        assert summary.get("phase") == "complete", (
+            f"terminal summary phase is {summary.get('phase')!r} — the pipeline "
+            "must re-emit the complete payload after the export (plan §3.4)"
+        )
+        for key in ("total_found", "files_hashed", "fingerprint_hits"):
+            assert key in summary, f"terminal complete summary lost counter {key!r}"
+
+    def test_mutated_content_searchable_after_run(self, run_evidence: dict):
+        assert run_evidence["post_search_status"] == 200
+        results = (run_evidence["post_search"] or {}).get("results")
+        assert isinstance(results, list) and results, "post-run /search returned no results"
+        names = _result_filenames(results)
+        assert _S2_MUTATE_NAME in names, (
+            f"mutated seed {_S2_MUTATE_NAME} not in post-run search results: {names}"
+        )
+
+    def test_handshake_lines_present_in_order(self, run_evidence: dict):
+        lines = run_evidence["log"]
+
+        def first_index(needle: str) -> int:
+            for i, line in enumerate(lines):
+                if needle in line:
+                    return i
+            return -1
+
+        i_request = first_index("Qdrant handoff: request written")
+        i_granted = first_index("Qdrant handoff: granted")
+        i_export = first_index("Exporting indexed items to Qdrant")
+        i_released = first_index("Qdrant handoff: released")
+        assert i_request >= 0, "missing handshake line: request written"
+        assert i_granted >= 0, (
+            "missing handshake line: granted — the API watcher never answered "
+            "(the run would have proceeded on the timeout path)"
+        )
+        assert i_export >= 0, "missing export line"
+        assert i_released >= 0, "missing handshake line: released"
+        assert i_request < i_granted < i_export < i_released, (
+            f"handshake lines out of order: request={i_request} granted={i_granted} "
+            f"export={i_export} released={i_released}"
+        )
+
+    def test_no_embedded_lock_contention_in_run_log(self, run_evidence: dict):
+        contended = [l for l in run_evidence["log"] if "already accessed by another instance" in l]
+        assert not contended, (
+            f"embedded-Qdrant lock contention during the run: {contended}"
         )

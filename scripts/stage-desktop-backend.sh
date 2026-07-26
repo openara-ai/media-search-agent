@@ -206,8 +206,9 @@ stage_exiftool() {
   # Platform-split (mirrors stage_uv/stage_mediainfo). The pure-Perl exiftool script is only
   # runnable where a system Perl exists — macOS/Linux. Windows has no system Perl and the desktop
   # sidecar's shutil.which("exiftool") won't resolve an extensionless Perl script, so Windows must
-  # stage the NATIVE build (exiftool.exe + its sibling exiftool_files/ runtime), exactly like the
-  # shell bundle at installer/windows-native/shell/build-bundle.sh step [4/5].
+  # stage the NATIVE build (exiftool.exe + its sibling exiftool_files/ runtime). (The legacy Windows
+  # shell bundle that first proved this out was retired in M-7/S-5.5; this staging is now the sole
+  # Windows exiftool path.)
   local plat tmp
   plat="$(detect_platform)"
   mkdir -p "$BIN_DIR"

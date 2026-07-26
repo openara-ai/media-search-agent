@@ -35,6 +35,11 @@ on:
         required: false
         default: false
         type: boolean
+      artifact_version:
+        description: "Optional SemVer prerelease for uploaded desktop installers (for example, 0.4.3-bvt.1). Leave empty for the normal 0.0.0 BVT version."
+        required: false
+        default: ""
+        type: string
 
 jobs:
   # ── React UI (built once for the Linux shell-bundle job) ─────────────────────
@@ -205,6 +210,21 @@ jobs:
         with:
           version: '0.5.21'
 
+      - name: Configure BVT artifact version
+        shell: bash
+        env:
+          ARTIFACT_VERSION: ${{ inputs.artifact_version }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$ARTIFACT_VERSION" ]]; then
+            ARTIFACT_VERSION="0.0.0"
+          elif [[ ! "$ARTIFACT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$ ]]; then
+            echo "::error::artifact_version must be a SemVer prerelease such as 0.4.3-bvt.1"
+            exit 1
+          fi
+          echo "Building desktop BVT artifact version $ARTIFACT_VERSION"
+          echo "MSA_STAGE_VERSION=$ARTIFACT_VERSION" >> "$GITHUB_ENV"
+
       - name: Stage desktop backend (uv + backend tree + tools + version stamp)
         shell: bash
         run: bash scripts/stage-desktop-backend.sh
@@ -276,6 +296,21 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           version: '0.5.21'
+
+      - name: Configure BVT artifact version
+        shell: bash
+        env:
+          ARTIFACT_VERSION: ${{ inputs.artifact_version }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$ARTIFACT_VERSION" ]]; then
+            ARTIFACT_VERSION="0.0.0"
+          elif [[ ! "$ARTIFACT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$ ]]; then
+            echo "::error::artifact_version must be a SemVer prerelease such as 0.4.3-bvt.1"
+            exit 1
+          fi
+          echo "Building desktop BVT artifact version $ARTIFACT_VERSION"
+          echo "MSA_STAGE_VERSION=$ARTIFACT_VERSION" >> "$GITHUB_ENV"
 
       - name: Stage desktop backend (uv + backend tree + tools + version stamp)
         shell: bash

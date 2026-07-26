@@ -1,10 +1,72 @@
+import os
 from types import SimpleNamespace
 import numpy as np
 from PIL import Image
 import pytest
 
 
-class _FakeSQLiteStore:
+class _FingerprintNoOpsMixin:
+    """M-8 fingerprint fast-path store methods as no-ops (fakes pretend the
+    fingerprint table is empty, so every file goes through the hash path)."""
+
+    def begin_scan_run(self):
+        return 1
+
+    def complete_scan_run(self, _scan_id, _sources_json):
+        pass
+
+    def get_fingerprint(self, _source_name, _rel_path):
+        return None
+
+    def upsert_fingerprint(self, *_args, **_kwargs):
+        pass
+
+    def mark_fingerprints_seen(self, _scan_id, _keys):
+        pass
+
+    def delete_fingerprint(self, _source_name, _rel_path):
+        pass
+
+    def count_fingerprints_for_media(self, _media_id):
+        return 0
+
+    def get_live_fingerprints_for_media(self, _media_id):
+        return []
+
+    def find_media_by_id_any(self, _media_id):
+        return None
+
+    def iter_stale_fingerprints(self, _source_name, _scan_id):
+        return []
+
+    def iter_legacy_orphan_media(self, _source_name):
+        return []
+
+    def set_fingerprint_missing(self, *_args):
+        pass
+
+    def set_media_missing_since(self, *_args):
+        pass
+
+    def tombstone_media(self, _media_id):
+        pass
+
+    def resurrect_media(self, _media_id):
+        pass
+
+
+def _patch_walk(monkeypatch, pipeline, paths):
+    """Patch both the count-phase walk (iter_media) and the main-loop walk
+    (iter_media_entries, which yields (path, stat) tuples)."""
+    monkeypatch.setattr(pipeline, "iter_media", lambda *_a, **_k: list(paths))
+    monkeypatch.setattr(
+        pipeline,
+        "iter_media_entries",
+        lambda *_a, **_k: [(p, os.stat(p)) for p in paths],
+    )
+
+
+class _FakeSQLiteStore(_FingerprintNoOpsMixin):
     _state = {
         "index_version_seq": 0,
         "index_version_ts": None,
@@ -93,7 +155,7 @@ class _FakeFaissStore:
             raise RuntimeError("FAISS save failed")
 
 
-class _FakeSQLiteStoreNeedsProcessing:
+class _FakeSQLiteStoreNeedsProcessing(_FingerprintNoOpsMixin):
     _state = {
         "index_version_seq": 0,
         "index_version_ts": None,
@@ -231,7 +293,7 @@ def test_complete_summary_counts_up_to_date_videos(tmp_path, monkeypatch):
     summaries: list[dict] = []
 
     monkeypatch.setattr(pipeline, "resolve_for_access", lambda p: p)
-    monkeypatch.setattr(pipeline, "iter_media", lambda *_args, **_kwargs: [image_path, video_path])
+    _patch_walk(monkeypatch, pipeline, [image_path, video_path])
     monkeypatch.setattr(pipeline, "sha256_of_file", lambda p: "img-id" if p.suffix.lower() == ".jpg" else "vid-id")
     monkeypatch.setattr(pipeline, "get_video_meta", lambda _p, **_kwargs: {"duration": 5.0})
     monkeypatch.setattr(pipeline, "SQLiteStore", _FakeSQLiteStore)
@@ -267,6 +329,17 @@ def test_complete_summary_counts_up_to_date_videos(tmp_path, monkeypatch):
     assert complete["skipped"] == 2
     assert complete["processed_images"] == 0
     assert complete["processed_videos"] == 0
+    # M-8 §3.6: additive fingerprint fast-path counters are always present
+    for key in (
+        "fingerprint_hits",
+        "files_hashed",
+        "moves_detected",
+        "superseded",
+        "missing_marked",
+        "tombstoned",
+        "resurrected",
+    ):
+        assert key in complete, f"complete payload missing {key}"
 
 
 def test_noop_run_skips_qdrant_export_by_default(tmp_path, monkeypatch):
@@ -280,7 +353,7 @@ def test_noop_run_skips_qdrant_export_by_default(tmp_path, monkeypatch):
     export_calls = []
 
     monkeypatch.setattr(pipeline, "resolve_for_access", lambda p: p)
-    monkeypatch.setattr(pipeline, "iter_media", lambda *_args, **_kwargs: [image_path, video_path])
+    _patch_walk(monkeypatch, pipeline, [image_path, video_path])
     monkeypatch.setattr(pipeline, "sha256_of_file", lambda p: "img-id" if p.suffix.lower() == ".jpg" else "vid-id")
     monkeypatch.setattr(pipeline, "get_video_meta", lambda _p, **_kwargs: {"duration": 5.0})
     monkeypatch.setattr(pipeline, "SQLiteStore", _FakeSQLiteStore)
@@ -330,11 +403,7 @@ def test_video_gps_track_extraction_is_limited_to_gopro_names(tmp_path, monkeypa
     gps_track_calls = []
 
     monkeypatch.setattr(pipeline, "resolve_for_access", lambda p: p)
-    monkeypatch.setattr(
-        pipeline,
-        "iter_media",
-        lambda *_args, **_kwargs: [regular_video, gopro_video, renamed_gopro_video],
-    )
+    _patch_walk(monkeypatch, pipeline, [regular_video, gopro_video, renamed_gopro_video])
     monkeypatch.setattr(
         pipeline,
         "sha256_of_file",
@@ -405,7 +474,7 @@ def test_changed_run_auto_exports_to_qdrant(tmp_path, monkeypatch):
     export_calls = []
 
     monkeypatch.setattr(pipeline, "resolve_for_access", lambda p: p)
-    monkeypatch.setattr(pipeline, "iter_media", lambda *_args, **_kwargs: [image_path])
+    _patch_walk(monkeypatch, pipeline, [image_path])
     monkeypatch.setattr(pipeline, "sha256_of_file", lambda _p: "img-id")
     monkeypatch.setattr(pipeline, "get_exif_basic", lambda _p: {})
     monkeypatch.setattr(pipeline, "write_thumbnail", lambda *_args, **_kwargs: None)
@@ -453,7 +522,7 @@ def test_force_export_runs_even_when_no_processing_was_needed(tmp_path, monkeypa
     export_calls = []
 
     monkeypatch.setattr(pipeline, "resolve_for_access", lambda p: p)
-    monkeypatch.setattr(pipeline, "iter_media", lambda *_args, **_kwargs: [image_path, video_path])
+    _patch_walk(monkeypatch, pipeline, [image_path, video_path])
     monkeypatch.setattr(pipeline, "sha256_of_file", lambda p: "img-id" if p.suffix.lower() == ".jpg" else "vid-id")
     monkeypatch.setattr(pipeline, "get_video_meta", lambda _p, **_kwargs: {"duration": 5.0})
     monkeypatch.setattr(pipeline, "SQLiteStore", _FakeSQLiteStore)
@@ -509,7 +578,7 @@ def test_stop_requested_still_exports_after_local_index_changes(tmp_path, monkey
     stop_event = _StopAfterFirstFile()
 
     monkeypatch.setattr(pipeline, "resolve_for_access", lambda p: p)
-    monkeypatch.setattr(pipeline, "iter_media", lambda *_args, **_kwargs: [image_path])
+    _patch_walk(monkeypatch, pipeline, [image_path])
     monkeypatch.setattr(pipeline, "sha256_of_file", lambda _p: "img-id")
     monkeypatch.setattr(pipeline, "get_exif_basic", lambda _p: {})
     monkeypatch.setattr(pipeline, "write_thumbnail", lambda *_args, **_kwargs: None)
@@ -563,7 +632,7 @@ def test_stale_qdrant_state_triggers_export_even_without_local_changes(tmp_path,
     }
 
     monkeypatch.setattr(pipeline, "resolve_for_access", lambda p: p)
-    monkeypatch.setattr(pipeline, "iter_media", lambda *_args, **_kwargs: [image_path, video_path])
+    _patch_walk(monkeypatch, pipeline, [image_path, video_path])
     monkeypatch.setattr(pipeline, "sha256_of_file", lambda p: "img-id" if p.suffix.lower() == ".jpg" else "vid-id")
     monkeypatch.setattr(pipeline, "SQLiteStore", _FakeSQLiteStore)
     monkeypatch.setattr(pipeline, "ClipEmbedder", _FakeClipEmbedder)

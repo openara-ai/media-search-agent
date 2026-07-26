@@ -2,14 +2,21 @@ name: CI
 
 # ── When each job runs ─────────────────────────────────────────────────────
 # pull_request  → test (ubuntu fast) only — cheap, fast feedback on every PR
-# push to main  → test + integration (ubuntu) + windows-test — fuller check
-# workflow_dispatch → all jobs, including macOS and Windows — manual pre-release gate
+# push to main  → test + integration (ubuntu) — fast + full Linux checks
+# workflow_dispatch → test + integration (Linux) by default; check full_gate to also
+#                     run the macOS + Windows jobs (the full pre-release gate)
 # tag push (v*)  → handled entirely by release.yml; ci.yml is skipped
 #
-# Note: windows-test does NOT run on pull_request (only push/workflow_dispatch).
-# This is intentional — Windows runners are slow and expensive. A PR can
-# introduce Windows-specific breakage that only surfaces post-merge on main.
-# The release.yml gate ensures no installer ships if windows-test fails.
+# Windows is NO LONGER run on every push here — Windows runners are slow and
+# metered, and the release.yml gate already blocks shipping a broken installer.
+# Automatic Windows validation moved to windows-ci.yml (Windows-path-triggered).
+# windows-test remains below as part of the manual full gate — a workflow_dispatch
+# with full_gate=true still exercises every OS.
+#
+# concurrency: a newer run cancels an in-flight one in the same ref+event group,
+# so a burst of pushes stops stacking N full CI runs — while a push can NOT
+# cancel an in-flight workflow_dispatch (the pre-release gate is a separate
+# event group, so it always runs to completion).
 # ──────────────────────────────────────────────────────────────────────────
 
 on:
@@ -19,15 +26,39 @@ on:
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      full_gate:
+        description: 'Also run the macOS + Windows jobs (the full pre-release gate). Off = Linux only.'
+        type: boolean
+        default: false
+
+concurrency:
+  # Include event_name so a push never shares a group with a workflow_dispatch
+  # run on the same ref — otherwise a routine push to main would cancel the
+  # manual pre-release gate (windows-test / macos-test / macos-setup) mid-flight.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
 
 jobs:
   test:
     name: Quick Tests
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","x64"]') }}
     timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Assert LAN isolation (in-job, DESIGN §7.1/§7.6)
+        run: |
+          fail=0
+          for pair in ${LAN_PROBES}; do
+            h=${pair%%:*}; p=${pair##*:}
+            timeout 3 bash -c "cat </dev/tcp/$h/$p" 2>/dev/null && { echo "BREACH $h:$p"; fail=1; } || echo "ok: $h:$p blocked"
+          done
+          curl -sf --max-time 5 https://api.github.com >/dev/null || { echo "EGRESS BROKEN"; fail=1; }
+          exit $fail
+        env:
+          LAN_PROBES: ${{ vars.LAN_PROBES }}
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -54,15 +85,36 @@ jobs:
             ${{ runner.os }}-pip-ci-
 
       - name: Install system tools
+        if: runner.environment == 'github-hosted'   # VM pre-provisions these; runner user has no sudo
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg mediainfo
+
+      - name: Install pinned exiftool (sudo-less; runs on both runner types)
+        # exiftool is pure-Perl, so install the scripts/versions.env-pinned version
+        # into $HOME and prepend it to PATH — no sudo needed, so this works on the
+        # self-hosted VM (runner user has no sudo) too, not just GitHub-hosted. Keeping
+        # ONE pinned version everywhere is required: GPS metadata support (via exifread)
+        # depends on a specific exiftool version, and version drift across platforms
+        # silently broke it. $GITHUB_PATH prepend makes it win over any distro exiftool.
+        run: |
           ETVER="$(awk -F= '/^EXIFTOOL_VERSION=/{print $2}' scripts/versions.env)"
-          curl -fsSL "https://github.com/exiftool/exiftool/archive/refs/tags/${ETVER}.tar.gz" -o /tmp/exiftool.tgz
-          sudo tar -xzf /tmp/exiftool.tgz -C /opt
-          sudo chmod +x "/opt/exiftool-${ETVER}/exiftool"
-          sudo ln -sf "/opt/exiftool-${ETVER}/exiftool" /usr/local/bin/exiftool
-          exiftool -ver
+          EXIFTOOL_DIR="$HOME/.local/exiftool"
+          # Persistent self-hosted runners keep $HOME across jobs, so: (1) skip the
+          # download when the pinned version is already staged (mirrors tools.sh
+          # install_exiftool_linux — keeps "cheap, fast feedback" cheap); (2) on a
+          # version change, wipe the dir FIRST so an orphaned file from the previous
+          # tarball can't linger and get loaded by Perl (anti-stale, per
+          # stage-desktop-backend.sh) — which would silently reintroduce version drift.
+          if [ "$("$EXIFTOOL_DIR/exiftool" -ver 2>/dev/null)" != "$ETVER" ]; then
+            rm -rf "$EXIFTOOL_DIR"
+            mkdir -p "$EXIFTOOL_DIR"
+            curl -fsSL "https://github.com/exiftool/exiftool/archive/refs/tags/${ETVER}.tar.gz" -o /tmp/exiftool.tgz
+            tar -xzf /tmp/exiftool.tgz -C "$EXIFTOOL_DIR" --strip-components=1
+            chmod +x "$EXIFTOOL_DIR/exiftool"
+          fi
+          echo "$EXIFTOOL_DIR" >> "$GITHUB_PATH"   # $GITHUB_PATH is per-job; append every run
+          "$EXIFTOOL_DIR/exiftool" -ver
 
       - name: Install CI dependencies
         run: |
@@ -99,20 +151,38 @@ jobs:
         run: |
           python -m pytest tests/ -v -m "not slow"
 
+  # Automatic Windows validation lives in windows-ci.yml (Windows-path-triggered).
+  # Here windows-test runs only as part of the manual full gate, so a
+  # workflow_dispatch of ci.yml still exercises every platform before a release.
+  # (macos-test / macos-setup below are dispatch-only for the same reason —
+  # heavy runners off the per-push path.)
   windows-test:
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.full_gate
     uses: ./.github/workflows/windows-test.yml
 
   integration:
     name: Full Integration
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["self-hosted","linux","x64"]') }}
     timeout-minutes: 60
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Assert LAN isolation (in-job, DESIGN §7.1/§7.6)
+        run: |
+          fail=0
+          for pair in ${LAN_PROBES}; do
+            h=${pair%%:*}; p=${pair##*:}
+            timeout 3 bash -c "cat </dev/tcp/$h/$p" 2>/dev/null && { echo "BREACH $h:$p"; fail=1; } || echo "ok: $h:$p blocked"
+          done
+          curl -sf --max-time 5 https://api.github.com >/dev/null || { echo "EGRESS BROKEN"; fail=1; }
+          exit $fail
+        env:
+          LAN_PROBES: ${{ vars.LAN_PROBES }}
+
       - name: Free up disk space
+        if: runner.environment == 'github-hosted'
         run: |
           # Remove unnecessary packages to free up ~10GB
           sudo rm -rf /usr/share/dotnet
@@ -136,15 +206,36 @@ jobs:
             ${{ runner.os }}-pip-integration-
 
       - name: Install system tools
+        if: runner.environment == 'github-hosted'   # VM pre-provisions these; runner user has no sudo
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg mediainfo
+
+      - name: Install pinned exiftool (sudo-less; runs on both runner types)
+        # exiftool is pure-Perl, so install the scripts/versions.env-pinned version
+        # into $HOME and prepend it to PATH — no sudo needed, so this works on the
+        # self-hosted VM (runner user has no sudo) too, not just GitHub-hosted. Keeping
+        # ONE pinned version everywhere is required: GPS metadata support (via exifread)
+        # depends on a specific exiftool version, and version drift across platforms
+        # silently broke it. $GITHUB_PATH prepend makes it win over any distro exiftool.
+        run: |
           ETVER="$(awk -F= '/^EXIFTOOL_VERSION=/{print $2}' scripts/versions.env)"
-          curl -fsSL "https://github.com/exiftool/exiftool/archive/refs/tags/${ETVER}.tar.gz" -o /tmp/exiftool.tgz
-          sudo tar -xzf /tmp/exiftool.tgz -C /opt
-          sudo chmod +x "/opt/exiftool-${ETVER}/exiftool"
-          sudo ln -sf "/opt/exiftool-${ETVER}/exiftool" /usr/local/bin/exiftool
-          exiftool -ver
+          EXIFTOOL_DIR="$HOME/.local/exiftool"
+          # Persistent self-hosted runners keep $HOME across jobs, so: (1) skip the
+          # download when the pinned version is already staged (mirrors tools.sh
+          # install_exiftool_linux — keeps "cheap, fast feedback" cheap); (2) on a
+          # version change, wipe the dir FIRST so an orphaned file from the previous
+          # tarball can't linger and get loaded by Perl (anti-stale, per
+          # stage-desktop-backend.sh) — which would silently reintroduce version drift.
+          if [ "$("$EXIFTOOL_DIR/exiftool" -ver 2>/dev/null)" != "$ETVER" ]; then
+            rm -rf "$EXIFTOOL_DIR"
+            mkdir -p "$EXIFTOOL_DIR"
+            curl -fsSL "https://github.com/exiftool/exiftool/archive/refs/tags/${ETVER}.tar.gz" -o /tmp/exiftool.tgz
+            tar -xzf /tmp/exiftool.tgz -C "$EXIFTOOL_DIR" --strip-components=1
+            chmod +x "$EXIFTOOL_DIR/exiftool"
+          fi
+          echo "$EXIFTOOL_DIR" >> "$GITHUB_PATH"   # $GITHUB_PATH is per-job; append every run
+          "$EXIFTOOL_DIR/exiftool" -ver
 
       - name: Install all dependencies
         run: |
@@ -164,7 +255,7 @@ jobs:
     name: macOS Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.full_gate
     strategy:
       matrix:
         os: [macos-14]   # macos-14 = Apple Silicon M1 (macos-13/Intel retired by GitHub)
@@ -222,7 +313,7 @@ jobs:
     name: macOS Full Setup (macos-14)
     runs-on: macos-14
     timeout-minutes: 60
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.full_gate
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -347,39 +438,5 @@ jobs:
           if-no-files-found: ignore
           retention-days: 1
 
-  # ── macOS: build .pkg + .dmg installer (workflow_dispatch / pre-release) ───
-  macos-installer:
-    name: macOS Installer (.dmg)
-    runs-on: macos-14
-    timeout-minutes: 30
-    if: github.event_name == 'workflow_dispatch'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install build tools
-        run: brew install create-dmg
-        # Note: Platypus CLI requires interactive install from within Platypus.app
-        # so we skip it; build.sh falls back to building the .app bundle manually
-
-      - name: Build installer
-        run: bash installer/macos/build.sh --version 1.0.0
-
-      - name: Upload installer artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: MediaSearchAgent-macOS-Setup
-          path: dist/macos/MediaSearchAgent-*-Setup.dmg
-          if-no-files-found: error
-          retention-days: 1
-
-      - name: Upload build logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-installer-build-logs
-          path: |
-            build/macos/
-            /tmp/msa-*.log
-          if-no-files-found: ignore
-          retention-days: 1
+  # The legacy macOS .pkg/.dmg (Platypus) installer job was retired in M-7/S-5.5:
+  # macOS ships as the Tauri desktop app (build-desktop-macos in release.yml).

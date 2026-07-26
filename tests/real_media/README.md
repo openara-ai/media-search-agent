@@ -169,6 +169,13 @@ Driven by [`.github/workflows/bvt.yml`](../../.github/workflows/bvt.yml)
 on `workflow_dispatch` (and `workflow_call` from `release.yml`). Not wired to
 PRs while we're in pre-release; manually dispatched to control CI cost.
 
+For a downloadable desktop installer that can exercise a manual upgrade over an
+installed release, set the dispatch input `artifact_version` to a SemVer
+prerelease greater than the installed version (for example, `0.4.3-bvt.1` over
+`0.4.2`) and enable `upload_installer`. Leaving `artifact_version` empty keeps
+the routine BVT placeholder `0.0.0`. The input affects only `bvt.yml`; tagged
+release builds continue to derive their version from the release tag.
+
 ### Three contracts verified end-to-end
 
 1. **Bundle-install contract.** The tarball/zip produced by `build-bundle.sh`

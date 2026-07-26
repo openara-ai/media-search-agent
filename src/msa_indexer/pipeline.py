@@ -4,7 +4,7 @@ import re
 from PIL import Image
 from loguru import logger
 from .utils.logging import with_ctx
-from .io.scanner import iter_media
+from .io.scanner import ScanStats, iter_media, iter_media_entries
 from msa_settings.paths import resolve_for_access
 from .io.exif import get_exif_basic
 try:
@@ -23,7 +23,7 @@ from .io.video import (
 from .io.shot_detection import detect_shots
 from .io.thumbnails import write_thumbnail, write_video_thumbnail, write_face_thumbnail
 from .utils.hashes import sha256_of_file
-from .db.sqlite_store import SQLiteStore
+from .db.sqlite_store import SQLiteStore, media_path_rebuild_pending
 from .models.embeddings import ClipEmbedder
 from .models.objects import ObjectDetector
 from .db.qdrant_export import (
@@ -32,6 +32,7 @@ from .db.qdrant_export import (
     get_qdrant_export_version,
     record_qdrant_export_version,
 )
+from .db import qdrant_handoff
 
 IMAGE_EXT = {".jpg",".jpeg",".png",".heic",".tif",".tiff",".webp"}
 VIDEO_EXT = {".mp4",".mov",".m4v",".avi",".mkv",".wmv",".flv",".webm"}
@@ -39,6 +40,282 @@ VIDEO_EXT = {".mp4",".mov",".m4v",".avi",".mkv",".wmv",".flv",".webm"}
 
 def _emit_indexer_summary(**payload) -> None:
     logger.info(f"INDEXER_SUMMARY {json.dumps(payload, sort_keys=True)}")
+
+
+def _db_rel_path(p: Path, root: Path) -> str:
+    """The relative-path key stored in SQLite — POSIX form per ADR-007.
+
+    This is THE single computation shared by the fingerprint key
+    (file_fingerprint.rel_path) and the media upsert (media.rel_path);
+    the two must never diverge (M-8 plan §3.3). ``as_posix()`` keeps the
+    stored form forward-slashed on every platform (on Windows-native,
+    ``str(relative_to())`` would emit backslashes — an ADR-007 violation).
+    Not to be confused with the display-only relative path used for log
+    context.
+    """
+    try:
+        return p.relative_to(root).as_posix()
+    except Exception:
+        # Fallback: just the basename if the file is outside root somehow
+        return p.name
+
+
+def _object_detection_enabled(config) -> bool:
+    """Whether object detection will actually run this session.
+
+    THE single definition of the detector gate, shared by the detector-init
+    block below (``should_detect``) and the count-phase ETA. The count phase
+    needs it to tell whether an incomplete ``object_detection_done`` means real
+    work (stage enabled → not a free skip) or ~zero cost (stage disabled → the
+    main loop iterates the file but does no object work). Errs toward "enabled"
+    — a later init failure only makes the ETA an over-estimate, the safe
+    direction.
+    """
+    det_setting = getattr(config, "enable_object_detection", False)
+    on_cpu = getattr(config, "device", "cpu") == "cpu"
+    return det_setting is True or (det_setting == "auto" and not on_cpu)
+
+
+def _video_object_detection_enabled(config) -> bool:
+    """Whether object detection will actually run on VIDEOS this session.
+
+    THE single definition of the video-object gate, shared by the main loop's
+    ``enable_video_detection`` and the count-phase ETA. Object detection touches
+    a video only when the detector is active (``_object_detection_enabled``)
+    AND ``enable_video_object_detection`` is on — which DEFAULTS to off, so a
+    library indexed with image detection on but video detection off keeps every
+    video at ``object_detection_done = 0`` while the main loop does no video
+    object work. The count phase must therefore charge an un-done video object
+    stage as work only when this gate is on, or those videos re-inflate the ETA
+    #208 fixes. Video analog of the image-detector enablement gate (#208 review,
+    Codex P2). Errs toward "enabled" — an init failure only over-estimates.
+    """
+    return _object_detection_enabled(config) and bool(
+        getattr(config, "enable_video_object_detection", False)
+    )
+
+
+def _base_needs_flags(status, *, model_version, reprocess_gps, reprocess_objects,
+                      reprocess_faces, reprocess_embeddings):
+    """The main loop's base ``needs_*`` decision, factored into ONE place so the
+    count-phase ETA and the runtime skip can't silently diverge (#208 review).
+
+    ``status`` is a :meth:`SQLiteStore.get_processing_status` dict (empty for a
+    missing row). Returns ``(needs_gps, needs_objects, needs_faces,
+    needs_embeddings)``. Deliberately EXCLUDES the Stage-3 embedding-presence
+    backfill (``has_image_embedding`` / ``media_has_unembedded_keyframes``):
+    each caller applies that from its own source — the main loop lazily per
+    ``media_id``, the count phase from its bulk per-source snapshot.
+    """
+    needs_gps = reprocess_gps or not status.get("gps_processed", False)
+    needs_objects = reprocess_objects or not status.get("object_detection_done", False)
+    needs_faces = reprocess_faces or not status.get("face_detection_done", False)
+    needs_embeddings = reprocess_embeddings or (
+        status.get("embeddings_version") != model_version
+    )
+    return needs_gps, needs_objects, needs_faces, needs_embeddings
+
+
+def _video_skip_predicate(*, has_shots, has_keyframes, has_unembedded_keyframes,
+                          needs_embeddings, needs_objects, needs_faces,
+                          reprocess_embeddings, reprocess_objects) -> bool:
+    """THE single definition of the runtime's video no-op skip, shared by the
+    main loop's video branch and the count-phase ETA so neither re-derives (and
+    drifts from) the other (#208 review, Codex P2).
+
+    Videos are never stamped complete via ``media.embeddings_version`` the way
+    images are — ``mark_embeddings_done`` runs only in the image branch — so the
+    image-style ``embeddings_version != model_version`` gate reads as "needs
+    embeddings" for EVERY video forever. The runtime instead decides a video is
+    done from its keyframe/shot state: shots present AND keyframes present AND
+    every keyframe embedded (and, under the historical heuristic that keyframes
+    could not exist without their tags, keyframes-present ⇒ object detection done
+    — so object work is re-charged only when keyframes are ABSENT). This
+    reproduces the main loop's ``existing_shots and has_keyframes and not
+    (video_needs_embeddings or video_needs_objects or needs_faces)`` decision
+    exactly. Returns True iff the video branch would ``continue`` without work.
+
+    ``needs_embeddings`` / ``needs_objects`` / ``needs_faces`` are the shared
+    :func:`_base_needs_flags` outputs; ``reprocess_*`` force the corresponding
+    stage even on an otherwise-complete video (the count phase passes False — a
+    reprocess run never subtracts, it falls back to the full-library estimate).
+    """
+    needs_keyframe_emb_backfill = has_keyframes and has_unembedded_keyframes
+    video_needs_embeddings = (
+        not has_keyframes or reprocess_embeddings or needs_keyframe_emb_backfill
+    ) and needs_embeddings
+    video_needs_objects = (not has_keyframes or reprocess_objects) and needs_objects
+    return bool(has_shots) and bool(has_keyframes) and not (
+        video_needs_embeddings or video_needs_objects or needs_faces
+    )
+
+
+def _count_phase_expects_free_skip(snap, *, model_version, is_image, is_video,
+                                   objects_enabled, faces_enabled) -> bool:
+    """True iff a fingerprint stat-match on this media costs ~0 processing time
+    — the only case the count-phase ETA may subtract it as a free skip
+    (#208 review, Codex P2).
+
+    ``snap`` is a bulk-snapshot row from
+    :meth:`SQLiteStore.get_processing_snapshot_for_media_ids`
+    (``get_processing_status`` keys PLUS ``has_image_embedding`` and, for videos,
+    ``has_shots`` / ``has_keyframes`` / ``has_unembedded_keyframes``); ``None``
+    when no live media row exists — the main loop then treats the file as new
+    work, so it is NOT free.
+
+    Reuses the SHARED :func:`_base_needs_flags` for the ``needs_*`` computation,
+    then splits by media type so each path asks the SAME question the main loop
+    asks for that type — ending the recurring divergence where the count phase
+    re-derived a per-type skip rule and drifted from the runtime:
+
+    * **Videos** are never stamped via ``embeddings_version``; completeness is
+      decided by the SHARED :func:`_video_skip_predicate` — the identical helper
+      the main loop's video branch skips on — from keyframe/shot state, NOT the
+      permanently-"stale" ``embeddings_version`` gate. Because that predicate
+      already treats keyframes-present ⇒ object tags done, video object-detection
+      enablement never enters here (the runtime does not re-run object detection
+      on a video that already has keyframes).
+    * **Images** gate the object/face stages by whether they are ENABLED this
+      session (a disabled stage does no work even with its ``*_done`` flag at 0,
+      so it must not block the subtraction — otherwise a library indexed without
+      detection would never subtract), plus the Stage-3 ``has_image_embedding``
+      backfill.
+
+    GPS always runs when un-done (it precedes the video branch in the main loop),
+    so it blocks the subtraction for both types. Conservative by construction —
+    any uncertainty (missing snapshot, version drift, an enabled stage not yet
+    done, an unembedded image/keyframe, a video missing shots/keyframes) counts
+    the file as work, so the ETA errs toward OVER-estimate, never the 0-ETA
+    under-estimate.
+    """
+    if snap is None:
+        return False
+    needs_gps, needs_objects, needs_faces, needs_embeddings = _base_needs_flags(
+        snap,
+        model_version=model_version,
+        reprocess_gps=False,
+        reprocess_objects=False,
+        reprocess_faces=False,
+        reprocess_embeddings=False,
+    )
+    # GPS precedes the video branch and always runs when un-done — blocks both
+    # media types.
+    if needs_gps:
+        return False
+    if is_video:
+        # Videos: ask the SAME predicate the runtime video branch skips on, from
+        # keyframe/shot state — never the image-style embeddings_version gate,
+        # which is permanently "stale" for videos (mark_embeddings_done runs only
+        # for images). #208 review, Codex P2.
+        return _video_skip_predicate(
+            has_shots=snap.get("has_shots", False),
+            has_keyframes=snap.get("has_keyframes", False),
+            has_unembedded_keyframes=snap.get("has_unembedded_keyframes", False),
+            needs_embeddings=needs_embeddings,
+            needs_objects=needs_objects,
+            needs_faces=needs_faces,
+            reprocess_embeddings=False,
+            reprocess_objects=False,
+        )
+    # Images: Stage-3 embedding-presence backfill, then the enablement-gated
+    # object/face stages.
+    if not needs_embeddings and not snap.get("has_image_embedding", False):
+        needs_embeddings = True
+    if needs_embeddings:
+        return False
+    if objects_enabled and needs_objects:
+        return False
+    if faces_enabled and needs_faces:
+        return False
+    return True
+
+
+def _resolve_stored_media_path(media_row: dict, source_roots: dict) -> Path | None:
+    """Resolve a media row's CURRENT on-disk location for copy-vs-move.
+
+    Prefers ``(source_name, rel_path)`` joined onto the current resolved
+    source root (source roots remap across machines/mounts — the stored
+    absolute ``media.path`` can be stale while the file still exists under
+    the current root). Falls back to the raw stored path only when that
+    resolution is unavailable (M-8 plan §3.3 step 4).
+    """
+    src = media_row.get("source_name")
+    rel = media_row.get("rel_path")
+    if src and rel and src in source_roots:
+        return source_roots[src] / rel
+    raw = media_row.get("path")
+    if raw:
+        try:
+            return Path(resolve_for_access(str(raw)))
+        except Exception:
+            return None
+    return None
+
+
+def _canonical_path_still_holds(db, media_row: dict, current: Path, media_id: str) -> bool:
+    """True iff the canonical location still verifiably holds this media's bytes.
+
+    §3.3 step 4 refinement (review finding, P2): ``current.exists()`` alone
+    misclassifies content exchanges — when two already-indexed files swap
+    contents in one scan (or the canonical path is replaced and not yet
+    revisited), the canonical path still EXISTS but holds DIFFERENT bytes
+    whose fingerprint has not been refreshed; treating the file at hand as a
+    "copy" would then leave the media row pointing at foreign bytes. Trust
+    the canonical location only when its fingerprint row still records this
+    ``media_id`` AND the on-disk stat matches that row (the fast path's own
+    freshness contract). With no fingerprint row to consult (pre-M-8 rows
+    before lazy backfill), fall back to hashing the canonical file — the only
+    remaining way to verify identity, and self-liquidating once fingerprints
+    exist. On any mismatch return False: move semantics repoint the row, and
+    the mapping self-corrects when the exchanged path is itself visited.
+    """
+    try:
+        st = current.stat()
+    except OSError:
+        return False  # canonical path gone/unreadable → not a copy
+    src = media_row.get("source_name")
+    rel = media_row.get("rel_path")
+    fp = db.get_fingerprint(src, rel) if (src and rel) else None
+    if fp is not None:
+        return (
+            fp["media_id"] == media_id
+            and fp["size_bytes"] == st.st_size
+            and fp["mtime_ns"] == st.st_mtime_ns
+        )
+    try:
+        return sha256_of_file(current) == media_id
+    except OSError:
+        return False
+
+
+def _promote_surviving_path(db, media_id: str, survivors: list, source_roots: dict) -> bool:
+    """Repoint a media row at a surviving fingerprint path (R5 path promotion).
+
+    Called when the canonical ``(source_name, rel_path)`` no longer holds this
+    media's content but other fingerprint rows survive. The deletion sweep
+    (canonical copy deleted) and the fast path's supersede branch (canonical
+    copy replaced in place) share this exact logic so browse and file-serving
+    never resolve a media_id to another file's bytes. Returns True when the
+    media row was repointed.
+    """
+    promo = next((c for c in survivors if c["source_name"] in source_roots), None)
+    if promo is None:
+        logger.debug(
+            "Path promotion skipped for {} — no surviving fingerprint under "
+            "a resolvable source root",
+            media_id,
+        )
+        return False
+    promo_abs = source_roots[promo["source_name"]] / promo["rel_path"]
+    db.update_media_fields(
+        media_id,
+        {
+            "path": str(promo_abs),
+            "source_name": promo["source_name"],
+            "rel_path": promo["rel_path"],
+        },
+    )
+    return True
 
 
 def _parse_duration_token(token: str) -> float | None:
@@ -203,30 +480,142 @@ def run_index(config, stop_event=None):
     hist_img_time, hist_vid_time, hist_vid_time_per_min = _load_historical_perf(
         Path(getattr(config, "log_dir", "logs")) / "msa.log"
     )
+    # Fingerprint fast-path config (re-read into the setup block further down).
+    # Read here so the initial estimate can subtract the files that will hit
+    # the fast path (#208): on a stable library nearly every found file skips
+    # the hash+processing, so multiplying ALL found files by per-item time
+    # over-estimates the ETA by 100-1000x. With the kill switch off (or
+    # verify-content on) no fingerprint is consulted — fall back to the
+    # full-library estimate, which is then accurate because every file is hashed.
+    _incremental_cfg = getattr(config, 'incremental', None)
+    fingerprint_enabled = bool(getattr(_incremental_cfg, 'fingerprint_enabled', True))
+    verify_content = bool(getattr(config, 'verify_content', False))
     total_found = 0
     total_images_found = 0
     total_videos_found = 0
+    # Files whose stored (size, mtime) already matches the on-disk stat — the
+    # exact fast-path skip condition — so they cost ~0 processing time (#208).
+    expected_image_hits = 0
+    expected_video_hits = 0
     media_type_filter = None
     if getattr(config, 'image_only', False):
         media_type_filter = "image"
     elif getattr(config, 'video_only', False):
         media_type_filter = "video"
+    # A --reprocess-* run rides the fast path (stat match ⇒ no re-hash) but
+    # STILL does full GPS/object/face/embedding work on every matching file
+    # (#208 review, Codex P2): the flags force that work regardless of the
+    # fingerprint hit. Those files are NOT ~free, so they must not be
+    # subtracted — fall back to the full-library estimate, exactly like the
+    # kill-switch / verify-content path. (The rolling estimate further down
+    # observes the real reprocess work per file, so it stays accurate too.)
+    reprocess_active = any(
+        bool(getattr(config, flag, False))
+        for flag in ('reprocess_gps', 'reprocess_objects', 'reprocess_faces', 'reprocess_embeddings')
+    )
+    # Which stages will actually do work this session — the count phase must
+    # know so it doesn't treat an incomplete-but-DISABLED stage as blocking a
+    # free skip (a disabled detector does no work even when its *_done flag is
+    # 0). Reuses the SAME gate as the detector init below.
+    count_model_version = getattr(config, 'model_version', None)
+    objects_enabled = _object_detection_enabled(config)
+    faces_enabled = bool(getattr(config, 'enable_face_recognition', False))
+    # Bulk-load each source's fingerprints AND processing-status snapshot ONCE
+    # (no per-file SQL in the walk). Only when the fast path is actually armed
+    # AND no reprocess flag is set; guarded on the DB file existing so a
+    # first-ever run doesn't create an empty DB before init_schema and just
+    # uses the full estimate (correct — nothing cached).
+    fp_by_source: dict[str, dict[str, tuple]] = {}
+    snap_by_source: dict[str, dict[str, dict]] = {}
+    if (
+        fingerprint_enabled
+        and not verify_content
+        and not reprocess_active
+        and Path(config.sqlite_path).exists()
+    ):
+        # Construct INSIDE the try: SQLiteStore.__init__ opens the connection
+        # and runs PRAGMAs, which can raise on a corrupt/zero-byte DB that
+        # merely passes the .exists() check above (#208 review, P3). This block
+        # must never take down the run — any failure degrades to the
+        # full-library estimate, so the reader lives entirely within the guard
+        # and is closed in finally.
+        _fp_reader = None
+        try:
+            _fp_reader = SQLiteStore(config.sqlite_path)
+            for source in sources_to_index:
+                src_fps = _fp_reader.get_fingerprints_for_source(source.name)
+                fp_by_source[source.name] = src_fps
+                # Resolve the snapshot by the SET of media_ids THIS source's
+                # fingerprints reference — not by media.source_name — so a
+                # cross-source duplicate (media canonical in source A, fingerprint
+                # row in source B pointing at A's media_id) is still resolved and
+                # counts as a free skip, exactly as the main loop treats it
+                # (#208 review, Codex P2). fp tuple is (size, mtime_ns, media_id).
+                snap_by_source[source.name] = _fp_reader.get_processing_snapshot_for_media_ids(
+                    fp[2] for fp in src_fps.values()
+                )
+        except Exception as exc:
+            logger.debug(f"Fingerprint pre-count unavailable ({exc}); using full-library estimate")
+            fp_by_source = {}
+            snap_by_source = {}
+        finally:
+            if _fp_reader is not None:
+                _fp_reader.close()
     for source in sources_to_index:
         root = Path(resolve_for_access(str(source.path)))
-        for p in iter_media(root, media_type=media_type_filter, stop_event=stop_event):
+        src_fps = fp_by_source.get(source.name, {})
+        src_snap = snap_by_source.get(source.name, {})
+        for p, st in iter_media_entries(root, media_type=media_type_filter, stop_event=stop_event):
             ext = p.suffix.lower()
             total_found += 1
-            if ext in IMAGE_EXT:
+            is_image = ext in IMAGE_EXT
+            is_video = ext in VIDEO_EXT
+            if is_image:
                 total_images_found += 1
-            elif ext in VIDEO_EXT:
+            elif is_video:
                 total_videos_found += 1
-    est_img_time = total_images_found * hist_img_time
-    est_vid_time = total_videos_found * hist_vid_time
+            # Expected fast-path skip. Same rel-path key as the main-loop fast
+            # path (_db_rel_path, POSIX per ADR-007) so the two never disagree
+            # on which fingerprint row a file maps to.
+            rel_key = _db_rel_path(p, root)
+            fp = src_fps.get(rel_key)
+            # A stat match (stored size+mtime == on-disk) only means the main
+            # loop won't RE-HASH the file — it still runs needs_* after the hit.
+            # So this is a FREE skip only when the media is already fully
+            # processed under the current config (#208 review, Codex P2):
+            # otherwise a model_version bump or a newly-enabled face/object
+            # stage would subtract ~the whole library and report ~0s while real
+            # work runs. Resolve completeness by the fingerprint's media_id —
+            # the SAME key the main loop skips on (fp["media_id"]) — so every
+            # live duplicate path of one complete media_id is recognized as
+            # free, not just the canonical rel_path (#208 review, Codex P2).
+            # Gate on the shared needs_* logic (bulk snapshot, no per-file SQL);
+            # when in doubt, count as work (over-estimate).
+            if fp is not None and fp[0] == st.st_size and fp[1] == st.st_mtime_ns:
+                if _count_phase_expects_free_skip(
+                    src_snap.get(fp[2]),
+                    model_version=count_model_version,
+                    is_image=is_image,
+                    is_video=is_video,
+                    objects_enabled=objects_enabled,
+                    faces_enabled=faces_enabled,
+                ):
+                    if is_image:
+                        expected_image_hits += 1
+                    elif is_video:
+                        expected_video_hits += 1
+    # Estimate only the remainder — the files that will actually be hashed
+    # and (potentially) processed. Keep total_found / images_to_process /
+    # videos_to_process as the raw COUNTS found (unchanged meaning; the
+    # IndexerManager parser + BVT read them); refine only the ETA.
+    est_img_time = max(0, total_images_found - expected_image_hits) * hist_img_time
+    est_vid_time = max(0, total_videos_found - expected_video_hits) * hist_vid_time
     _emit_indexer_summary(
         phase="processing",
         total_found=total_found,
         images_to_process=total_images_found,
         videos_to_process=total_videos_found,
+        expected_to_process=max(0, total_found - expected_image_hits - expected_video_hits),
         estimated_remaining_seconds=round(est_img_time + est_vid_time),
     )
     
@@ -274,13 +663,70 @@ def run_index(config, stop_event=None):
         else:
             return 'CPU'
     
+    # §3.1a pre-migration backup (R4): the one-time media-table rebuild
+    # (drop UNIQUE(path)) runs inside init_schema below. When the probe says
+    # a rebuild is pending, snapshot the DB first — same pattern as the
+    # reprocess_faces backup above, hardened with a WAL checkpoint so the
+    # copy includes any unmerged WAL content.
+    try:
+        _sqlite_path = Path(config.sqlite_path)
+        if _sqlite_path.exists() and media_path_rebuild_pending(_sqlite_path):
+            import shutil
+            import sqlite3 as _sqlite3
+            from datetime import datetime
+
+            _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            _backup = _sqlite_path.parent / f"{_sqlite_path.stem}.backup.{_ts}{_sqlite_path.suffix}"
+            _ckpt = _sqlite3.connect(str(_sqlite_path))
+            try:
+                _ckpt.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                _ckpt.close()
+            shutil.copy2(_sqlite_path, _backup)
+            logger.info(f"Created pre-migration SQLite backup (M-8 §3.1a): {_backup.name}")
+            logger.info(f"Restore with: cp {_backup} {_sqlite_path}")
+    except Exception as _backup_exc:
+        # A failed backup must not be silently skipped past — the rebuild is
+        # a destructive-in-place migration. Abort and let the user retry.
+        logger.error(f"Pre-migration backup failed, aborting before schema rebuild: {_backup_exc}")
+        raise
+
     # DB + Vector init
     db = SQLiteStore(config.sqlite_path, autocommit=False)
     db.init_schema(Path(__file__).parent / "db" / "schema.sql")
-    # total_changes is connection-scoped and counts all writes on this SQLite
-    # connection. We snapshot it after init_schema() so schema bootstrap/migration
-    # writes don't look like index content changes for this run.
-    initial_db_total_changes = db.get_total_changes()
+
+    # §4.1 (M-8/S-3): run-scoped stamp allocation. Every payload-relevant
+    # write of this run stamps its embedding rows with pending_seq — the
+    # seq the end-of-run bump will commit. Rows stamped by a run that
+    # crashes before the bump stay ABOVE the exported watermark, so the
+    # next run's dirty-row trigger finds and exports them (G8).
+    db.stamp_seq = db.get_index_state()["index_version_seq"] + 1
+
+    # §3.5 (M-8): explicit content-change signal. Set ONLY by processing
+    # writes (media upsert, embedding/face/tag/shot/keyframe writes,
+    # tombstone, resurrect, path updates) — never by fingerprint
+    # bookkeeping, scan_run rows, or grace-marker writes. The previous
+    # get_total_changes() heuristic counted ALL SQLite writes, which would
+    # make every fingerprint mark-seen run look changed and trigger a full
+    # Qdrant export on every no-op run (R1, P1).
+    content_changed = False
+
+    # §3.3/§3.4 (M-8): fingerprint fast-path setup. fingerprint_enabled:
+    # false is the kill switch back to hash-everything — with it off, NO
+    # fingerprint state is read or written and the deletion sweep +
+    # legacy-orphan reconcile are hard-disabled too (deletion detection is
+    # only meaningful over live fingerprint state).
+    # fingerprint_enabled / verify_content were read up in the count phase
+    # (the initial ETA needs them); deletion_sweep + scan_id need the open DB.
+    deletion_sweep_enabled = fingerprint_enabled and bool(
+        getattr(_incremental_cfg, 'deletion_sweep', True)
+    )
+    scan_id = db.begin_scan_run() if fingerprint_enabled else None
+    if fingerprint_enabled:
+        mode = "verify-content (hashing every file)" if verify_content else "fast-path"
+        logger.info(f"Fingerprint {mode} enabled | scan_id={scan_id}")
+    else:
+        logger.info("Fingerprint fast-path DISABLED (incremental.fingerprint_enabled: false) — hashing every file; deletion sweep off")
 
     # Stage 3 upgrade-path advisory: surface pre-Stage-3 DBs where face
     # rows exist without face_embedding rows. We don't auto-fix this
@@ -316,7 +762,9 @@ def run_index(config, stop_event=None):
     object_detector = None
     det_setting = getattr(config, "enable_object_detection", False)
     on_cpu = config.device == "cpu"
-    should_detect = det_setting is True or (det_setting == "auto" and not on_cpu)
+    # Shared with the count-phase ETA so both agree on whether object detection
+    # runs this session (see _object_detection_enabled).
+    should_detect = _object_detection_enabled(config)
 
     if should_detect:
         try:
@@ -417,15 +865,43 @@ def run_index(config, stop_event=None):
     processed_vid_count = 0  # Videos that were actually processed (not skipped)
     total_img_time = 0.0  # Total time spent processing images
     total_vid_time = 0.0  # Total time spent processing videos
+    # Rolling-ETA observed work (#208 review, Codex P2): true per-file
+    # processing wall-clock summed over every file that was actually processed
+    # — independent of whether it produced result parts. total_img_time /
+    # total_vid_time accrue only inside the non-empty result-`parts` blocks, so
+    # a no-result batch (--reprocess-faces on faceless images, object detection
+    # with 0 labels) would leave them at 0 and collapse the rolling ETA to 0
+    # even though real work is happening. This captures that time.
+    processing_wall_time = 0.0
     total_video_duration = 0.0  # Total duration of processed videos (in seconds)
     total_shots = 0  # Total shots detected across all videos
-    
+
+    # §3.3/§3.6 (M-8): fast-path counters + per-run bookkeeping
+    fingerprint_hits = 0     # size+mtime matched — media_id reused, no hash
+    files_hashed = 0         # full-content SHA-256 actually computed
+    hashed_new = 0           # ...of which: brand-new content
+    hashed_changed = 0       # ...of which: content replaced at a known path
+    moves_detected = 0       # media.path updated to a new location
+    superseded = 0           # old content tombstoned after in-place replacement
+    resurrected = 0          # tombstoned media revived by reappearing content
+    missing_marked = 0       # first-miss grace stamps (sweep, §3.4)
+    tombstoned = 0           # media tombstoned by the deletion sweep
+    pending_seen: list[tuple[str, str]] = []  # mark-seen batch, flushed with commits
+    # Resolved root per source name — used by copy-vs-move resolution and
+    # (in the sweep) path promotion. Includes every source of this run.
+    source_roots: dict[str, Path] = {
+        s.name: Path(resolve_for_access(str(s.path))) for s in sources_to_index
+    }
+    source_walk_stats: dict[str, ScanStats] = {}
+
     # Iterate through all enabled sources
     for source in sources_to_index:
-        root = Path(resolve_for_access(str(source.path)))
+        root = source_roots[source.name]
         source_name = source.name
+        walk_stats = ScanStats()
+        source_walk_stats[source_name] = walk_stats
         logger.info(f"📂 Indexing source: {source_name} | path: {root}")
-        for p in iter_media(root):
+        for p, st in iter_media_entries(root, stats=walk_stats):
             # Check for graceful shutdown between files
             if stop_event is not None and stop_event.is_set():
                 logger.info("Stop requested — finishing indexing run early (FAISS will still be saved)")
@@ -433,21 +909,157 @@ def run_index(config, stop_event=None):
 
             # Track time for each file
             file_start_time = time.perf_counter()
-            
+
             ext = p.suffix.lower()
-            media_id = sha256_of_file(p)
             file_count += 1
             # Count images and videos as they are discovered (before skip check)
             if ext in IMAGE_EXT:
                 img_count += 1
             elif ext in VIDEO_EXT:
                 vid_count += 1
+
+            # Skip based on media type filtering flags (before any hashing
+            # or fingerprint work)
+            if ext in IMAGE_EXT and getattr(config, 'video_only', False):
+                logger.info(f"Skipping image (video_only mode): {p.name}")
+                skipped_count += 1
+                skipped_filtered_count += 1
+                continue
+            elif ext in VIDEO_EXT and getattr(config, 'image_only', False):
+                logger.info(f"Skipping video (image_only mode): {p.name}")
+                skipped_count += 1
+                skipped_filtered_count += 1
+                continue
+
+            # §3.3: resolve media_id — fingerprint fast-path first, hash only
+            # for new/changed paths. `rel` is the shared DB rel-path key
+            # (fingerprint AND media upsert — one computation, ADR-007).
+            rel = _db_rel_path(p, root)
+            size_bytes = st.st_size
+            mtime_ns = st.st_mtime_ns
+            fp = db.get_fingerprint(source_name, rel) if fingerprint_enabled else None
+            # Fingerprint row for brand-new content must wait for the media
+            # row (FK) — written immediately after upsert_media below.
+            fp_pending: tuple[str, str, int, int] | None = None
+
+            if (
+                fp is not None
+                and not verify_content
+                and fp["size_bytes"] == size_bytes
+                and fp["mtime_ns"] == mtime_ns
+            ):
+                # HIT: stat matches — reuse the stored media_id, no hash.
+                media_id = fp["media_id"]
+                fingerprint_hits += 1
+                pending_seen.append((source_name, rel))
+            else:
+                media_id = sha256_of_file(p)
+                files_hashed += 1
+                if fingerprint_enabled:
+                    if fp is not None and fp["media_id"] == media_id:
+                        # Same content, stat drifted (touch / cloud
+                        # re-download) or --verify-content pass: refresh
+                        # stat fields, no reprocessing.
+                        if fp["size_bytes"] != size_bytes or fp["mtime_ns"] != mtime_ns:
+                            db.upsert_fingerprint(
+                                source_name, rel, size_bytes, mtime_ns, media_id, scan_id
+                            )
+                        else:
+                            pending_seen.append((source_name, rel))
+                    else:
+                        old_media_id = fp["media_id"] if fp is not None else None
+                        if old_media_id is not None:
+                            # Content replaced in place (§3.3 step 3):
+                            # detach the path from the old content first.
+                            hashed_changed += 1
+                            db.delete_fingerprint(source_name, rel)
+
+                        existing = db.find_media_by_id_any(media_id)
+                        if existing is not None:
+                            # Resurrection check FIRST (§3.3 step 4): a file
+                            # restored at its original stored path would
+                            # otherwise classify as "copy" and stay
+                            # tombstoned forever; a replaced path matching
+                            # previously-deleted content must revive before
+                            # the skip gate can hide it.
+                            if existing["deleted"]:
+                                db.resurrect_media(media_id)
+                                content_changed = True
+                                resurrected += 1
+                            elif existing["missing_since_scan_id"] is not None:
+                                # Grace clear only — not a content change.
+                                db.resurrect_media(media_id)
+                            db.upsert_fingerprint(
+                                source_name, rel, size_bytes, mtime_ns, media_id, scan_id
+                            )
+                            # Copy-vs-move cannot be decided from fingerprint
+                            # liveness mid-walk — check the RESOLVED current
+                            # path (source roots remap; stored media.path can
+                            # be stale while the file exists under the
+                            # current root). Bare existence is NOT enough:
+                            # the canonical path must still verifiably hold
+                            # this media_id's bytes (fingerprint row + stat
+                            # match), or two files exchanging contents in one
+                            # scan would classify as "copy" and leave the row
+                            # pointing at foreign bytes.
+                            current = _resolve_stored_media_path(existing, source_roots)
+                            if current is not None and _canonical_path_still_holds(
+                                db, existing, current, media_id
+                            ):
+                                # Copy: first-path-wins, media row untouched.
+                                pass
+                            else:
+                                # Move: repoint the canonical location.
+                                db.update_media_fields(
+                                    media_id,
+                                    {
+                                        "path": str(p),
+                                        "source_name": source_name,
+                                        "rel_path": rel,
+                                    },
+                                )
+                                content_changed = True
+                                moves_detected += 1
+                        else:
+                            if old_media_id is None:
+                                hashed_new += 1
+                            fp_pending = (source_name, rel, size_bytes, mtime_ns)
+
+                        if old_media_id is not None:
+                            # Tombstone the superseded content iff this was
+                            # its last remaining path (R5).
+                            old_survivors = db.get_live_fingerprints_for_media(
+                                old_media_id
+                            )
+                            old_row = db.find_media_by_id_any(old_media_id)
+                            if not old_survivors:
+                                if old_row is not None and not old_row["deleted"]:
+                                    db.tombstone_media(old_media_id)
+                                    content_changed = True
+                                    superseded += 1
+                            elif (
+                                old_row is not None
+                                and old_row["source_name"] == source_name
+                                and old_row["rel_path"] == rel
+                            ):
+                                # Duplicate copies survive elsewhere but the
+                                # replaced path WAS the canonical media
+                                # location — promote a surviving copy (the
+                                # sweep's R5 promotion), else browse/serving
+                                # for the old media_id would resolve to the
+                                # NEW file's bytes.
+                                if _promote_surviving_path(
+                                    db, old_media_id, old_survivors, source_roots
+                                ):
+                                    content_changed = True
+
             # Truncate media_id: first 5 + .. + last 5 chars
             if len(media_id) > 10:
                 short_media_id = f"{media_id[:5]}..{media_id[-5:]}"
             else:
                 short_media_id = media_id
             # Show relative path from project root, prefer ../data/ if present
+            # (display-only — NOT the DB rel-path computation above)
             try:
                 rel_path = p.relative_to(Path.cwd())
             except Exception:
@@ -460,24 +1072,18 @@ def run_index(config, stop_event=None):
             log = with_ctx(media_id=short_media_id, path=rel_path_str)
             log.debug(f"Discovered media file ext={ext}")
 
-            # Skip based on media type filtering flags (before any processing)
-            if ext in IMAGE_EXT and getattr(config, 'video_only', False):
-                log.info(f"Skipping image (video_only mode): {p.name}")
-                skipped_count += 1
-                skipped_filtered_count += 1
-                continue
-            elif ext in VIDEO_EXT and getattr(config, 'image_only', False):
-                log.info(f"Skipping video (image_only mode): {p.name}")
-                skipped_count += 1
-                skipped_filtered_count += 1
-                continue
-
             # Check processing status to determine what needs to be done
             status = db.get_processing_status(media_id)
-            needs_gps = bool(getattr(config, 'reprocess_gps', False)) or not status.get("gps_processed", False)
-            needs_objects = bool(getattr(config, 'reprocess_objects', False)) or not status.get("object_detection_done", False)
-            needs_faces = bool(getattr(config, 'reprocess_faces', False)) or not status.get("face_detection_done", False)
-            needs_embeddings = bool(getattr(config, 'reprocess_embeddings', False)) or (status.get("embeddings_version") != getattr(config, 'model_version', None))
+            # Shared with the count-phase ETA via _base_needs_flags so the
+            # runtime skip decision and the pre-count can't diverge (#208).
+            needs_gps, needs_objects, needs_faces, needs_embeddings = _base_needs_flags(
+                status,
+                model_version=getattr(config, 'model_version', None),
+                reprocess_gps=bool(getattr(config, 'reprocess_gps', False)),
+                reprocess_objects=bool(getattr(config, 'reprocess_objects', False)),
+                reprocess_faces=bool(getattr(config, 'reprocess_faces', False)),
+                reprocess_embeddings=bool(getattr(config, 'reprocess_embeddings', False)),
+            )
 
             # Stage 3 upgrade-path backfill: a pre-Stage-3 DB has the
             # status flags set above but no rows in the new embedding
@@ -530,8 +1136,7 @@ def run_index(config, stop_event=None):
             # Fallback to file modification time if no timestamp from EXIF/metadata
             if not meta.get("ts_utc") and not media_exists:
                 from datetime import datetime
-                mtime = p.stat().st_mtime
-                meta["ts_utc"] = datetime.fromtimestamp(mtime).isoformat()
+                meta["ts_utc"] = datetime.fromtimestamp(st.st_mtime).isoformat()
 
             # Reverse geocoding: convert GPS to place name
             place_name = None
@@ -561,14 +1166,11 @@ def run_index(config, stop_event=None):
             # Skip metadata upsert when doing selective feature reprocessing (faces, objects, embeddings)
             should_upsert = not media_exists or needs_gps
             if should_upsert:
-                # Compute relative path to current source root for portability
-                try:
-                    rel_path = str(p.relative_to(root))
-                except Exception:
-                    # Fallback: just the basename if file is outside root for some reason
-                    rel_path = p.name
+                # media.rel_path uses the SAME computation as the fingerprint
+                # key (`rel`, via _db_rel_path — §3.3, ADR-007); size comes
+                # from the walk's stat (no redundant p.stat()).
                 row = dict(
-                    media_id=media_id, path=str(p), source_name=source_name, rel_path=rel_path, size_bytes=p.stat().st_size,
+                    media_id=media_id, path=str(p), source_name=source_name, rel_path=rel, size_bytes=size_bytes,
                     mime=("image" if ext in IMAGE_EXT else "video") + "/" + ext.strip("."),
                     ts_utc=meta.get("ts_utc") if meta.get("ts_utc") else None,
                     place=place_name, camera=meta.get("camera"), lens=meta.get("lens"),
@@ -589,7 +1191,17 @@ def run_index(config, stop_event=None):
                     gps_lon = meta.get("gps_lon")
                     processed_gps = bool(video_gps_samples) or (gps_lat is not None and gps_lon is not None)
                 db.upsert_media(row)
+                content_changed = True
                 log.debug(f"Upserted media row: {row}")
+
+            # Deferred fingerprint insert for brand-new content: the media
+            # row now exists, so the FK is satisfiable.
+            if fp_pending is not None and fingerprint_enabled:
+                db.upsert_fingerprint(
+                    fp_pending[0], fp_pending[1], fp_pending[2], fp_pending[3],
+                    media_id, scan_id,
+                )
+                fp_pending = None
         
             # Process images (embeddings, object detection, face detection)
             if ext in IMAGE_EXT:
@@ -609,6 +1221,7 @@ def run_index(config, stop_event=None):
                     try:
                         v = embedder.image_embed([img])[0]
                         db.upsert_image_embedding(media_id, v, model=config.model_version)
+                        content_changed = True
                         image_embedding_count += 1
                         embed_ok += 1
                         processed_embedding = True
@@ -630,6 +1243,7 @@ def run_index(config, stop_event=None):
                             log.debug(f"Object tags added count={len(object_labels)} labels={object_labels}")
                         # Mark object detection as done (even if no objects found)
                         db.mark_object_detection_done(media_id)
+                        content_changed = True
                     except Exception as e:
                         log.warning(f"Object detection failed: {e}")
                 
@@ -640,6 +1254,7 @@ def run_index(config, stop_event=None):
                         # Delete old faces when reprocessing to avoid orphaned face_ids
                         if getattr(config, 'reprocess_faces', False):
                             db.delete_faces_for_media(media_id)
+                            content_changed = True
                             log.debug("Deleted old face records for reprocessing")
                         
                         # Run face detection (reprocess or first time)
@@ -661,6 +1276,7 @@ def run_index(config, stop_event=None):
                                 # Generate face thumbnail
                                 write_face_thumbnail(img, face.bbox, face_id, config.face_thumb_dir)
                             db.add_faces(media_id, face_entries)
+                            content_changed = True
                             # face rows must exist before face_embedding rows
                             # for the FK to be satisfied — order matters here.
                             for fid, emb in face_emb_pairs:
@@ -672,6 +1288,7 @@ def run_index(config, stop_event=None):
                             log.debug("No faces detected in image")
                         # Mark face detection as done (even if no faces found)
                         db.mark_face_detection_done(media_id)
+                        content_changed = True
                     except Exception as e:
                         log.warning(f"Face detection failed: {e}")
                 
@@ -723,21 +1340,30 @@ def run_index(config, stop_event=None):
                     # video path on those keyframes.
                     reprocess_embeddings = getattr(config, 'reprocess_embeddings', False)
                     reprocess_objects = getattr(config, 'reprocess_objects', False)
-                    needs_keyframe_emb_backfill = (
-                        has_keyframes and db.media_has_unembedded_keyframes(media_id)
+                    # Whether this video is a no-op skip — decided by the SHARED
+                    # _video_skip_predicate the count-phase ETA also calls, so the
+                    # runtime skip and the pre-count can't diverge (#208 review,
+                    # Codex P2). media_has_unembedded_keyframes is queried only
+                    # when keyframes exist (short-circuit preserves the prior
+                    # single query).
+                    video_is_free_skip = _video_skip_predicate(
+                        has_shots=bool(existing_shots),
+                        has_keyframes=has_keyframes,
+                        has_unembedded_keyframes=(
+                            has_keyframes and db.media_has_unembedded_keyframes(media_id)
+                        ),
+                        needs_embeddings=needs_embeddings,
+                        needs_objects=needs_objects,
+                        needs_faces=needs_faces,
+                        reprocess_embeddings=reprocess_embeddings,
+                        reprocess_objects=reprocess_objects,
                     )
-                    video_needs_embeddings = (
-                        not has_keyframes
-                        or reprocess_embeddings
-                        or needs_keyframe_emb_backfill
-                    ) and needs_embeddings
-                    video_needs_objects = (not has_keyframes or reprocess_objects) and needs_objects
-                    
+
                     # Debug: log why video is or isn't being skipped
-                    log.debug(f"Video skip check: existing_shots={bool(existing_shots)} has_keyframes={has_keyframes} video_needs_embeddings={video_needs_embeddings} video_needs_objects={video_needs_objects} needs_faces={needs_faces}")
-                    
+                    log.debug(f"Video skip check: existing_shots={bool(existing_shots)} has_keyframes={has_keyframes} video_is_free_skip={video_is_free_skip} needs_faces={needs_faces}")
+
                     # If shots and keyframes exist, and no processing is needed, skip the video
-                    if existing_shots and has_keyframes and not (video_needs_embeddings or video_needs_objects or needs_faces):
+                    if video_is_free_skip:
                         log.info("Skipping - no processing needed")
                         skipped_count += 1
                         skipped_up_to_date_count += 1
@@ -779,6 +1405,7 @@ def run_index(config, stop_event=None):
                         if shots:
                             # Store shots in SQLite (with synthetic flag)
                             db.add_shots(media_id, shots, is_synthetic=is_synthetic)
+                            content_changed = True
                             processed_shot_count = len(shots)
 
                     # Time the rest of video processing operations (keyframes, embedding, object detection, face detection)
@@ -788,12 +1415,22 @@ def run_index(config, stop_event=None):
                         
                         # Extract keyframes; metadata + per-keyframe embedding go to SQLite
                         kps = int(getattr(config, 'keyframes_per_shot', 1))
-                        enable_video_detection = object_detector and getattr(config, 'enable_video_object_detection', False)
+                        # Shared with the count-phase ETA (via
+                        # _video_object_detection_enabled) so both agree on
+                        # whether object detection runs on videos this session.
+                        # object_detector is None unless _object_detection_enabled
+                        # held at init, so this stays equivalent to the prior
+                        # `object_detector and enable_video_object_detection`.
+                        enable_video_detection = (
+                            object_detector is not None
+                            and _video_object_detection_enabled(config)
+                        )
                         geocode_cache = {}
                         
                         # Delete old faces when reprocessing to avoid orphaned face_ids
                         if face_recognizer and needs_faces and getattr(config, 'reprocess_faces', False):
                             db.delete_faces_for_media(media_id)
+                            content_changed = True
                             log.debug("Deleted old face records for video reprocessing")
                         
                         keyframe_entries = []
@@ -851,6 +1488,7 @@ def run_index(config, stop_event=None):
                                                 # Generate face thumbnail
                                                 write_face_thumbnail(img, face.bbox, face_id, config.face_thumb_dir)
                                             db.add_faces(media_id, face_entries)
+                                            content_changed = True
                                             # face rows must exist before face_embedding rows
                                             for fid, emb in face_emb_pairs:
                                                 db.upsert_face_embedding(fid, emb, model=face_model_id)
@@ -897,6 +1535,7 @@ def run_index(config, stop_event=None):
                             # Insert keyframe metadata first so the FK from
                             # keyframe_embedding -> video_keyframes(id) holds.
                             db.add_keyframes(media_id, keyframe_entries)
+                            content_changed = True
                             for s_idx_kf, k_idx_kf, vec_kf in kf_emb_pairs:
                                 kf_id = db.get_keyframe_id(media_id, s_idx_kf, k_idx_kf)
                                 if kf_id is None:
@@ -920,6 +1559,7 @@ def run_index(config, stop_event=None):
                                 if not place_name and first_keyframe_place:
                                     update_fields["place"] = first_keyframe_place
                                 db.update_media_fields(media_id, update_fields)
+                                content_changed = True
                             embed_ok += 1  # Count as successful video embedding
                             log.debug(f"Stored video keyframes count={len(kf_emb_pairs)} shots={len(shots)}")
                         else:
@@ -929,10 +1569,12 @@ def run_index(config, stop_event=None):
                         # Mark face detection as done for video (if face recognizer is enabled and we processed faces)
                         if face_recognizer and needs_faces:
                             db.mark_face_detection_done(media_id)
-                        
+                            content_changed = True
+
                         # Mark object detection as done for video (if object detection was enabled and run)
                         if enable_video_detection and needs_objects:
                             db.mark_object_detection_done(media_id)
+                            content_changed = True
                         
                         other_ops_time = time.perf_counter() - other_ops_start
                         
@@ -1008,6 +1650,15 @@ def run_index(config, stop_event=None):
                     embed_fail += 1
                     log.error(f"Video shot detection/indexing failed: {e}", exc_info=True)
 
+            # Accrue THIS file's true processing wall-clock for the rolling ETA
+            # (#208 review, Codex P2). Every file reaching here was actually
+            # processed — all skip paths (media-type filter, up-to-date,
+            # video-no-op) `continue` earlier, so this is never diluted by a
+            # skip and captures real cost even for no-result batches that never
+            # touch total_img_time/total_vid_time. Measured BEFORE the commit
+            # below so amortized commit time isn't charged to the file.
+            processing_wall_time += time.perf_counter() - file_start_time
+
             # Per-batch commit boundary. Runs after this file's full processing
             # (media + faces + tags) has landed in the open SQLite transaction.
             files_since_commit += 1
@@ -1018,6 +1669,11 @@ def run_index(config, stop_event=None):
             ):
                 commit_t0 = time.perf_counter()
                 try:
+                    # Flush the mark-seen batch with the commit (§3.3) —
+                    # bookkeeping rides the existing durability boundary.
+                    if pending_seen:
+                        db.mark_fingerprints_seen(scan_id, pending_seen)
+                        pending_seen.clear()
                     db.commit()
                 except Exception as commit_exc:
                     logger.error(f"Per-batch commit failed: {commit_exc}")
@@ -1037,17 +1693,161 @@ def run_index(config, stop_event=None):
                 last_commit_ts = time.perf_counter()
                 commit_batch_serial += 1
 
+                # Rolling ETA refinement (#208): the count-phase estimate is
+                # blind to content changes the fingerprints can't foresee
+                # (same path, new bytes). Re-project the remainder from the
+                # OBSERVED average time per walked file so far — processing
+                # wall-clock accrues only on files that were actually worked
+                # (processing_wall_time, which — unlike total_img_time /
+                # total_vid_time — also counts no-result batches, #208 review
+                # Codex P2), so a batch dominated by fast-path hits drives the
+                # average (and thus the ETA) toward zero while a slow no-result
+                # reprocess keeps it honest. Rides the commit cadence, no spam.
+                # Re-emits phase="processing" (the parser keeps only the LAST
+                # summary) with the raw found COUNTS unchanged.
+                # Scope both sides to the SAME basis (#208 review). total_found
+                # (count phase) is scanner-filtered to the selected media type
+                # under --image-only/--video-only, but file_count is bumped for
+                # EVERY walked file — including the ones the media-type filter
+                # skips (skipped_filtered_count). Subtracting raw file_count
+                # would race total_found to 0 the moment out-of-type files are
+                # walked past, reporting "0s remaining" while in-type work is
+                # still queued. file_count - skipped_filtered_count is the
+                # in-scope walked count, matching total_found's scope (with no
+                # filter, skipped_filtered_count is 0 → unchanged). The observed
+                # per-file average uses the same in-scope basis (skipped files
+                # accrue no work), so it isn't diluted by out-of-type skips.
+                files_walked_in_scope = file_count - skipped_filtered_count
+                remaining_files = max(0, total_found - files_walked_in_scope)
+                observed_work = processing_wall_time
+                avg_per_file = (
+                    observed_work / files_walked_in_scope
+                    if files_walked_in_scope > 0
+                    else 0.0
+                )
+                _emit_indexer_summary(
+                    phase="processing",
+                    total_found=total_found,
+                    images_to_process=total_images_found,
+                    videos_to_process=total_videos_found,
+                    files_walked=file_count,
+                    estimated_remaining_seconds=round(remaining_files * avg_per_file),
+                )
+
         # If stop was requested mid-source, don't continue to the next source
         if stop_event is not None and stop_event.is_set():
             break
 
     # Embeddings are now durably committed per file via image_embedding /
     # keyframe_embedding / face_embedding tables, so there is no separate
-    # end-of-run save step. The local_index_changed signal collapses to
-    # "did SQLite get any net writes this run", which already covers
-    # metadata, faces, keyframes, and embeddings.
+    # end-of-run save step. The local_index_changed signal is the explicit
+    # content_changed flag (§3.5): set by metadata, face, keyframe, and
+    # embedding writes — never by fingerprint or scan bookkeeping.
     face_count = face_embedding_count
     try:
+        # Flush any remaining mark-seen batch (runs where every file was a
+        # fast-path hit never trigger a per-batch commit).
+        if fingerprint_enabled and pending_seen:
+            db.mark_fingerprints_seen(scan_id, pending_seen)
+            pending_seen.clear()
+
+        # §3.4 (M-8): deletion sweep + legacy orphan reconcile + scan-run
+        # completion. Gated hard (R3 — a partial walk must never look like
+        # mass deletion): fingerprint fast-path on, no stop request, and no
+        # media-type filter (an --image-only/--video-only run never marks the
+        # other type's fingerprints seen, so sweeping it would mass-tombstone
+        # that entire media type). Per-source: zero swallowed walk errors.
+        _stopped_mid_run = stop_event is not None and stop_event.is_set()
+        if fingerprint_enabled and not _stopped_mid_run and media_type_filter is None:
+            if deletion_sweep_enabled:
+                for _sweep_source in sources_to_index:
+                    _s_name = _sweep_source.name
+                    _s_stats = source_walk_stats.get(_s_name)
+                    if _s_stats is None or _s_stats.walk_errors > 0:
+                        logger.warning(
+                            "Deletion sweep skipped for source '{}' — {} walk error(s) "
+                            "swallowed during the scan (a transient I/O failure must "
+                            "never look like mass deletion)",
+                            _s_name,
+                            _s_stats.walk_errors if _s_stats is not None else "unknown",
+                        )
+                        continue
+
+                    # 1) Fingerprint-driven sweep: two-scan grace, then delete
+                    #    the fingerprint row; tombstone the media only when its
+                    #    LAST fingerprint row disappears (R5).
+                    for fp_row in db.iter_stale_fingerprints(_s_name, scan_id):
+                        if fp_row["missing_since_scan_id"] is None:
+                            db.set_fingerprint_missing(_s_name, fp_row["rel_path"], scan_id)
+                            missing_marked += 1
+                            continue
+                        db.delete_fingerprint(_s_name, fp_row["rel_path"])
+                        _mid = fp_row["media_id"]
+                        _survivors = db.get_live_fingerprints_for_media(_mid)
+                        if not _survivors:
+                            _mrow = db.find_media_by_id_any(_mid)
+                            if _mrow is not None and not _mrow["deleted"]:
+                                db.tombstone_media(_mid)
+                                content_changed = True
+                                tombstoned += 1
+                        else:
+                            # Path promotion (R5): if the canonical location was
+                            # the deleted copy, promote a surviving one — browse
+                            # and file-serving resolve from media. (Shared with
+                            # the fast path's supersede branch.)
+                            _mrow = db.find_media_by_id_any(_mid)
+                            if (
+                                _mrow is not None
+                                and _mrow["source_name"] == _s_name
+                                and _mrow["rel_path"] == fp_row["rel_path"]
+                            ):
+                                if _promote_surviving_path(
+                                    db, _mid, _survivors, source_roots
+                                ):
+                                    content_changed = True
+
+                    # 2) Legacy orphan reconcile: non-deleted media of this
+                    #    source with zero fingerprint rows were deleted before
+                    #    the M-8 upgrade (the lazy backfill only fingerprints
+                    #    files that still exist). Same two-scan grace via
+                    #    media.missing_since_scan_id; self-liquidating.
+                    for _orphan in db.iter_legacy_orphan_media(_s_name):
+                        if _orphan["missing_since_scan_id"] is None:
+                            db.set_media_missing_since(_orphan["media_id"], scan_id)
+                            missing_marked += 1
+                        elif _orphan["missing_since_scan_id"] != scan_id:
+                            db.tombstone_media(_orphan["media_id"])
+                            content_changed = True
+                            tombstoned += 1
+
+                if missing_marked or tombstoned:
+                    logger.info(
+                        "Deletion sweep: {} path(s) newly missing (grace), {} media tombstoned",
+                        missing_marked,
+                        tombstoned,
+                    )
+
+            # Clean full completion (stop never requested, every source root
+            # walked, unfiltered): record it — the NEXT sweep's grace decisions
+            # key off completed scans only.
+            db.complete_scan_run(
+                scan_id,
+                json.dumps(
+                    {
+                        s.name: {
+                            "walked_to_completion": True,
+                            "walk_errors": (
+                                source_walk_stats[s.name].walk_errors
+                                if s.name in source_walk_stats
+                                else None
+                            ),
+                        }
+                        for s in sources_to_index
+                    },
+                    sort_keys=True,
+                ),
+            )
+
         if face_count == 0 and face_recognizer and files_processed_with_faces > 0:
             logger.warning(
                 f"No faces detected in {files_processed_with_faces} processed file(s) with "
@@ -1059,8 +1859,7 @@ def run_index(config, stop_event=None):
                 f"keyframe={keyframe_embedding_count} face={face_count}"
             )
 
-        db_changed = db.get_total_changes() > initial_db_total_changes
-        local_index_changed = db_changed
+        local_index_changed = content_changed
         committed_index_version: dict | None = None
         if local_index_changed:
             committed_index_version = db.bump_index_version()
@@ -1182,7 +1981,21 @@ def run_index(config, stop_event=None):
                 f"MSA_INDEXER_COMMIT_BATCH_SECONDS (currently {commit_batch_seconds:.1f}s)"
             )
 
-    _emit_indexer_summary(
+    # §3.6 (M-8): fingerprint fast-path observability. One human-readable
+    # summary line plus additive keys on the complete payload (the
+    # IndexerManager log parser is JSON-based and tolerant of new keys).
+    if fingerprint_enabled:
+        logger.info(
+            f"Fingerprint fast-path: {fingerprint_hits} hits, {files_hashed} hashed "
+            f"({hashed_new} new, {hashed_changed} changed), {moves_detected} moves, "
+            f"{tombstoned} tombstoned"
+        )
+
+    # Captured (not just emitted) because IndexerManager keeps only the LAST
+    # parsed summary: after the export phase below, this exact payload is
+    # re-emitted so the terminal /indexer/status is "complete" with the full
+    # counters rather than stuck on "exporting" (M-8/S-2 plan §3.4).
+    complete_summary = dict(
         phase="complete",
         total_found=file_count,
         already_indexed=skipped_up_to_date_count,
@@ -1195,7 +2008,15 @@ def run_index(config, stop_event=None):
         avg_image_seconds=(total_img_time / processed_img_count) if processed_img_count > 0 else None,
         avg_video_seconds=(total_vid_time / processed_vid_count) if processed_vid_count > 0 else None,
         avg_video_seconds_per_min=((total_vid_time / total_video_duration) * 60.0) if total_video_duration > 0 else None,
+        fingerprint_hits=fingerprint_hits,
+        files_hashed=files_hashed,
+        moves_detected=moves_detected,
+        superseded=superseded,
+        missing_marked=missing_marked,
+        tombstoned=tombstoned,
+        resurrected=resurrected,
     )
+    _emit_indexer_summary(**complete_summary)
 
     current_index_state = committed_index_version or db.get_index_state()
     db.close()
@@ -1203,69 +2024,278 @@ def run_index(config, stop_event=None):
     stop_requested = stop_event is not None and stop_event.is_set()
 
     force_export_to_qdrant = getattr(config, 'export_to_qdrant', False)
+
+    # M-8/S-2: the export window is the only part of the run that needs the
+    # embedded Qdrant lock. Announce the phase, then request the lock from
+    # the API via the sentinel-file handshake. The version read below is the
+    # FIRST Qdrant open of the run, so it sits inside the window — including
+    # on no-change runs, whose brief request → granted → version-read →
+    # release probe keeps the qdrant_stale recovery path alive (§3.1).
+    _emit_indexer_summary(phase="exporting")
+    export_blocked = False
     try:
-        qdrant_export_state = get_qdrant_export_version()
-    except Exception as _e:
-        logger.warning("Could not read Qdrant export state ({}); treating as unknown — will export conservatively.", _e)
-        qdrant_export_state = None
-    qdrant_stale = False
-    local_index_version_seq = int(current_index_state.get("index_version_seq") or 0)
-    if local_index_version_seq > 0:
-        exported_seq = int(qdrant_export_state["index_version_seq"]) if qdrant_export_state else -1
-        qdrant_stale = exported_seq < local_index_version_seq
+        # log_dir anchors the sentinel dir to THIS run's config (round-5):
+        # a standalone run in any cwd lands on the same slot the API polls.
+        with qdrant_handoff.handoff_window(log_dir=getattr(config, "log_dir", None)):
+            try:
+                qdrant_export_state = qdrant_handoff.call_with_lock_retry(get_qdrant_export_version)
+            except Exception as _e:
+                if qdrant_handoff.is_lock_error(_e):
+                    # Grant timed out AND the lock is genuinely held (§3.1 step 5).
+                    # Fail loudly and defer: the version was bumped in SQLite but
+                    # not recorded in Qdrant, so the next run's qdrant_stale check
+                    # retries the export automatically — deferred, never silent.
+                    logger.error(
+                        "Qdrant lock still held after {:.0f}s of retries — skipping export. "
+                        "Media are indexed in SQLite but not yet searchable; the next "
+                        "indexer run repairs this automatically (or run 'msa index export'). ({})",
+                        qdrant_handoff.LOCK_RETRY_TOTAL_SECONDS, _e,
+                    )
+                    _emit_indexer_summary(phase="export_blocked")
+                    export_blocked = True
+                    qdrant_export_state = None
+                else:
+                    logger.warning("Could not read Qdrant export state ({}); treating as unknown — will export conservatively.", _e)
+                    qdrant_export_state = None
+            if not export_blocked:
+                qdrant_stale = False
+                local_index_version_seq = int(current_index_state.get("index_version_seq") or 0)
+                exported_seq: int | None = (
+                    int(qdrant_export_state["index_version_seq"]) if qdrant_export_state else None
+                )
+                if local_index_version_seq > 0:
+                    qdrant_stale = (exported_seq if exported_seq is not None else -1) < local_index_version_seq
 
-    # Auto-export when local state changed this run, when Qdrant is behind local
-    # SQLite state, or when explicitly forced. A graceful stop still finishes the
-    # export so local index state and Qdrant stay in sync.
-    should_export_to_qdrant = force_export_to_qdrant or local_index_changed or qdrant_stale
-    if should_export_to_qdrant:
-        if force_export_to_qdrant:
-            logger.info("Forced Qdrant export requested, starting export...")
-        elif qdrant_stale and not local_index_changed:
-            logger.info(
-                "Qdrant export state is stale (qdrant_seq={} local_seq={}), exporting to catch up...",
-                qdrant_export_state["index_version_seq"] if qdrant_export_state else None,
-                local_index_version_seq,
-            )
-        elif stop_requested:
-            logger.info("Stop requested — finishing graceful shutdown with Qdrant export...")
-        else:
-            logger.info("Local index changes detected during indexing, exporting to Qdrant...")
-        try:
-            images_exported = _do_qdrant_export(config, face_recognizer, face_count, export_all=False)
-        except Exception as _export_exc:
-            logger.error("Qdrant export failed (local index is intact; retry with 'msa index export'): {}", _export_exc)
-            images_exported = False
-        if images_exported:
-            record_qdrant_export_version(
-                local_index_version_seq,
-                current_index_state.get("index_version_ts"),
-            )
-            logger.info(
-                "Recorded Qdrant export version seq={} ts={}",
-                local_index_version_seq,
-                current_index_state.get("index_version_ts"),
-            )
-        else:
-            logger.info("Skipping version record — image/video export was skipped (reprocessing mode)")
+                # §4.2 (M-8/S-3): dirty-row trigger, first-delta-run guard,
+                # and the watermark-advance rule all need SQLite. The run's
+                # handle closed before the window opened, so reopen a
+                # short-lived store INSIDE the window — SQLite was never
+                # part of the lock handshake; only Qdrant opens are
+                # window-bound (S-2), and the version read above was the
+                # window's first (ladder-protected) Qdrant open.
+                dirty_rows_exist = False
+                s3_migration_seq = 0
+                face_recreate_pending = False
+                try:
+                    probe_db = SQLiteStore(Path(config.sqlite_path))
+                    try:
+                        _s3_state = probe_db.get_s3_state()
+                        s3_migration_seq = _s3_state["s3_migration_seq"]
+                        face_recreate_pending = _s3_state["face_recreate_required"]
+                        probe_floor = exported_seq if exported_seq is not None else -1
+                        dirty_rows_exist = (
+                            probe_db.dirty_rows_exist(probe_floor) or face_recreate_pending
+                        )
+                        if dirty_rows_exist:
+                            # Watermark-advance rule (§4.2): stamps ABOVE the
+                            # committed seq mean a run crashed between its
+                            # batch commits and bump_index_version (G8), or
+                            # an out-of-band write allocated ahead. Durably
+                            # complete the interrupted bump FIRST, then
+                            # export and record THAT seq — recording the
+                            # stale lower seq would repeat the recovery
+                            # export on every subsequent no-op run.
+                            _max_stamped = probe_db.max_stamped_seq()
+                            if _max_stamped > local_index_version_seq:
+                                current_index_state = probe_db.advance_index_version_to(
+                                    _max_stamped
+                                )
+                                local_index_version_seq = _max_stamped
+                                qdrant_stale = (
+                                    exported_seq if exported_seq is not None else -1
+                                ) < local_index_version_seq
+                                logger.info(
+                                    "Advanced index version to max stamped seq={} "
+                                    "(completing an interrupted bump — G8 recovery)",
+                                    _max_stamped,
+                                )
+                    finally:
+                        probe_db.close()
+                except Exception as _probe_exc:
+                    logger.warning(
+                        "Dirty-row probe failed ({}); relying on the change/stale "
+                        "triggers only for this run.",
+                        _probe_exc,
+                    )
+
+                # Auto-export when local state changed this run, when Qdrant is behind local
+                # SQLite state, when stamped-but-unexported rows exist (the §4.2
+                # dirty-row trigger — closes G8 together with stamping), or when
+                # explicitly forced. A graceful stop still finishes the
+                # export so local index state and Qdrant stay in sync.
+                should_export_to_qdrant = (
+                    force_export_to_qdrant
+                    or local_index_changed
+                    or qdrant_stale
+                    or dirty_rows_exist
+                )
+                if should_export_to_qdrant:
+                    # First-delta-run guard (§4.2, P1): delta engages ONLY
+                    # when a recorded export exists AND it is at/above the
+                    # migration-time seq (durably captured by the slice-1
+                    # migration). Otherwise legacy rows carry updated_seq=0
+                    # below a positive watermark and a delta pass would
+                    # export nothing while recording currency — permanently
+                    # hiding the stale points. One recorded full export
+                    # flips the inequality permanently (exported_seq is
+                    # monotonic).
+                    since_seq = None
+                    if exported_seq is not None and exported_seq >= s3_migration_seq:
+                        since_seq = exported_seq
+                    if force_export_to_qdrant:
+                        logger.info("Forced Qdrant export requested, starting export...")
+                    elif qdrant_stale and not local_index_changed:
+                        logger.info(
+                            "Qdrant export state is stale (qdrant_seq={} local_seq={}), exporting to catch up...",
+                            qdrant_export_state["index_version_seq"] if qdrant_export_state else None,
+                            local_index_version_seq,
+                        )
+                    elif dirty_rows_exist and not local_index_changed:
+                        logger.info(
+                            "Stamped-but-unexported rows detected (dirty trigger), exporting to Qdrant..."
+                        )
+                    elif stop_requested:
+                        logger.info("Stop requested — finishing graceful shutdown with Qdrant export...")
+                    else:
+                        logger.info("Local index changes detected during indexing, exporting to Qdrant...")
+                    if since_seq is None and (qdrant_export_state or s3_migration_seq):
+                        logger.info(
+                            "First-delta-run guard: running a FULL export (recorded seq {} "
+                            "vs migration seq {})",
+                            exported_seq,
+                            s3_migration_seq,
+                        )
+                    try:
+                        export_outcome = _do_qdrant_export(
+                            config, face_recognizer, face_count, export_all=False,
+                            since_seq=since_seq,
+                        )
+                    except Exception as _export_exc:
+                        logger.error("Qdrant export failed (local index is intact; retry with 'msa index export'): {}", _export_exc)
+                        export_outcome = False
+                    # §4.2 widened gate: record ONLY when the whole pass —
+                    # image/video AND face exports AND the deletion pass —
+                    # succeeded (ExportOutcome.record_ok; legacy bools from
+                    # test fakes gate identically via truthiness).
+                    if export_outcome:
+                        record_qdrant_export_version(
+                            local_index_version_seq,
+                            current_index_state.get("index_version_ts"),
+                        )
+                        logger.info(
+                            "Recorded Qdrant export version seq={} ts={}",
+                            local_index_version_seq,
+                            current_index_state.get("index_version_ts"),
+                        )
+                    else:
+                        _log_export_record_skip(export_outcome)
+                else:
+                    if qdrant_stale:
+                        logger.info("Skipping Qdrant export because local index has no committed version yet.")
+                    else:
+                        logger.info("Skipping Qdrant export (no index changes detected; use --export-to-qdrant or 'msa index export' to force)")
+    except qdrant_handoff.HandoffSlotBusyError as _busy:
+        # Another exporter/index run holds the handoff window and did not
+        # release it within the slot budget. Never clobber, never
+        # interleave — fail loudly (§3.1 step 5): the version was bumped
+        # in SQLite but not recorded in Qdrant, so the next run's
+        # qdrant_stale check repairs this automatically.
+        logger.error(
+            "Qdrant handoff window is busy — skipping export. Media are "
+            "indexed in SQLite but not yet searchable; the next indexer run "
+            "repairs this automatically (or run 'msa index export'). ({})",
+            _busy,
+        )
+        _emit_indexer_summary(phase="export_blocked")
+        export_blocked = True
+    if not export_blocked:
+        # Terminal summary re-emit — after the handshake files are removed so
+        # the "complete" the API parses means the lock is already free. The
+        # export_blocked path deliberately does NOT re-emit: the loud failure
+        # stays the terminal summary (§3.4).
+        _emit_indexer_summary(**complete_summary)
+
+
+def _sqlite_pre_stage3_shape(sqlite_path: Path) -> bool:
+    """True when the DB matches the pre-Stage-3 upgrade shape: live media
+    rows exist but ALL THREE embedding tables are empty. Under delta export
+    this is the only 0-sent case that must still block the version record
+    (§4.3) — 0 dirty rows with populated tables is a legitimate no-op."""
+    with SQLiteStore(sqlite_path) as db:
+        media_rows = db.conn.execute(
+            "SELECT 1 FROM media WHERE deleted = 0 LIMIT 1"
+        ).fetchone()
+        if media_rows is None:
+            return False
+        for table in ("image_embedding", "keyframe_embedding", "face_embedding"):
+            if db.conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None:
+                return False
+    return True
+
+
+def _log_export_record_skip(outcome) -> None:
+    """Explain WHY the export-version record was withheld (widened gate)."""
+    from .db.qdrant_export import ExportOutcome
+
+    if not isinstance(outcome, ExportOutcome):
+        # Legacy bool shape (export raised, or a test fake): message
+        # already logged by the caller / exporter.
+        logger.info("Skipping version record — export did not complete")
+        return
+    if not outcome.images_attempted:
+        logger.info(
+            "Skipping version record — image/video export was skipped (reprocessing mode)"
+        )
+    elif outcome.empty_tables:
+        logger.info(
+            "Skipping version record — embedding tables are empty (pre-Stage-3 shape)"
+        )
+    elif not outcome.faces_ok:
+        logger.warning(
+            "Skipping version record — face export failed; dirty face rows and "
+            "face tombstones stay stamped and retry on the next run (R8)"
+        )
+    elif not outcome.deletions_ok:
+        logger.warning(
+            "Skipping version record — tombstone deletion pass failed; stamped "
+            "tombstones stay above the watermark and retry on the next run (R8)"
+        )
     else:
-        if qdrant_stale:
-            logger.info("Skipping Qdrant export because local index has no committed version yet.")
-        else:
-            logger.info("Skipping Qdrant export (no index changes detected; use --export-to-qdrant or 'msa index export' to force)")
+        logger.info("Skipping version record — image/video export did not complete")
 
 
-def _do_qdrant_export(config, face_recognizer=None, face_count=0, export_all=False):
-    """Helper function to perform Qdrant export. Used by both run_index and run_export.
-    
+def _do_qdrant_export(config, face_recognizer=None, face_count=0, export_all=False,
+                      since_seq=None):
+    """Perform one Qdrant export pass. Used by both run_index and run_export.
+
     Args:
         config: Configuration object
         face_recognizer: Face recognizer instance (if available)
         face_count: Number of faces detected (if available)
         export_all: If True, export everything regardless of reprocessing flags (used by run_export)
+        since_seq: M-8/S-3 §4.2 delta watermark — export only rows stamped
+            above it; None = full export (export-only mode, --recreate,
+            repair, and the first-delta-run guard).
+
+    Returns an ExportOutcome. The caller may record the export version ONLY
+    when the outcome is truthy (record_ok): §4.2 widened gate — an
+    image/video failure, a face failure (previously swallowed), or a
+    deletion-pass failure all block the record, leaving the unexported rows
+    stamped for the next run (R8).
+
+    Runs entirely inside the caller's handoff window — every Qdrant open
+    below (exporters, deletion pass) is window-bound.
     """
+    from .db.qdrant_export import (
+        ExportOutcome,
+        delete_tombstoned_points_from_qdrant,
+        export_faces_to_qdrant,
+    )
+
     # Check if recreate flag is set (from export command)
     recreate = getattr(config, 'export_recreate', False)
+    sqlite_path = Path(config.sqlite_path)
+    outcome = ExportOutcome()
 
     # Embeddings are sourced from SQLite tables (image_embedding,
     # keyframe_embedding, face_embedding). The export functions detect
@@ -1283,27 +2313,77 @@ def _do_qdrant_export(config, face_recognizer=None, face_count=0, export_all=Fal
         ])
         export_faces = export_images
 
-    images_exported = False
+    # §4.1 durable recreate marker: set (same transaction) whenever face
+    # rows were deleted while their media stayed live. Whenever it is set,
+    # the face export below runs in RECREATE mode regardless of this run's
+    # flags, and it is cleared only after that recreate export succeeds —
+    # crash-safe repair for the cascade that leaves nothing stamped.
+    face_recreate_required = False
+    try:
+        with SQLiteStore(sqlite_path) as s3_db:
+            face_recreate_required = s3_db.get_s3_state()["face_recreate_required"]
+    except Exception as _s3_exc:
+        logger.debug(f"Could not read face_recreate_required: {_s3_exc}")
+
     try:
         if export_images:
-            logger.info("Exporting indexed items to Qdrant...")
-            image_stats = export_images_to_qdrant(Path(config.sqlite_path), recreate=recreate)
+            mode_note = f" (delta since seq {since_seq})" if since_seq is not None else ""
+            logger.info(f"Exporting indexed items to Qdrant...{mode_note}")
+            # §4.2 (round-3 review finding, P2): each exporter degrades
+            # since_seq to None PER COLLECTION when ensure_collection had
+            # to create (or recreate) its target — a delta upload into a
+            # fresh empty collection followed by the version record would
+            # leave every unchanged point permanently absent/unsearchable.
+            # The other collections keep their delta window.
+            image_stats = export_images_to_qdrant(
+                sqlite_path, recreate=recreate, since_seq=since_seq
+            )
             video_collection = getattr(config, 'col_video', None) or 'video_emb'
             video_stats = export_video_frames_to_qdrant(
-                Path(config.sqlite_path), collection=video_collection, recreate=recreate
+                sqlite_path, collection=video_collection, recreate=recreate,
+                since_seq=since_seq,
             )
             image_sent = int((image_stats or {}).get('sent', 0))
             video_sent = int((video_stats or {}).get('sent', 0))
+            iv_errors = (
+                int((image_stats or {}).get('errors', 0))
+                + int((video_stats or {}).get('errors', 0))
+            )
+            outcome.images_attempted = True
+            outcome.image_sent = image_sent
+            outcome.video_sent = video_sent
+            # §4.2: the exporters swallow per-item/per-batch upsert failures
+            # into `errors` and return normally — those rows' vectors and
+            # payloads were NOT written, so treating the pass as ok would
+            # advance the watermark past their dirty stamps and skip them on
+            # every later delta run. Nonzero errors are record-blocking; the
+            # rows stay stamped for the next run (R8). (`skipped` is
+            # different — see the face gate below.)
+            #
             # Only signal "we exported the current state" when there was
             # actually content to export. A pre-Stage-3 upgrade (SQLite
             # metadata present, image_embedding empty) would otherwise
             # falsely advance the recorded export version and make later
-            # runs believe Qdrant is current. See export gating below.
-            if image_sent > 0 or video_sent > 0:
+            # runs believe Qdrant is current. In DELTA mode a 0-sent result
+            # is a legitimate no-op (0 dirty rows — e.g. a deletion-only
+            # run) UNLESS that same pre-Stage-3 shape holds (§4.3).
+            if iv_errors:
+                logger.error(
+                    f"Image/video export reported {iv_errors} error(s) — "
+                    "blocking the export-version record; dirty rows stay "
+                    "stamped for the next run"
+                )
+                # outcome.images_ok stays False
+            elif image_sent > 0 or video_sent > 0:
                 logger.info(
                     f"Qdrant image/video export complete (image={image_sent} video={video_sent})"
                 )
-                images_exported = True
+                outcome.images_ok = True
+            elif since_seq is not None and not _sqlite_pre_stage3_shape(sqlite_path):
+                logger.info(
+                    "Delta export: no dirty image/video rows to send (0-dirty no-op)"
+                )
+                outcome.images_ok = True
             else:
                 logger.warning(
                     "Image/video export sent 0 points — SQLite has no image_embedding "
@@ -1312,35 +2392,144 @@ def _do_qdrant_export(config, face_recognizer=None, face_count=0, export_all=Fal
                     "to populate the new tables (image and keyframe backfills are "
                     "automatic on the next normal indexer run)."
                 )
+                outcome.empty_tables = True
         else:
             logger.info("Skipping image/video export to Qdrant (reprocessing mode)")
 
-        # Export faces to Qdrant
-        if export_faces:
-            from .db.qdrant_export import export_faces_to_qdrant
+        # Export faces to Qdrant. face_recreate_required forces this even
+        # when the reprocess gate skipped the image/video export — the
+        # deleted face rows' points must not outlive their rows.
+        if export_faces or face_recreate_required:
             face_collection = getattr(config, 'col_face', None) or 'face_emb'
-            # Force recreate when reprocessing to remove orphaned face vectors, or if export_recreate is set
-            recreate_faces = getattr(config, 'reprocess_faces', False) or recreate
+            # Force recreate when reprocessing (to remove orphaned face
+            # vectors), when export_recreate is set, or when the durable
+            # marker demands it.
+            recreate_faces = (
+                getattr(config, 'reprocess_faces', False)
+                or recreate
+                or face_recreate_required
+            )
+            # A recreated (empty) collection needs the FULL face set.
+            face_since_seq = None if recreate_faces else since_seq
             try:
                 if recreate_faces:
                     logger.info(f"Exporting {face_count} faces to Qdrant (recreating collection to remove orphaned vectors)...")
                 else:
                     logger.info(f"Exporting {face_count} faces to Qdrant collection '{face_collection}'...")
-                export_faces_to_qdrant(
-                    Path(config.sqlite_path),
+                face_stats = export_faces_to_qdrant(
+                    sqlite_path,
                     collection=face_collection,
                     recreate=recreate_faces,
                     embedding_backend=getattr(config, 'face_recognizer_backend', 'facenet_pytorch'),
+                    since_seq=face_since_seq,
                 )
-                logger.info("Qdrant face export complete")
+                outcome.face_sent = int((face_stats or {}).get('sent', 0))
+                face_errors = int((face_stats or {}).get('errors', 0))
+                if face_errors:
+                    # §4.2: the exporter swallows per-batch upsert failures
+                    # into `errors` and returns normally — those faces'
+                    # vectors/payloads were NOT written. Marking the pass ok
+                    # would advance the watermark past their dirty stamps
+                    # (and clear the recreate marker below), permanently
+                    # skipping them. Record-blocking; rows stay stamped
+                    # (R8). `skipped` stays non-blocking: a face row with no
+                    # embedding blob is stable SQLite state that re-stamps
+                    # itself when the embedding lands — blocking on it would
+                    # wedge the watermark with no retry that can succeed.
+                    logger.error(
+                        f"Face export reported {face_errors} error(s) — "
+                        "blocking the export-version record; dirty face rows "
+                        "stay stamped for the next run"
+                    )
+                    outcome.faces_ok = False
+                else:
+                    outcome.faces_ok = True
+                    logger.info("Qdrant face export complete")
+                    if face_recreate_required:
+                        # Clear ONLY after the recreate export succeeded
+                        # (§4.1). A crash before this line re-runs the
+                        # recreate next time — idempotent and safe.
+                        with SQLiteStore(sqlite_path) as s3_db:
+                            s3_db.clear_face_recreate_required()
+                        logger.info(
+                            "Cleared face_recreate_required after successful recreate export"
+                        )
             except Exception as e:
+                # §4.2 widened gate: a face failure is RECORD-BLOCKING under
+                # delta export — the pre-S-3 swallow would advance the
+                # watermark past dirty face stamps and face tombstones,
+                # permanently skipping them.
                 logger.error(f"Face export to Qdrant failed: {e}")
+                outcome.faces_ok = False
+        else:
+            outcome.faces_ok = True  # nothing to export, nothing failed
+
+        # §4.2 deletion pass — unconditional on EVERY export, full included:
+        # a full export that skipped deletions would orphan same-run
+        # tombstones forever (their deleted_seq equals the watermark this
+        # run records).
+        try:
+            del_stats = delete_tombstoned_points_from_qdrant(
+                sqlite_path,
+                since_seq=since_seq,
+                video_collection=getattr(config, 'col_video', None) or 'video_emb',
+                face_collection=getattr(config, 'col_face', None) or 'face_emb',
+            )
+            outcome.deleted_points = int(del_stats.get('deleted_points', 0))
+            outcome.deletions_ok = True
+        except Exception as e:
+            logger.error(f"Qdrant tombstone deletion pass failed: {e}")
+            outcome.deletions_ok = False
 
     except Exception as e:
         logger.error(f"Qdrant export failed: {e}", exc_info=True)
         raise
 
-    return images_exported
+    return outcome
+
+
+def _read_qdrant_collection_counts():
+    """Collection point counts for the export-only summary, or None on failure.
+
+    Opens embedded Qdrant, so run_export must call this INSIDE the handoff
+    window — the moment the window releases, the API watcher reopens its
+    shared client, and a fresh ``QdrantClient(path=...)`` here would race it
+    for the embedded lock. The client is closed explicitly in a ``finally``:
+    a GC-released reference could outlive the window and collide with the
+    reopened API client.
+    """
+    try:
+        from qdrant_client import QdrantClient
+        from msa_settings import load_config
+
+        S = load_config()
+        client = QdrantClient(path=str(S.qdrant_path))
+    except Exception as e:
+        logger.warning(f"Could not open Qdrant for export summary counts: {e}")
+        return None
+    try:
+        counts = {}
+        for display_name, collection_name in [
+            ("image_emb", getattr(S.collections, 'image', 'image_emb')),
+            ("video_emb", getattr(S.collections, 'video', 'video_emb')),
+            ("face_emb", getattr(S.collections, 'face', 'face_emb')),
+        ]:
+            try:
+                info = client.get_collection(collection_name)
+                points_count = getattr(info, 'points_count', 0)
+                vector_size = getattr(info.vectors_config.params, 'size', 'unknown') if hasattr(info, 'vectors_config') else 'unknown'
+                counts[display_name] = (points_count, vector_size)
+            except Exception as e:
+                error_msg = str(e).lower()
+                if not ("not found" in error_msg or "404" in error_msg or "does not exist" in error_msg):
+                    logger.debug(f"Error querying {display_name}: {e}")
+                counts[display_name] = (0, 'unknown')
+        return counts
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 def run_export(config):
@@ -1394,36 +2583,96 @@ def run_export(config):
     except Exception as e:
         logger.warning(f"Could not read face_embedding count: {e}")
 
-    images_exported = _do_qdrant_export(config, face_recognizer, face_count, export_all=True)
-    if images_exported:
-        export_db = SQLiteStore(config.sqlite_path)
-        try:
-            latest_state = export_db.get_index_state()
-        finally:
-            export_db.close()
-        record_qdrant_export_version(
-            int(latest_state.get("index_version_seq") or 0),
-            latest_state.get("index_version_ts"),
+    # M-8/S-2: export-only mode joins the same sentinel-file handshake as
+    # run_index — this command is the documented manual repair after a
+    # blocked export, so it must be able to take the lock from a live API
+    # rather than colliding with its held client.
+    #
+    # EVERY Qdrant open in this mode — the post-export summary's collection
+    # counts included — must happen inside this window: the moment the
+    # with-block exits, the API watcher reopens its shared client, and any
+    # later QdrantClient(path=...) would race it for the embedded lock.
+    qdrant_counts = None
+    try:
+        # log_dir anchors the sentinel dir to the --config being exported
+        # (round-5): the manual-repair export must poll the same slot as the
+        # live API's watcher regardless of the cwd it was launched from.
+        with qdrant_handoff.handoff_window(log_dir=getattr(config, "log_dir", None)):
+            # Round-6 (P2): the FIRST Qdrant open of the window goes through
+            # the same lock-retry ladder as run_index's version read. A 15s
+            # grant timeout is LEGITIMATE while the API watcher is still
+            # inside its 120s write-drain ceiling — a bare open would abort
+            # on the API-held lock exactly when this documented manual
+            # repair is most needed. Open attempts are harmless probes: a
+            # grant landing mid-ladder frees the lock and the next attempt
+            # succeeds (see the LOCK_RETRY_TOTAL_SECONDS rationale). The
+            # first open is export_images_to_qdrant's client construction,
+            # which precedes any empty-table bailout, so every later open in
+            # the window (version record, summary counts) is post-first-open:
+            # the lock is proven free and the on-disk request keeps the API
+            # from reopening.
+            try:
+                export_outcome = qdrant_handoff.call_with_lock_retry(
+                    lambda: _do_qdrant_export(
+                        config, face_recognizer, face_count, export_all=True
+                    )
+                )
+            except Exception as _e:
+                if not qdrant_handoff.is_lock_error(_e):
+                    raise
+                # Ladder exhausted with the lock still held (§3.1 step 5):
+                # fail loudly, record no version — SQLite is canonical and
+                # untouched, so a later export replays cleanly.
+                logger.error(
+                    "Qdrant lock still held after {:.0f}s of retries — export "
+                    "not run. Retry once the process holding embedded Qdrant "
+                    "(usually the API) releases it. ({})",
+                    qdrant_handoff.LOCK_RETRY_TOTAL_SECONDS, _e,
+                )
+                return
+            # §4.2 widened gate: face-export and deletion-pass failures now
+            # block the record too (ExportOutcome.record_ok).
+            if export_outcome:
+                export_db = SQLiteStore(config.sqlite_path)
+                try:
+                    latest_state = export_db.get_index_state()
+                finally:
+                    export_db.close()
+                record_qdrant_export_version(
+                    int(latest_state.get("index_version_seq") or 0),
+                    latest_state.get("index_version_ts"),
+                )
+                logger.info(
+                    "Recorded Qdrant export version seq={} ts={}",
+                    int(latest_state.get("index_version_seq") or 0),
+                    latest_state.get("index_version_ts"),
+                )
+            else:
+                logger.warning("Export did not fully complete — skipping version record to avoid stale state")
+                _log_export_record_skip(export_outcome)
+            qdrant_counts = _read_qdrant_collection_counts()
+    except qdrant_handoff.HandoffSlotBusyError as _busy:
+        # Never clobber a live foreign window, never interleave two exporters
+        # (§3.1 step 5): fail loudly and leave the active window undisturbed.
+        # Same early-return idiom as the missing-DB failure above.
+        logger.error(
+            "Another process already holds the Qdrant handoff window — export "
+            "not run. Retry after the active export/index run finishes. ({})",
+            _busy,
         )
-        logger.info(
-            "Recorded Qdrant export version seq={} ts={}",
-            int(latest_state.get("index_version_seq") or 0),
-            latest_state.get("index_version_ts"),
-        )
-    else:
-        logger.warning("Image/video export did not complete — skipping version record to avoid stale state")
-    
+        return
+
     logger.info("Qdrant export complete")
 
-    # Summary: SQLite (canonical) vs Qdrant (search index)
+    # Summary: SQLite (canonical) vs Qdrant (search index). The SQLite reads
+    # run deliberately OUTSIDE the handoff window (SQLite is never part of
+    # the lock handshake); the Qdrant counts were captured inside it.
     logger.info("")
     logger.info("Export Summary (SQLite → Qdrant):")
 
     try:
-        from qdrant_client import QdrantClient
-        from msa_settings import load_config
-
-        S = load_config()
+        if qdrant_counts is None:
+            raise RuntimeError("Qdrant collection counts unavailable (read failed inside the handoff window)")
         sqlite_path = Path(config.sqlite_path)
 
         with SQLiteStore(sqlite_path) as sqlite_db:
@@ -1452,27 +2701,6 @@ def run_export(config):
             face_emb_sqlite = sqlite_db.conn.execute(
                 "SELECT COUNT(1) FROM face_embedding"
             ).fetchone()[0]
-
-        client = QdrantClient(path=str(S.qdrant_path))
-        collections_to_check = [
-            ("image_emb", getattr(S.collections, 'image', 'image_emb')),
-            ("video_emb", getattr(S.collections, 'video', 'video_emb')),
-            ("face_emb", getattr(S.collections, 'face', 'face_emb')),
-        ]
-        qdrant_counts = {}
-        for display_name, collection_name in collections_to_check:
-            try:
-                info = client.get_collection(collection_name)
-                points_count = getattr(info, 'points_count', 0)
-                vector_size = getattr(info.vectors_config.params, 'size', 'unknown') if hasattr(info, 'vectors_config') else 'unknown'
-                qdrant_counts[display_name] = (points_count, vector_size)
-            except Exception as e:
-                error_msg = str(e).lower()
-                if "not found" in error_msg or "404" in error_msg or "does not exist" in error_msg:
-                    qdrant_counts[display_name] = (0, 'unknown')
-                else:
-                    logger.debug(f"Error querying {display_name}: {e}")
-                    qdrant_counts[display_name] = (0, 'unknown')
 
         logger.info("")
         logger.info("  Images:")

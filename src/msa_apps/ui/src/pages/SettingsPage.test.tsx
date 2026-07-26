@@ -48,12 +48,20 @@ const diagData = {
   qdrant_url: 'http://localhost:6333',
   api_url: 'http://localhost:52341',
   app_version: '0.3.2',
+  cli: {
+    msa_path: '/home/user/msa/.venv/bin/msa',
+    launcher_path: '/home/user/.local/bin/msa',
+    launcher_installed: false,
+    on_path: false,
+  },
 }
 
-function mockFetch(): void {
+function mockFetch(platform = 'macos', diag: Record<string, unknown> = diagData): void {
   vi.stubGlobal('fetch', vi.fn((url: string, opts?: RequestInit) => {
     if (url === '/diagnostics')
-      return Promise.resolve({ ok: true, json: () => Promise.resolve(diagData) })
+      return Promise.resolve({ ok: true, json: () => Promise.resolve(diag) })
+    if (url === '/platform')
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ platform }) })
     if (url === '/config/model') {
       if (opts?.method === 'PATCH')
         return Promise.resolve({ ok: true, json: () => Promise.resolve({ updated: ['batch_size'] }) })
@@ -144,6 +152,88 @@ describe('SettingsPage', () => {
       renderPage()
       await waitFor(() => expect(screen.getByText('0.3.2')).toBeInTheDocument())
       expect(screen.queryByText('0.1.0')).toBeNull()
+    })
+  })
+
+  describe('command-line tool (msa CLI opt-in)', () => {
+    it('macOS not-installed: shows a non-clobbering symlink opt-in targeting the venv msa', async () => {
+      renderPage()
+      await waitFor(() => expect(screen.getByText('Command-line tool')).toBeInTheDocument())
+      // Non-clobbering: `ln -s` (no -f) guarded by an existence check, targeting our venv msa.
+      expect(
+        screen.getByText(/ln -s "\/home\/user\/msa\/\.venv\/bin\/msa" ~\/\.local\/bin\/msa/),
+      ).toBeInTheDocument()
+      expect(screen.getByText(/already exists — remove it first/)).toBeInTheDocument()
+      // Must NOT force-overwrite an existing launcher.
+      expect(screen.queryByText(/ln -sf/)).toBeNull()
+    })
+
+    it('Windows not-installed: shows the executable path, no symlink command', async () => {
+      mockFetch('windows', {
+        ...diagData,
+        cli: { msa_path: 'C:\\Users\\u\\msa\\.venv\\Scripts\\msa.exe', launcher_path: null, launcher_installed: false, on_path: false },
+      })
+      renderPage()
+      await waitFor(() => expect(screen.getByText('Command-line tool')).toBeInTheDocument())
+      expect(screen.getByText(/Scripts\\msa\.exe/)).toBeInTheDocument()
+      expect(screen.queryByText(/ln -s /)).toBeNull()
+    })
+
+    it('already installed: states the tool is available, no install command', async () => {
+      mockFetch('macos', {
+        ...diagData,
+        cli: { msa_path: '/home/user/msa/.venv/bin/msa', launcher_path: '/home/user/.local/bin/msa', launcher_installed: true, on_path: false },
+      })
+      renderPage()
+      await waitFor(() =>
+        expect(screen.getByText(/is available in your terminal/)).toBeInTheDocument(),
+      )
+      expect(screen.queryByText(/ln -s /)).toBeNull()
+    })
+
+    it('no msa_path: section is omitted entirely', async () => {
+      mockFetch('macos', {
+        ...diagData,
+        cli: { msa_path: null, launcher_path: null, launcher_installed: false, on_path: false },
+      })
+      renderPage()
+      await waitFor(() => expect(screen.getByText('Diagnostics')).toBeInTheDocument())
+      expect(screen.queryByText('Command-line tool')).toBeNull()
+    })
+  })
+
+  describe('uninstall', () => {
+    it('renders the Uninstall section with instructions collapsed', () => {
+      renderPage()
+      expect(screen.getByText('Uninstall')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: /Uninstall Media Search Agent/ })).toBeInTheDocument()
+      expect(screen.queryByText(/kept by default/)).toBeNull()
+    })
+
+    it('macOS instructions show the uninstall-desktop.sh one-liner and default-keep wording', async () => {
+      renderPage()
+      await userEvent.click(screen.getByRole('button', { name: /Uninstall Media Search Agent/ }))
+      await waitFor(() =>
+        expect(screen.getByText(/uninstall-desktop\.sh/)).toBeInTheDocument()
+      )
+      // ADR-005 Tier-2 posture must be stated: user data is kept by default.
+      expect(screen.getByText(/index, config, logs and model cache are kept by default/)).toBeInTheDocument()
+    })
+
+    it('Windows instructions point at Apps and the app-data checkbox (default keep)', async () => {
+      mockFetch('windows')
+      renderPage()
+      await userEvent.click(screen.getByRole('button', { name: /Uninstall Media Search Agent/ }))
+      await waitFor(() => expect(screen.getByText(/Installed apps/)).toBeInTheDocument())
+      expect(screen.getByText(/Delete the application data/)).toBeInTheDocument()
+      expect(screen.getByText(/kept by default/)).toBeInTheDocument()
+    })
+
+    it('Linux/WSL2 points at the shell-bundle uninstall path', async () => {
+      mockFetch('linux')
+      renderPage()
+      await userEvent.click(screen.getByRole('button', { name: /Uninstall Media Search Agent/ }))
+      await waitFor(() => expect(screen.getByText(/msa uninstall/)).toBeInTheDocument())
     })
   })
 

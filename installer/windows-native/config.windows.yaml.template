@@ -67,6 +67,14 @@ keyframes_per_shot: 1
 # Logs are written to %LOCALAPPDATA%\MediaSearchAgent\logs\.
 log_level: "INFO"
 
+# ── Incremental indexing ────────────────────────────────────────────────────────
+# The indexer skips re-hashing files whose size and modification time are
+# unchanged (fingerprint fast-path) and tombstones media whose files have been
+# deleted, after two consecutive completed scans. Defaults are on and safe.
+# incremental:
+#   fingerprint_enabled: true   # false = hash every file every run; also disables deletion detection
+#   deletion_sweep: true        # false = never mark deleted files as removed
+
 # ── Server ────────────────────────────────────────────────────────────────────
 server:
   qdrant_recreate_collections_on_export: false

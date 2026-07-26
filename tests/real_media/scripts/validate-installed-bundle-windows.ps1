@@ -142,6 +142,77 @@ $env:PATH = "$toolDir;$env:PATH"
 
 Write-Host ("exiftool: " + (where.exe exiftool))
 & exiftool -ver
+
+# --- Incremental-phase helpers (M-8/S-1, BVT Phases C/D) -------------------
+# Native-command wrappers per NCE-001: under $ErrorActionPreference='Stop'
+# PowerShell 5.1 promotes ANY native stderr write to a terminating error,
+# so best-effort/streamed native calls run under EAP='Continue' restored in
+# finally, with explicit $LASTEXITCODE checks.
+$checksScript = Join-Path $testRoot "scripts\incremental_checks.py"
+
+function Invoke-ExifToolWrite {
+    param([string[]] $ExifArgs)
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & exiftool @ExifArgs 2>&1 | Out-Null
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "FAIL: exiftool $($ExifArgs -join ' ') (rc=$LASTEXITCODE)"
+        exit 1
+    }
+}
+
+function Invoke-IncrementalCheck {
+    param([string[]] $CheckArgs)
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $venvPy $checksScript @CheckArgs 2>&1 | ForEach-Object { Write-Host "$_" }
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "FAIL: incremental check failed: $($CheckArgs -join ' ')"
+        exit 1
+    }
+}
+
+function Invoke-IndexerRerun {
+    param([string] $OutLog, [string] $ErrLog)
+    $proc = Start-Process -FilePath $msaCmd `
+        -ArgumentList @("index", "run", "--config", $configPath,
+                        "--media-source-override", $fixtureRoot) `
+        -RedirectStandardOutput $OutLog `
+        -RedirectStandardError $ErrLog `
+        -PassThru -Wait
+    $rc = $proc.ExitCode
+    if ($null -ne $rc -and $rc -ne 0) {
+        Write-Host "FAIL: indexer re-run failed (rc=$rc). See $OutLog / $ErrLog"
+        if (Test-Path $OutLog) { Get-Content $OutLog -Tail 100 }
+        if (Test-Path $ErrLog) { Get-Content $ErrLog -Tail 100 }
+        exit 1
+    }
+}
+
+# Step 6b: Stage the content-unique seed files that BVT Phases C/D (Step 7c)
+# mutate. Must land before the first index run so the seeds are in the
+# baseline. Mirrors tests/real_media/scripts/incremental-phases.sh seed.
+$seedDir = Join-Path $fixtureRoot "incremental"
+New-Item -ItemType Directory -Force -Path $seedDir | Out-Null
+$seedImage1 = Join-Path $seedDir "incremental_seed_image_01.jpg"
+$seedImage2 = Join-Path $seedDir "incremental_seed_image_02.jpg"
+$seedVideo1 = Join-Path $seedDir "incremental_seed_video_01.mp4"
+Copy-Item (Join-Path $fixtureRoot "originals\object_landscape_01.jpg") $seedImage1 -Force
+Invoke-ExifToolWrite @("-overwrite_original", "-Artist=MSA-BVT-Incremental-Seed-01", $seedImage1)
+Copy-Item (Join-Path $fixtureRoot "originals\object_landscape_01.jpg") $seedImage2 -Force
+Invoke-ExifToolWrite @("-overwrite_original", "-Artist=MSA-BVT-Incremental-Seed-02", $seedImage2)
+Copy-Item (Join-Path $fixtureRoot "derived\trimmed_gopro_gps_01.mp4") $seedVideo1 -Force
+Invoke-ExifToolWrite @("-overwrite_original", "-Title=MSA-BVT-Incremental-Seed-Video", $seedVideo1)
+Write-Host "Staged incremental seed files under $seedDir"
+
 & $venvPy -m pytest (Join-Path $testRoot "test_real_media_fixtures.py") -v -m "not slow"
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
@@ -281,6 +352,77 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
+# Step 7c: BVT Phases C/D -- incremental indexing (M-8/S-1 plan 6.2).
+# Phase C proves a no-op re-run hashes nothing and skips the export; Phase D
+# mutates the staged fixture copy (EXIF re-inject / move / delete) and
+# asserts the supersede, move, and two-scan tombstone paths via the
+# INDEXER_SUMMARY counters. Runs before the API starts (embedded-Qdrant
+# lock). Mirrors tests/real_media/scripts/incremental-phases.sh run.
+$sqliteDb = Join-Path $dataDir "index\media.sqlite"
+$phaseCBaseline = Join-Path $logsDir "phase-c-baseline.json"
+$phaseCOut = Join-Path $logsDir "indexer-phase-c.out.log"
+$phaseCErr = Join-Path $logsDir "indexer-phase-c.err.log"
+
+Write-Host "Phase C: no-op re-run"
+Invoke-IncrementalCheck @("snapshot", "--sqlite", $sqliteDb, "--out", $phaseCBaseline)
+Invoke-IndexerRerun -OutLog $phaseCOut -ErrLog $phaseCErr
+Invoke-IncrementalCheck @("assert-complete", "--log", $phaseCOut, "--log", $phaseCErr,
+    "--expect", "files_hashed=0",
+    "--expect", "moves_detected=0", "--expect", "superseded=0",
+    "--expect", "missing_marked=0", "--expect", "tombstoned=0",
+    "--expect", "resurrected=0",
+    "--expect-gt", "fingerprint_hits=0",
+    "--expect-eq-key", "fingerprint_hits=total_found")
+Invoke-IncrementalCheck @("assert-contains", "--log", $phaseCOut, "--log", $phaseCErr,
+    "--text", "Skipping Qdrant export (no index changes detected")
+Invoke-IncrementalCheck @("compare-counts", "--sqlite", $sqliteDb, "--baseline", $phaseCBaseline)
+Write-Host "Phase C PASSED"
+
+Write-Host "Phase D(a): EXIF re-inject incremental_seed_image_01.jpg"
+Invoke-ExifToolWrite @("-overwrite_original", "-Artist=MSA-BVT-Incremental-Mutated", $seedImage1)
+$phaseDExifOut = Join-Path $logsDir "indexer-phase-d-exif.out.log"
+$phaseDExifErr = Join-Path $logsDir "indexer-phase-d-exif.err.log"
+Invoke-IndexerRerun -OutLog $phaseDExifOut -ErrLog $phaseDExifErr
+Invoke-IncrementalCheck @("assert-complete", "--log", $phaseDExifOut, "--log", $phaseDExifErr,
+    "--expect", "files_hashed=1", "--expect", "superseded=1",
+    "--expect", "processed_images=1", "--expect", "processed_videos=0",
+    "--expect", "moves_detected=0")
+
+Write-Host "Phase D(b): move incremental_seed_image_02.jpg into incremental\moved\"
+$phaseDMoveBaseline = Join-Path $logsDir "phase-d-move-baseline.json"
+Invoke-IncrementalCheck @("snapshot", "--sqlite", $sqliteDb, "--out", $phaseDMoveBaseline)
+$movedDir = Join-Path $seedDir "moved"
+New-Item -ItemType Directory -Force -Path $movedDir | Out-Null
+Move-Item $seedImage2 (Join-Path $movedDir "incremental_seed_image_02.jpg") -Force
+$phaseDMoveOut = Join-Path $logsDir "indexer-phase-d-move.out.log"
+$phaseDMoveErr = Join-Path $logsDir "indexer-phase-d-move.err.log"
+Invoke-IndexerRerun -OutLog $phaseDMoveOut -ErrLog $phaseDMoveErr
+Invoke-IncrementalCheck @("assert-complete", "--log", $phaseDMoveOut, "--log", $phaseDMoveErr,
+    "--expect", "moves_detected=1", "--expect", "files_hashed=1",
+    "--expect", "processed_images=0", "--expect", "processed_videos=0")
+Invoke-IncrementalCheck @("compare-counts", "--sqlite", $sqliteDb,
+    "--baseline", $phaseDMoveBaseline,
+    "--tables", "image_embedding,keyframe_embedding,face_embedding")
+
+Write-Host "Phase D(c): delete incremental_seed_video_01.mp4 (two-scan grace)"
+Remove-Item $seedVideo1 -Force
+$phaseDDel1Out = Join-Path $logsDir "indexer-phase-d-del1.out.log"
+$phaseDDel1Err = Join-Path $logsDir "indexer-phase-d-del1.err.log"
+Invoke-IndexerRerun -OutLog $phaseDDel1Out -ErrLog $phaseDDel1Err
+Invoke-IncrementalCheck @("assert-complete", "--log", $phaseDDel1Out, "--log", $phaseDDel1Err,
+    "--expect", "missing_marked=1", "--expect", "tombstoned=0")
+$phaseDDel2Out = Join-Path $logsDir "indexer-phase-d-del2.out.log"
+$phaseDDel2Err = Join-Path $logsDir "indexer-phase-d-del2.err.log"
+Invoke-IndexerRerun -OutLog $phaseDDel2Out -ErrLog $phaseDDel2Err
+Invoke-IncrementalCheck @("assert-complete", "--log", $phaseDDel2Out, "--log", $phaseDDel2Err,
+    "--expect", "tombstoned=1")
+Invoke-IncrementalCheck @("assert-media-state", "--sqlite", $sqliteDb,
+    "--moved-name", "incremental_seed_image_02.jpg",
+    "--moved-rel", "incremental/moved/incremental_seed_image_02.jpg",
+    "--deleted-name", "incremental_seed_video_01.mp4")
+Write-Host "Phase D PASSED"
+$env:MSA_REALDATA_INCREMENTAL = "1"
+
 $env:MSA_REALDATA_WORKSPACE = $dataDir
 $env:MSA_REALDATA_SQLITE_PATH = Join-Path $dataDir "index\media.sqlite"
 $env:MSA_REALDATA_FAISS_PATH = Join-Path $dataDir "index\image_vec.faiss"
@@ -341,6 +483,20 @@ try {
     # Step 8: Run the runtime test suite against the installed indexed state and
     # live API server, then stop the API in the finally block.
     & $venvPy -m pytest (Join-Path $testRoot "test_real_media_runtime.py") -v
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+
+    # Step 9: M-8/S-2 - search-during-indexing gate (Qdrant lock window,
+    # sentinel-file handshake; Windows inclusion is mandatory - L7: the
+    # file-polling protocol carries everything on this platform). Starts a
+    # fresh indexer run THROUGH the live API (POST /indexer/start) and polls
+    # /search for the whole run: every response must be HTTP 200, non-empty
+    # during pre-export phases, the mutated seed searchable afterwards,
+    # handshake lines in order in the run log, and no "already accessed by
+    # another instance" contention.
+    $env:MSA_REALDATA_SEARCH_DURING_INDEXING = "1"
+    & $venvPy -m pytest (Join-Path $testRoot "test_real_media_runtime.py") -v -k TestSearchDuringIndexing
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }

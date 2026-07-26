@@ -18,10 +18,77 @@ class LegacyFaceSchemaError(RuntimeError):
     """
 
 
+def _media_path_unique_index_names(conn: sqlite3.Connection) -> List[str]:
+    """Names of UNIQUE-constraint indexes on media that cover exactly (path).
+
+    A column-level ``UNIQUE`` shows up in ``PRAGMA index_list`` with
+    origin ``'u'`` (constraint-created), typically named
+    ``sqlite_autoindex_media_N``. Detecting it via the index list is
+    robust against DDL formatting differences across historical DBs.
+    """
+    names: List[str] = []
+    try:
+        for row in conn.execute("PRAGMA index_list(media)").fetchall():
+            # (seq, name, unique, origin, partial)
+            name, unique, origin = row[1], row[2], row[3]
+            if not unique or origin != "u":
+                continue
+            cols = [r[2] for r in conn.execute(f'PRAGMA index_info("{name}")').fetchall()]
+            if cols == ["path"]:
+                names.append(name)
+    except sqlite3.Error:
+        return []
+    return names
+
+
+def media_path_rebuild_pending(sqlite_path) -> bool:
+    """True if the DB at ``sqlite_path`` still carries UNIQUE(media.path).
+
+    Used by the indexer entry point to decide whether to take the
+    pre-migration backup BEFORE opening the main store connection
+    (§3.1a, R4). Opens (and closes) its own throwaway connection;
+    a missing file or missing media table means no rebuild is pending.
+    """
+    p = Path(sqlite_path)
+    if not p.exists():
+        return False
+    try:
+        conn = sqlite3.connect(str(p))
+    except sqlite3.Error:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='media'"
+        ).fetchone()
+        if row is None:
+            return False
+        return bool(_media_path_unique_index_names(conn))
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+
+
+# media columns whose write is payload-relevant (M-8/S-3 §4.1): they feed at
+# least one Qdrant payload builder (see payload_columns.PAYLOAD_SOURCES).
+# gps_lat/gps_lon accompany place refreshes and are included conservatively.
+_MEDIA_PAYLOAD_FIELDS = frozenset(
+    {"path", "source_name", "rel_path", "place", "ts_utc", "added_at", "gps_lat", "gps_lon"}
+)
+
+
 class SQLiteStore:
     def __init__(self, path: Path, autocommit: bool = True):
         self.path = path
-        self.conn = sqlite3.connect(str(path))
+        # timeout (busy wait) raised from the sqlite3 default of 5s: the API's
+        # §4 payload-write guard (M-8/S-2) holds its deferred-commit write
+        # transaction across the Qdrant payload sync — bounded but multi-second
+        # for a large person merge — and a concurrent indexer batch commit
+        # should queue behind it rather than error with "database is locked".
+        # WAL keeps readers unaffected; this only changes behavior under
+        # writer-writer contention, where waiting is strictly more robust
+        # than failing.
+        self.conn = sqlite3.connect(str(path), timeout=30.0)
         self.conn.execute("PRAGMA foreign_keys=ON")
         # synchronous=NORMAL is the appropriate companion to journal_mode=WAL
         # for a single-host workload — it keeps fsync only at WAL checkpoints
@@ -34,10 +101,127 @@ class SQLiteStore:
         self.autocommit = autocommit
         # Lazy-initialized map: source_name -> base Path from config.yaml
         self._source_map: Optional[dict[str, Path]] = None
+        # M-8/S-3 §4.1: run-scoped stamp. The indexer pipeline sets this to
+        # pending_seq (index_version_seq + 1 at run start) so every
+        # payload-relevant write of the run stamps its embedding rows with
+        # the seq the end-of-run bump will commit. When None (API-side /
+        # out-of-band writers), _stamp() allocates index_version_seq + 1
+        # transactionally on this connection — committed or rolled back
+        # atomically with the payload write it stamps.
+        self.stamp_seq: Optional[int] = None
 
     def _maybe_commit(self):
         if self.autocommit:
             self.commit()
+
+    # ── M-8/S-3 §4.1: per-row dirty stamping ──────────────────────────────
+    #
+    # Every payload-relevant write stamps the embedding rows whose Qdrant
+    # payload embeds the written cell, so delta export (`updated_seq >
+    # exported_seq`) can never miss a payload-only change (R7). The
+    # write→stamp mapping is declared in payload_columns.py and locked by
+    # the coverage test in tests/test_delta_export.py. Media-level writes
+    # use the SUPERSET stamp (image row + all keyframe rows + all face rows
+    # of the media): coarser than strictly needed per column, but correct by
+    # construction and immune to per-column-precision drift.
+
+    def _stamp(self) -> int:
+        """The seq to stamp writes with.
+
+        Inside an indexer run: the run's pending_seq (set by the pipeline).
+        Outside a run (API label/rename/merge): index_version_seq + 1, read
+        on THIS connection so the allocation shares the caller's deferred
+        transaction — the S-2 commit-gated endpoints roll the stamp back
+        together with the payload write (no orphan stamps).
+        """
+        if self.stamp_seq is not None:
+            return int(self.stamp_seq)
+        row = self.conn.execute(
+            "SELECT index_version_seq FROM index_state WHERE singleton_id = 1"
+        ).fetchone()
+        return (int(row[0]) if row is not None and row[0] is not None else 0) + 1
+
+    def _stamp_media_payload_rows(self, media_id: str, seq: Optional[int] = None) -> None:
+        """Superset stamp for a media-level payload write: the media's
+        image_embedding row, all its keyframe_embedding rows, and its
+        faces' face_embedding rows. No-ops harmlessly for rows that don't
+        exist (e.g. brand-new media whose embeddings land later — their
+        upserts stamp themselves)."""
+        if seq is None:
+            seq = self._stamp()
+        self.conn.execute(
+            "UPDATE image_embedding SET updated_seq = ? WHERE media_id = ?",
+            (int(seq), media_id),
+        )
+        self.conn.execute(
+            """
+            UPDATE keyframe_embedding SET updated_seq = ?
+            WHERE keyframe_id IN (SELECT id FROM video_keyframes WHERE video_id = ?)
+            """,
+            (int(seq), media_id),
+        )
+        self.conn.execute(
+            """
+            UPDATE face_embedding SET updated_seq = ?
+            WHERE face_id IN (SELECT face_id FROM face WHERE media_id = ?)
+            """,
+            (int(seq), media_id),
+        )
+
+    def _stamp_face_rows(self, face_ids: List[str], seq: Optional[int] = None) -> None:
+        """Stamp specific faces' embedding rows PLUS their owning videos'
+        keyframe rows (video payloads embed people names). Chunked to stay
+        under SQLite's bound-parameter limit."""
+        if not face_ids:
+            return
+        if seq is None:
+            seq = self._stamp()
+        CHUNK = 500
+        for i in range(0, len(face_ids), CHUNK):
+            chunk = face_ids[i:i + CHUNK]
+            ph = ",".join(["?"] * len(chunk))
+            self.conn.execute(
+                f"UPDATE face_embedding SET updated_seq = ? WHERE face_id IN ({ph})",
+                [int(seq), *chunk],
+            )
+            self.conn.execute(
+                f"""
+                UPDATE keyframe_embedding SET updated_seq = ?
+                WHERE keyframe_id IN (
+                    SELECT vk.id FROM video_keyframes vk
+                    WHERE vk.video_id IN (
+                        SELECT DISTINCT media_id FROM face WHERE face_id IN ({ph})
+                    )
+                )
+                """,
+                [int(seq), *chunk],
+            )
+
+    def _stamp_person_rows(self, person_id: str, seq: Optional[int] = None) -> None:
+        """Stamp every face of a person + every keyframe row of videos that
+        contain those faces (face payloads carry person_name; keyframe
+        payloads carry people names)."""
+        if seq is None:
+            seq = self._stamp()
+        self.conn.execute(
+            """
+            UPDATE face_embedding SET updated_seq = ?
+            WHERE face_id IN (SELECT face_id FROM face WHERE person_id = ?)
+            """,
+            (int(seq), person_id),
+        )
+        self.conn.execute(
+            """
+            UPDATE keyframe_embedding SET updated_seq = ?
+            WHERE keyframe_id IN (
+                SELECT vk.id FROM video_keyframes vk
+                WHERE vk.video_id IN (
+                    SELECT DISTINCT media_id FROM face WHERE person_id = ?
+                )
+            )
+            """,
+            (int(seq), person_id),
+        )
 
     # ---------------- Internal helpers: source/path resolution ----------------
     def _load_source_map(self) -> dict[str, Path]:
@@ -85,9 +269,17 @@ class SQLiteStore:
         full re-process — i.e. ``msa index run``. Other entry points
         (export-only mode, porter, dry-runs) must call
         :meth:`init_schema_no_migrations` instead.
+
+        Also performs the one-time §3.1a path-authority rebuild (drop
+        ``UNIQUE(media.path)``) when a pre-M-8 media table is detected.
+        Like the face migration, the rebuild is indexer-entry-only:
+        :meth:`init_schema_no_migrations` stays non-mutating for existing
+        tables. The indexer takes a pre-migration backup first, gated on
+        :func:`media_path_rebuild_pending`.
         """
         self._maybe_drop_legacy_face_table()
         self._apply_schema_and_additive_migrations(schema_path)
+        self._maybe_rebuild_media_drop_unique_path(schema_path)
 
     def init_schema_no_migrations(self, schema_path: Path):
         """Idempotent schema init without the destructive face-table drop.
@@ -230,12 +422,217 @@ class SQLiteStore:
         except Exception:
             pass
 
+        # Migration (M-8): Add missing_since_scan_id column for the deletion
+        # sweep's legacy-orphan grace state. Fresh installs get it from
+        # schema.sql; upgraded DBs need the additive ALTER.
+        try:
+            cursor = self.conn.execute("PRAGMA table_info(media)")
+            columns = [col[1] for col in cursor.fetchall()]
+            if 'missing_since_scan_id' not in columns:
+                print("⚠️  Adding missing_since_scan_id column to media table...")
+                self.conn.execute("ALTER TABLE media ADD COLUMN missing_since_scan_id INTEGER")
+                self.conn.commit()
+        except Exception:
+            pass
+
+        # Migration (M-8/S-3, R10): per-row dirty stamps for delta Qdrant
+        # export. Additive only (ADD COLUMN / CREATE INDEX IF NOT EXISTS).
+        # Unlike the legacy blocks above, failures here RAISE (after
+        # rollback) instead of being swallowed: a silently-skipped stamp
+        # column or tombstone seed would mean permanently stale / dangling
+        # Qdrant points — the exact silent-divergence class S-3 closes.
+        # Each ALTER + its seed commit atomically (SQLite DDL is
+        # transactional), so a partial migration cannot persist.
+        try:
+            # updated_seq on the three embedding tables + covering indexes.
+            # The indexes are created HERE (not schema.sql) because on a
+            # pre-S-3 DB schema.sql runs before the column exists; this
+            # path runs for fresh DBs too, so parity holds.
+            for _table, _index in (
+                ("image_embedding", "idx_image_emb_updated"),
+                ("keyframe_embedding", "idx_kf_emb_updated"),
+                ("face_embedding", "idx_face_emb_updated"),
+            ):
+                cols = [c[1] for c in self.conn.execute(f"PRAGMA table_info({_table})").fetchall()]
+                if 'updated_seq' not in cols:
+                    print(f"⚠️  Adding updated_seq column to {_table} table (M-8/S-3)...")
+                    self.conn.execute(
+                        f"ALTER TABLE {_table} ADD COLUMN updated_seq INTEGER NOT NULL DEFAULT 0"
+                    )
+                self.conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS {_index} ON {_table}(updated_seq)"
+                )
+            self.conn.commit()
+
+            # media.deleted_seq + pre-existing tombstone seeding. Seeded at
+            # index_version_seq + 1 — ABOVE the exported watermark, not at
+            # it (plan §4.1, P2): when SQLite and Qdrant are in sync at
+            # migration, a stamp at the current seq would never satisfy
+            # `deleted_seq > since_seq` and the dangling points would
+            # survive forever. One seq ahead, the §4.2 dirty trigger picks
+            # them up on the next run. Same-transaction as the ALTER so the
+            # column can never exist unseeded.
+            cols = [c[1] for c in self.conn.execute("PRAGMA table_info(media)").fetchall()]
+            if 'deleted_seq' not in cols:
+                print("⚠️  Adding deleted_seq column to media table (M-8/S-3)...")
+                self.conn.execute("ALTER TABLE media ADD COLUMN deleted_seq INTEGER")
+                self.conn.execute(
+                    """
+                    UPDATE media SET deleted_seq = (
+                        SELECT index_version_seq + 1 FROM index_state WHERE singleton_id = 1
+                    )
+                    WHERE deleted = 1 AND deleted_seq IS NULL
+                    """
+                )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_media_deleted_seq ON media(deleted_seq)"
+            )
+            self.conn.commit()
+
+            # index_state: s3_migration_seq (first-delta-run guard input,
+            # seeded ONCE to the migration-time seq — never re-seeded) and
+            # the durable face_recreate_required marker.
+            cols = [c[1] for c in self.conn.execute("PRAGMA table_info(index_state)").fetchall()]
+            if 's3_migration_seq' not in cols:
+                print("⚠️  Adding s3_migration_seq column to index_state table (M-8/S-3)...")
+                self.conn.execute(
+                    "ALTER TABLE index_state ADD COLUMN s3_migration_seq INTEGER NOT NULL DEFAULT 0"
+                )
+                self.conn.execute(
+                    "UPDATE index_state SET s3_migration_seq = index_version_seq WHERE singleton_id = 1"
+                )
+            if 'face_recreate_required' not in cols:
+                print("⚠️  Adding face_recreate_required column to index_state table (M-8/S-3)...")
+                self.conn.execute(
+                    "ALTER TABLE index_state ADD COLUMN face_recreate_required INTEGER NOT NULL DEFAULT 0"
+                )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def _maybe_rebuild_media_drop_unique_path(self, schema_path: Path):
+        """§3.1a one-time table rebuild: drop ``UNIQUE`` on ``media.path``.
+
+        SQLite cannot drop a constraint in place, so: disable foreign keys
+        (BEFORE any transaction — the pragma is silently ignored while a
+        transaction is active), then in one transaction create the
+        replacement table from the canonical schema.sql media DDL (which
+        post-M-8 has no UNIQUE on path), copy all rows, drop the old
+        table, rename, recreate the media indexes, verify row count and
+        ``PRAGMA foreign_key_check``, commit. ``media_id`` is untouched, so
+        child tables (FK on media_id) need no changes. No-op when the
+        constraint is already gone.
+        """
+        if not _media_path_unique_index_names(self.conn):
+            return
+
+        with open(schema_path, "r") as f:
+            schema_sql = f.read()
+        # Extract the media DDL by letting SQLite itself parse schema.sql in
+        # a scratch in-memory DB, then rename the table so SQLite rewrites
+        # the CREATE statement authoritatively under the rebuild name. (A
+        # regex over the raw SQL would silently truncate at the first ");"
+        # inside a future column comment or CHECK constraint.)
+        scratch = sqlite3.connect(":memory:")
+        try:
+            scratch.executescript(schema_sql)
+            scratch.execute("ALTER TABLE media RENAME TO media_rebuild_m8")
+            ddl_row = scratch.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='media_rebuild_m8'"
+            ).fetchone()
+        except sqlite3.Error as e:
+            raise RuntimeError(
+                f"media DDL not found in schema.sql — cannot run the §3.1a rebuild ({e})"
+            )
+        finally:
+            scratch.close()
+        if ddl_row is None or not ddl_row[0]:
+            raise RuntimeError(
+                "media DDL not found in schema.sql — cannot run the §3.1a rebuild"
+            )
+        create_rebuild_sql = ddl_row[0]
+
+        print("⚠️  Rebuilding media table to drop UNIQUE(path) (M-8 §3.1a)...")
+
+        # Close any open transaction so PRAGMA foreign_keys takes effect,
+        # then take explicit transaction control for the rebuild.
+        self.conn.commit()
+        old_isolation = self.conn.isolation_level
+        self.conn.isolation_level = None  # autocommit; we BEGIN explicitly
+        try:
+            self.conn.execute("PRAGMA foreign_keys=OFF")
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                self.conn.execute("DROP TABLE IF EXISTS media_rebuild_m8")
+                self.conn.execute(create_rebuild_sql)
+
+                old_cols = [
+                    r[1]
+                    for r in self.conn.execute("PRAGMA table_info(media)").fetchall()
+                ]
+                new_cols = [
+                    r[1]
+                    for r in self.conn.execute(
+                        "PRAGMA table_info(media_rebuild_m8)"
+                    ).fetchall()
+                ]
+                copy_cols = [c for c in old_cols if c in new_cols]
+                col_list = ", ".join(copy_cols)
+                self.conn.execute(
+                    f"INSERT INTO media_rebuild_m8 ({col_list}) SELECT {col_list} FROM media"
+                )
+
+                old_count = self.conn.execute("SELECT COUNT(*) FROM media").fetchone()[0]
+                new_count = self.conn.execute(
+                    "SELECT COUNT(*) FROM media_rebuild_m8"
+                ).fetchone()[0]
+                if old_count != new_count:
+                    raise RuntimeError(
+                        f"media rebuild row-count mismatch: {old_count} != {new_count}"
+                    )
+
+                self.conn.execute("DROP TABLE media")
+                self.conn.execute("ALTER TABLE media_rebuild_m8 RENAME TO media")
+
+                # Recreate the media indexes (the UNIQUE autoindex doubled as
+                # the path lookup — idx_media_path replaces it, non-unique).
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_media_source_rel ON media(source_name, rel_path)"
+                )
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_media_ts ON media(ts_utc)"
+                )
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_media_path ON media(path)"
+                )
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_media_deleted_seq ON media(deleted_seq)"
+                )
+
+                fk_issues = self.conn.execute("PRAGMA foreign_key_check").fetchall()
+                if fk_issues:
+                    raise RuntimeError(
+                        f"media rebuild foreign_key_check failed: {fk_issues[:5]}"
+                    )
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        finally:
+            self.conn.execute("PRAGMA foreign_keys=ON")
+            self.conn.isolation_level = old_isolation
+
     def upsert_media(self, row: Dict[str, Any]):
         cols = ",".join(row.keys())
         placeholders = ",".join([":" + k for k in row.keys()])
         sql = f"INSERT INTO media ({cols}) VALUES ({placeholders}) " \
               f"ON CONFLICT(media_id) DO UPDATE SET " + ",".join([f"{k}=excluded.{k}" for k in row.keys() if k!="media_id"])
         self.conn.execute(sql, row)
+        # §4.1 (media_superset rule): every upsert carries payload columns
+        # (path/place/ts_utc). New media has no embedding rows yet (no-op);
+        # a metadata refresh stamps the existing ones.
+        self._stamp_media_payload_rows(row["media_id"])
         self._maybe_commit()
 
     def update_media_fields(self, media_id: str, fields: Dict[str, Any]):
@@ -244,13 +641,24 @@ class SQLiteStore:
         assignments = ",".join([f"{key}=?" for key in fields.keys()])
         params = list(fields.values()) + [media_id]
         self.conn.execute(f"UPDATE media SET {assignments} WHERE media_id = ?", params)
+        # §4.1 (media_superset rule): moves/path-promotion, place/timestamp
+        # refreshes — all three collections embed these cells. Non-payload
+        # bookkeeping (gps_data_mode, flags) stays stamp-free.
+        if not _MEDIA_PAYLOAD_FIELDS.isdisjoint(fields):
+            self._stamp_media_payload_rows(media_id)
         self._maybe_commit()
 
     def add_tags(self, media_id: str, tags: Iterable[str]):
+        stamped_any = False
         for t in tags:
             self.conn.execute("INSERT OR IGNORE INTO tag(name) VALUES (?)", (t,))
             tag_id = self.conn.execute("SELECT tag_id FROM tag WHERE name=?", (t,)).fetchone()[0]
             self.conn.execute("INSERT OR IGNORE INTO media_tag(media_id, tag_id) VALUES (?,?)", (media_id, tag_id))
+            stamped_any = True
+        # §4.1 (media_superset rule): image payloads carry tags; video
+        # payloads fall back to media-level tags.
+        if stamped_any:
+            self._stamp_media_payload_rows(media_id)
         self._maybe_commit()
 
     # ── Embedding storage (Stage 3 of SQLITE_INCREMENTAL_VISIBILITY_PLAN) ──
@@ -262,50 +670,63 @@ class SQLiteStore:
     # table forces a re-embed without disturbing labels or metadata.
 
     def upsert_image_embedding(self, media_id: str, embedding, model: str) -> None:
-        """Insert or replace the CLIP embedding for an image-type media row."""
+        """Insert or replace the CLIP embedding for an image-type media row.
+
+        Stamps updated_seq on BOTH the insert and the conflict-update arm
+        (§4.1): a re-embed of an existing row must re-export it too.
+        """
         blob, dim = self._serialize_embedding(embedding)
         self.conn.execute(
             """
-            INSERT INTO image_embedding(media_id, embedding, embedding_dim, embedding_model)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO image_embedding(media_id, embedding, embedding_dim, embedding_model, updated_seq)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(media_id) DO UPDATE SET
               embedding=excluded.embedding,
               embedding_dim=excluded.embedding_dim,
-              embedding_model=excluded.embedding_model
+              embedding_model=excluded.embedding_model,
+              updated_seq=excluded.updated_seq
             """,
-            (media_id, blob, dim, model),
+            (media_id, blob, dim, model, self._stamp()),
         )
         self._maybe_commit()
 
     def upsert_keyframe_embedding(self, keyframe_id: int, embedding, model: str) -> None:
-        """Insert or replace the CLIP embedding for a video keyframe row."""
+        """Insert or replace the CLIP embedding for a video keyframe row.
+
+        Stamps updated_seq on both arms (§4.1).
+        """
         blob, dim = self._serialize_embedding(embedding)
         self.conn.execute(
             """
-            INSERT INTO keyframe_embedding(keyframe_id, embedding, embedding_dim, embedding_model)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO keyframe_embedding(keyframe_id, embedding, embedding_dim, embedding_model, updated_seq)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(keyframe_id) DO UPDATE SET
               embedding=excluded.embedding,
               embedding_dim=excluded.embedding_dim,
-              embedding_model=excluded.embedding_model
+              embedding_model=excluded.embedding_model,
+              updated_seq=excluded.updated_seq
             """,
-            (int(keyframe_id), blob, dim, model),
+            (int(keyframe_id), blob, dim, model, self._stamp()),
         )
         self._maybe_commit()
 
     def upsert_face_embedding(self, face_id: str, embedding, model: str) -> None:
-        """Insert or replace the face embedding for a detection row."""
+        """Insert or replace the face embedding for a detection row.
+
+        Stamps updated_seq on both arms (§4.1).
+        """
         blob, dim = self._serialize_embedding(embedding)
         self.conn.execute(
             """
-            INSERT INTO face_embedding(face_id, embedding, embedding_dim, embedding_model)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO face_embedding(face_id, embedding, embedding_dim, embedding_model, updated_seq)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(face_id) DO UPDATE SET
               embedding=excluded.embedding,
               embedding_dim=excluded.embedding_dim,
-              embedding_model=excluded.embedding_model
+              embedding_model=excluded.embedding_model,
+              updated_seq=excluded.updated_seq
             """,
-            (face_id, blob, dim, model),
+            (face_id, blob, dim, model, self._stamp()),
         )
         self._maybe_commit()
 
@@ -497,6 +918,375 @@ class SQLiteStore:
     def get_total_changes(self) -> int:
         return int(self.conn.total_changes)
 
+    # ── M-8 fingerprint fast-path: scan_run / file_fingerprint helpers ────
+    #
+    # file_fingerprint is the authoritative path -> content mapping
+    # (M8_INCREMENTAL_INDEXING_PLAN.md §3.1). scan_run rows give the
+    # deletion sweep its "completed scan" boundary. None of these writes
+    # count as index-content changes — the pipeline's content_changed
+    # flag (§3.5) is deliberately NOT set by fingerprint bookkeeping.
+
+    def begin_scan_run(self) -> int:
+        """Open a scan_run row and return its scan_id."""
+        cur = self.conn.execute("INSERT INTO scan_run DEFAULT VALUES")
+        self._maybe_commit()
+        return int(cur.lastrowid)
+
+    def complete_scan_run(self, scan_id: int, sources_json: str) -> None:
+        """Mark a scan_run as cleanly completed (all sources fully walked)."""
+        self.conn.execute(
+            "UPDATE scan_run SET completed_at = datetime('now'), sources_json = ? WHERE scan_id = ?",
+            (sources_json, int(scan_id)),
+        )
+        self._maybe_commit()
+
+    def get_fingerprint(self, source_name: str, rel_path: str) -> Optional[Dict[str, Any]]:
+        """Look up the fingerprint row for one (source_name, rel_path) key."""
+        row = self.conn.execute(
+            """
+            SELECT size_bytes, mtime_ns, media_id, last_seen_scan_id, missing_since_scan_id
+            FROM file_fingerprint WHERE source_name = ? AND rel_path = ?
+            """,
+            (source_name, rel_path),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "source_name": source_name,
+            "rel_path": rel_path,
+            "size_bytes": int(row[0]),
+            "mtime_ns": int(row[1]),
+            "media_id": row[2],
+            "last_seen_scan_id": row[3],
+            "missing_since_scan_id": row[4],
+        }
+
+    def get_fingerprints_for_source(self, source_name: str) -> Dict[str, tuple]:
+        """Bulk-load one source's fingerprints as
+        ``{rel_path: (size, mtime_ns, media_id)}``.
+
+        The count-phase ETA (#208) counts expected fast-path skips without a
+        per-file query — it compares each walked file's on-disk stat against
+        the stored ``(size_bytes, mtime_ns)`` here (the exact fast-path skip
+        condition) and, on a match, resolves the processing snapshot by the
+        row's ``media_id`` — NOT its rel_path — so every live duplicate path of
+        one complete ``media_id`` is recognized as a free skip, exactly as the
+        main loop does (it keys the skip off ``fp["media_id"]``); a rel_path
+        lookup would miss non-canonical duplicate paths, which have no ``media``
+        row of their own (#208 review, Codex P2). Read-only; safe on any DB
+        where ``file_fingerprint`` exists (an OperationalError on a pre-M-8 DB
+        is the caller's cue to fall back to the full-library estimate).
+        """
+        cur = self.conn.execute(
+            "SELECT rel_path, size_bytes, mtime_ns, media_id FROM file_fingerprint WHERE source_name = ?",
+            (source_name,),
+        )
+        return {row[0]: (int(row[1]), int(row[2]), row[3]) for row in cur.fetchall()}
+
+    def get_processing_snapshot_for_media_ids(self, media_ids) -> Dict[str, dict]:
+        """Bulk-load live media rows keyed by ``media_id`` with the inputs the
+        count-phase ETA needs to decide whether a fingerprint stat-match is a
+        *truly-free* skip (#208 review, Codex P2) — without a per-file query.
+
+        Loaded by the SET of ``media_id`` values a source's fingerprint rows
+        reference — NOT filtered on ``media.source_name`` — so a *cross-source
+        duplicate* resolves correctly (#208 review, Codex P2): content first
+        indexed under source A owns a single ``media`` row whose canonical
+        ``source_name`` is A; when the same bytes later appear under source B,
+        B's fingerprint row points at A's ``media_id``. The main loop reuses
+        ``fp["media_id"]`` and skips it, so the count phase must resolve that
+        media_id too even though the row's ``source_name`` is A — a
+        ``source_name = B`` filter would drop it and re-charge the duplicate as
+        work, re-inflating the very ETA #208 fixes. Keying by ``media_id`` (not
+        rel_path) likewise lets every live duplicate PATH of one complete
+        media_id count as a free skip.
+
+        A stat-match only means the main loop won't re-hash the file; it still
+        runs ``needs_*`` afterward, so the file is free ONLY if it is already
+        fully processed under the current config. Each value carries the same
+        keys as :meth:`get_processing_status` (``gps_processed`` /
+        ``object_detection_done`` / ``face_detection_done`` /
+        ``embeddings_version``) PLUS ``has_image_embedding`` and — for videos,
+        which are never stamped complete via ``embeddings_version`` the way
+        images are — the keyframe/shot signals the runtime video branch skips
+        on: ``has_shots`` (a ``shots`` row exists), ``has_keyframes`` (a
+        ``video_keyframes`` row exists), and ``has_unembedded_keyframes`` (a
+        keyframe lacks its ``keyframe_embedding``). The count phase feeds those
+        into the SHARED :func:`msa_indexer.pipeline._video_skip_predicate` — the
+        same helper the main loop's video branch uses — so the two can't
+        diverge. Tombstoned rows (``deleted``) are excluded: a stat-match on
+        deleted content resurrects + reprocesses, so it is not free. Read-only;
+        an OperationalError on a pre-M-8 DB is the caller's cue to fall back to
+        the full-library estimate.
+        """
+        out: Dict[str, dict] = {}
+        ids = [mid for mid in {m for m in media_ids if m is not None}]
+        if not ids:
+            return out
+        # Chunk to stay under SQLite's default host-parameter limit (999) on a
+        # duplicate-heavy source with thousands of distinct media_ids.
+        for start in range(0, len(ids), 900):
+            chunk = ids[start:start + 900]
+            placeholders = ",".join("?" * len(chunk))
+            cur = self.conn.execute(
+                f"""
+                SELECT
+                    m.media_id,
+                    m.gps_processed,
+                    m.object_detection_done,
+                    m.face_detection_done,
+                    m.embeddings_version,
+                    EXISTS(
+                        SELECT 1 FROM image_embedding ie WHERE ie.media_id = m.media_id
+                    ),
+                    EXISTS(
+                        SELECT 1 FROM shots s WHERE s.video_id = m.media_id
+                    ),
+                    EXISTS(
+                        SELECT 1 FROM video_keyframes vk WHERE vk.video_id = m.media_id
+                    ),
+                    EXISTS(
+                        SELECT 1 FROM video_keyframes vk2
+                        LEFT JOIN keyframe_embedding ke ON ke.keyframe_id = vk2.id
+                        WHERE vk2.video_id = m.media_id AND ke.keyframe_id IS NULL
+                    )
+                FROM media m
+                WHERE m.media_id IN ({placeholders}) AND COALESCE(m.deleted, 0) = 0
+                """,
+                chunk,
+            )
+            for row in cur.fetchall():
+                media_id = row[0]
+                if media_id is None:
+                    continue
+                out[media_id] = {
+                    "gps_processed": bool(row[1]),
+                    "object_detection_done": bool(row[2]),
+                    "face_detection_done": bool(row[3]),
+                    "embeddings_version": row[4],
+                    "has_image_embedding": bool(row[5]),
+                    "has_shots": bool(row[6]),
+                    "has_keyframes": bool(row[7]),
+                    "has_unembedded_keyframes": bool(row[8]),
+                }
+        return out
+
+    def upsert_fingerprint(
+        self,
+        source_name: str,
+        rel_path: str,
+        size_bytes: int,
+        mtime_ns: int,
+        media_id: str,
+        scan_id: int,
+    ) -> None:
+        """Insert or update (incl. repoint) a fingerprint row.
+
+        Always stamps last_seen_scan_id and clears missing_since_scan_id —
+        an upserted path was, by definition, just seen on disk.
+        """
+        self.conn.execute(
+            """
+            INSERT INTO file_fingerprint(
+                source_name, rel_path, size_bytes, mtime_ns, media_id,
+                last_seen_scan_id, missing_since_scan_id
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL)
+            ON CONFLICT(source_name, rel_path) DO UPDATE SET
+              size_bytes=excluded.size_bytes,
+              mtime_ns=excluded.mtime_ns,
+              media_id=excluded.media_id,
+              last_seen_scan_id=excluded.last_seen_scan_id,
+              missing_since_scan_id=NULL
+            """,
+            (source_name, rel_path, int(size_bytes), int(mtime_ns), media_id, int(scan_id)),
+        )
+        self._maybe_commit()
+
+    def mark_fingerprints_seen(self, scan_id: int, keys: List[tuple]) -> None:
+        """Batch-stamp last_seen_scan_id (and clear grace) for fast-path hits.
+
+        keys: [(source_name, rel_path), ...] — batched in memory by the
+        pipeline and flushed with the per-batch commits.
+        """
+        if not keys:
+            return
+        self.conn.executemany(
+            """
+            UPDATE file_fingerprint
+            SET last_seen_scan_id = ?, missing_since_scan_id = NULL
+            WHERE source_name = ? AND rel_path = ?
+            """,
+            [(int(scan_id), src, rel) for (src, rel) in keys],
+        )
+        self._maybe_commit()
+
+    def delete_fingerprint(self, source_name: str, rel_path: str) -> None:
+        self.conn.execute(
+            "DELETE FROM file_fingerprint WHERE source_name = ? AND rel_path = ?",
+            (source_name, rel_path),
+        )
+        self._maybe_commit()
+
+    def count_fingerprints_for_media(self, media_id: str) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM file_fingerprint WHERE media_id = ?",
+            (media_id,),
+        ).fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def get_live_fingerprints_for_media(self, media_id: str) -> List[Dict[str, Any]]:
+        """All fingerprint rows for a media_id (used for path promotion, R5)."""
+        cur = self.conn.execute(
+            """
+            SELECT source_name, rel_path, size_bytes, mtime_ns
+            FROM file_fingerprint WHERE media_id = ?
+            ORDER BY source_name, rel_path
+            """,
+            (media_id,),
+        )
+        return [
+            {
+                "source_name": r[0],
+                "rel_path": r[1],
+                "size_bytes": int(r[2]),
+                "mtime_ns": int(r[3]),
+            }
+            for r in cur.fetchall()
+        ]
+
+    def find_media_by_id_any(self, media_id: str) -> Optional[Dict[str, Any]]:
+        """Media row lookup that does NOT filter on deleted.
+
+        The fast path needs tombstoned rows too (resurrection check,
+        §3.3 step 4).
+        """
+        row = self.conn.execute(
+            """
+            SELECT media_id, path, source_name, rel_path, deleted, missing_since_scan_id
+            FROM media WHERE media_id = ?
+            """,
+            (media_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "media_id": row[0],
+            "path": row[1],
+            "source_name": row[2],
+            "rel_path": row[3],
+            "deleted": int(row[4] or 0),
+            "missing_since_scan_id": row[5],
+        }
+
+    def iter_stale_fingerprints(self, source_name: str, scan_id: int) -> List[Dict[str, Any]]:
+        """Fingerprint rows of a source not seen by the given scan (§3.4 sweep)."""
+        cur = self.conn.execute(
+            """
+            SELECT rel_path, media_id, last_seen_scan_id, missing_since_scan_id
+            FROM file_fingerprint
+            WHERE source_name = ? AND last_seen_scan_id < ?
+            ORDER BY rel_path
+            """,
+            (source_name, int(scan_id)),
+        )
+        return [
+            {
+                "source_name": source_name,
+                "rel_path": r[0],
+                "media_id": r[1],
+                "last_seen_scan_id": r[2],
+                "missing_since_scan_id": r[3],
+            }
+            for r in cur.fetchall()
+        ]
+
+    def set_fingerprint_missing(self, source_name: str, rel_path: str, scan_id: int) -> None:
+        """First-miss grace stamp (no visible effect; §3.4)."""
+        self.conn.execute(
+            """
+            UPDATE file_fingerprint SET missing_since_scan_id = ?
+            WHERE source_name = ? AND rel_path = ?
+            """,
+            (int(scan_id), source_name, rel_path),
+        )
+        self._maybe_commit()
+
+    def iter_legacy_orphan_media(self, source_name: str) -> List[Dict[str, Any]]:
+        """Non-deleted media of a source with zero fingerprint rows.
+
+        These are rows whose files were deleted before the M-8 upgrade —
+        the lazy backfill never fingerprints them, so the fingerprint
+        sweep never examines them (§3.4 legacy orphan reconcile).
+        Self-liquidating after two completed post-upgrade scans.
+        """
+        cur = self.conn.execute(
+            """
+            SELECT m.media_id, m.missing_since_scan_id
+            FROM media m
+            WHERE m.deleted = 0 AND m.source_name = ?
+              AND NOT EXISTS (
+                SELECT 1 FROM file_fingerprint fp WHERE fp.media_id = m.media_id
+              )
+            ORDER BY m.media_id
+            """,
+            (source_name,),
+        )
+        return [
+            {"media_id": r[0], "missing_since_scan_id": r[1]} for r in cur.fetchall()
+        ]
+
+    def set_media_missing_since(self, media_id: str, scan_id: int) -> None:
+        self.conn.execute(
+            "UPDATE media SET missing_since_scan_id = ? WHERE media_id = ?",
+            (int(scan_id), media_id),
+        )
+        self._maybe_commit()
+
+    def tombstone_media(self, media_id: str) -> None:
+        """Soft-delete a media row (its last on-disk copy is gone).
+
+        §4.1 tombstone rule: EVERY transition to deleted=1 carries a
+        deleted_seq stamp — the sweep, the fast path's content-replaced
+        supersede, and the legacy-orphan reconcile all route through this
+        one method. A tombstone without its stamp would leave its Qdrant
+        points dangling while the watermark advances past them.
+        """
+        self.conn.execute(
+            """
+            UPDATE media SET deleted = 1, missing_since_scan_id = NULL, deleted_seq = ?
+            WHERE media_id = ?
+            """,
+            (self._stamp(), media_id),
+        )
+        self._maybe_commit()
+
+    def resurrect_media(self, media_id: str) -> None:
+        """Clear the tombstone and grace state (content reappeared on disk).
+
+        A true resurrection (deleted was 1) also stamps the media's
+        image/keyframe/face embedding rows — the reactivation re-upsert of
+        plan §3.3 step 4: an earlier export's deletion pass may already have
+        removed the points, so the next delta export must send them again.
+        deleted_seq is cleared in the same statement so the deletion pass
+        can never remove the re-upserted points. A grace-only clear
+        (missing_since_scan_id set, deleted still 0) stays pure bookkeeping —
+        no stamps, or every grace clear would dirty a no-op run (R1).
+        """
+        row = self.conn.execute(
+            "SELECT deleted FROM media WHERE media_id = ?", (media_id,)
+        ).fetchone()
+        was_deleted = bool(row is not None and row[0])
+        self.conn.execute(
+            """
+            UPDATE media SET deleted = 0, missing_since_scan_id = NULL, deleted_seq = NULL
+            WHERE media_id = ?
+            """,
+            (media_id,),
+        )
+        if was_deleted:
+            self._stamp_media_payload_rows(media_id)
+        self._maybe_commit()
+
     def get_index_state(self) -> Dict[str, Any]:
         row = self.conn.execute(
             """
@@ -543,23 +1333,153 @@ class SQLiteStore:
             "index_version_ts": next_ts,
         }
 
+    # ── M-8/S-3: export-decision state (dirty trigger, first-delta guard) ──
+
+    def get_s3_state(self) -> Dict[str, Any]:
+        """The S-3 columns of index_state (kept out of get_index_state so
+        legacy callers stay byte-identical)."""
+        row = self.conn.execute(
+            """
+            SELECT s3_migration_seq, face_recreate_required
+            FROM index_state WHERE singleton_id = 1
+            """
+        ).fetchone()
+        if row is None:
+            return {"s3_migration_seq": 0, "face_recreate_required": False}
+        return {
+            "s3_migration_seq": int(row[0] or 0),
+            "face_recreate_required": bool(row[1]),
+        }
+
+    def clear_face_recreate_required(self) -> None:
+        """Called ONLY after a recreate-mode face export succeeded (§4.1)."""
+        self.conn.execute(
+            "UPDATE index_state SET face_recreate_required = 0 WHERE singleton_id = 1"
+        )
+        self._maybe_commit()
+
+    def dirty_rows_exist(self, exported_seq: int) -> bool:
+        """§4.2 dirty-row trigger: cheap EXISTS probes per stamped table for
+        rows above the exported watermark, plus stamped tombstones. Pass -1
+        when no export record exists (everything is dirty)."""
+        floor = int(exported_seq)
+        probes = (
+            "SELECT 1 FROM image_embedding WHERE updated_seq > ? LIMIT 1",
+            "SELECT 1 FROM keyframe_embedding WHERE updated_seq > ? LIMIT 1",
+            "SELECT 1 FROM face_embedding WHERE updated_seq > ? LIMIT 1",
+            "SELECT 1 FROM media WHERE deleted = 1 AND deleted_seq IS NOT NULL"
+            " AND deleted_seq > ? LIMIT 1",
+        )
+        for sql in probes:
+            if self.conn.execute(sql, (floor,)).fetchone() is not None:
+                return True
+        return False
+
+    def max_stamped_seq(self) -> int:
+        """Highest stamp anywhere (updated_seq tables + tombstones). Drives
+        the §4.2 watermark-advance rule for the crashed-bump case."""
+        row = self.conn.execute(
+            """
+            SELECT MAX(s) FROM (
+                SELECT COALESCE(MAX(updated_seq), 0) AS s FROM image_embedding
+                UNION ALL SELECT COALESCE(MAX(updated_seq), 0) FROM keyframe_embedding
+                UNION ALL SELECT COALESCE(MAX(updated_seq), 0) FROM face_embedding
+                UNION ALL SELECT COALESCE(MAX(deleted_seq), 0) FROM media WHERE deleted = 1
+            )
+            """
+        ).fetchone()
+        return int(row[0] or 0)
+
+    def advance_index_version_to(self, seq: int) -> Dict[str, Any]:
+        """Durably complete an interrupted version bump (§4.2 watermark
+        rule): stamps found ABOVE index_version_seq mean a run crashed
+        between its batch commits and bump_index_version (or an out-of-band
+        write allocated ahead). Recording the stale lower seq would repeat
+        the recovery export on every subsequent no-op run."""
+        next_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.conn.execute(
+            """
+            UPDATE index_state SET index_version_seq = ?, index_version_ts = ?
+            WHERE singleton_id = 1
+            """,
+            (int(seq), next_ts),
+        )
+        self._maybe_commit()
+        return {"index_version_seq": int(seq), "index_version_ts": next_ts}
+
+    def iter_stamped_tombstones(self, since_seq: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Tombstoned media whose Qdrant points the §4.2 deletion pass must
+        remove: deleted = 1 AND deleted_seq > since_seq (None → every
+        stamped tombstone — the full-export case). Keyframe triples and
+        face ids survive soft-delete, so every point id is computable."""
+        floor = -1 if since_seq is None else int(since_seq)
+        cur = self.conn.execute(
+            """
+            SELECT media_id, deleted_seq FROM media
+            WHERE deleted = 1 AND deleted_seq IS NOT NULL AND deleted_seq > ?
+            ORDER BY media_id
+            """,
+            (floor,),
+        )
+        out: List[Dict[str, Any]] = []
+        for media_id, dseq in cur.fetchall():
+            keyframes = [
+                (int(r[0]), int(r[1]))
+                for r in self.conn.execute(
+                    "SELECT shot_index, kf_index FROM video_keyframes WHERE video_id = ?",
+                    (media_id,),
+                ).fetchall()
+            ]
+            face_ids = [
+                r[0]
+                for r in self.conn.execute(
+                    "SELECT face_id FROM face WHERE media_id = ?", (media_id,)
+                ).fetchall()
+            ]
+            out.append(
+                {
+                    "media_id": media_id,
+                    "deleted_seq": int(dseq),
+                    "keyframes": keyframes,
+                    "face_ids": face_ids,
+                }
+            )
+        return out
+
     # --- Helpers expected by qdrant_export.py ---
-    def iter_items(self):
+    def iter_items(self, since_seq: Optional[int] = None):
         """Yield dicts for each image media item (videos excluded).
 
         Videos are handled separately via iter_video_keyframes(). The
         SQL-level ``mime LIKE 'image/%'`` filter is the primary guard;
         the path-extension fallback below catches legacy rows where
         ``mime`` was never populated.
+
+        since_seq (M-8/S-3 §4.2): when set, delta mode — only media whose
+        image_embedding row is stamped ABOVE the exported watermark
+        (``updated_seq > since_seq``; the covering index makes this cheap).
+        None = full export, unchanged behavior.
         """
         VIDEO_EXTENSIONS = ('.mp4', '.mov', '.avi', '.mkv', '.m4v', '.wmv', '.flv', '.webm')
-        cur = self.conn.execute(
-            """
-            SELECT media_id, path, source_name, rel_path, place, ts_utc, added_at
-            FROM media
-            WHERE deleted = 0 AND (mime LIKE 'image/%' OR mime IS NULL)
-            """
-        )
+        if since_seq is None:
+            cur = self.conn.execute(
+                """
+                SELECT media_id, path, source_name, rel_path, place, ts_utc, added_at
+                FROM media
+                WHERE deleted = 0 AND (mime LIKE 'image/%' OR mime IS NULL)
+                """
+            )
+        else:
+            cur = self.conn.execute(
+                """
+                SELECT m.media_id, m.path, m.source_name, m.rel_path, m.place, m.ts_utc, m.added_at
+                FROM media m
+                JOIN image_embedding ie ON ie.media_id = m.media_id
+                    AND ie.updated_seq > ?
+                WHERE m.deleted = 0 AND (m.mime LIKE 'image/%' OR m.mime IS NULL)
+                """,
+                (int(since_seq),),
+            )
         for media_id, path, source_name, rel_path, place, ts_utc, added_at in cur:
             resolved_path = self._resolve_abs_path(path, source_name, rel_path)
             # Belt-and-braces: filter by extension too, in case a legacy
@@ -601,10 +1521,32 @@ class SQLiteStore:
         stale detections before re-running face detection on a media
         item. Manual labels (``face.person_id``) are necessarily lost
         in this path — the user opted in via the reprocessing flag.
+
+        §4.1 (M-8/S-3): the cascade removes the ``face_embedding`` rows,
+        so nothing stamped survives to drive Qdrant point deletion while
+        the media itself stays live. When rows were actually deleted, set
+        the durable ``face_recreate_required`` marker in the SAME
+        transaction — the next face export runs in recreate mode
+        regardless of that run's flags, and the marker is cleared only
+        after that recreate export succeeds (crash-safe). The media's
+        keyframe rows are stamped too: video payloads embed people names,
+        which just changed.
         """
         cur = self.conn.execute("DELETE FROM face WHERE media_id = ?", (media_id,))
+        deleted = int(cur.rowcount or 0)
+        if deleted:
+            self.conn.execute(
+                "UPDATE index_state SET face_recreate_required = 1 WHERE singleton_id = 1"
+            )
+            self.conn.execute(
+                """
+                UPDATE keyframe_embedding SET updated_seq = ?
+                WHERE keyframe_id IN (SELECT id FROM video_keyframes WHERE video_id = ?)
+                """,
+                (self._stamp(), media_id),
+            )
         self._maybe_commit()
-        return int(cur.rowcount or 0)
+        return deleted
 
     # --- Shots management for video-semantic search ---
     def delete_shots_for_video(self, video_id: str):
@@ -698,25 +1640,55 @@ class SQLiteStore:
                     e.get("place"),
                 ),
             )
+        # §4.1 (keyframe_rows rule): the conflict arm refreshes payload
+        # cells (tags/gps/place) of existing keyframes — stamp the video's
+        # keyframe embedding rows. Fresh keyframes have no embedding row
+        # yet (no-op); their upsert stamps itself.
+        self.conn.execute(
+            """
+            UPDATE keyframe_embedding SET updated_seq = ?
+            WHERE keyframe_id IN (SELECT id FROM video_keyframes WHERE video_id = ?)
+            """,
+            (self._stamp(), video_id),
+        )
         self._maybe_commit()
 
-    def iter_video_keyframes(self):
+    def iter_video_keyframes(self, since_seq: Optional[int] = None):
         """
         Yield keyframe rows joined with media path and tags for export.
         Returns dicts with: video_id, path, shot_index, kf_index, timestamp, shot_start, shot_end, tags, place, people
+
+        since_seq (M-8/S-3 §4.2): when set, delta mode — only keyframes
+        whose embedding row is stamped above the watermark. None = full.
         """
         import json
-        cur = self.conn.execute(
-            """
-            SELECT vk.video_id, m.path, m.source_name, m.rel_path, m.place,
-                   vk.shot_index, vk.kf_index, vk.timestamp, vk.shot_start, vk.shot_end, vk.tags,
-                   vk.gps_lat, vk.gps_lon, vk.gps_alt, vk.gps_datetime_utc, vk.gps_fix, vk.gps_source, vk.place
-            FROM video_keyframes vk
-            JOIN media m ON m.media_id = vk.video_id
-            WHERE m.deleted = 0
-            ORDER BY vk.video_id, vk.shot_index, vk.kf_index
-            """
-        )
+        if since_seq is None:
+            cur = self.conn.execute(
+                """
+                SELECT vk.video_id, m.path, m.source_name, m.rel_path, m.place,
+                       vk.shot_index, vk.kf_index, vk.timestamp, vk.shot_start, vk.shot_end, vk.tags,
+                       vk.gps_lat, vk.gps_lon, vk.gps_alt, vk.gps_datetime_utc, vk.gps_fix, vk.gps_source, vk.place
+                FROM video_keyframes vk
+                JOIN media m ON m.media_id = vk.video_id
+                WHERE m.deleted = 0
+                ORDER BY vk.video_id, vk.shot_index, vk.kf_index
+                """
+            )
+        else:
+            cur = self.conn.execute(
+                """
+                SELECT vk.video_id, m.path, m.source_name, m.rel_path, m.place,
+                       vk.shot_index, vk.kf_index, vk.timestamp, vk.shot_start, vk.shot_end, vk.tags,
+                       vk.gps_lat, vk.gps_lon, vk.gps_alt, vk.gps_datetime_utc, vk.gps_fix, vk.gps_source, vk.place
+                FROM video_keyframes vk
+                JOIN media m ON m.media_id = vk.video_id
+                JOIN keyframe_embedding ke ON ke.keyframe_id = vk.id
+                    AND ke.updated_seq > ?
+                WHERE m.deleted = 0
+                ORDER BY vk.video_id, vk.shot_index, vk.kf_index
+                """,
+                (int(since_seq),),
+            )
         for video_id, path, source_name, rel_path, media_place, s_idx, k_idx, ts, s_start, s_end, tags_json, gps_lat, gps_lon, gps_alt, gps_dt, gps_fix, gps_source, keyframe_place in cur:
             resolved_path = self._resolve_abs_path(path, source_name, rel_path)
             # Parse keyframe-level tags from JSON (if available)
@@ -816,6 +1788,26 @@ class SQLiteStore:
                     face.get("kf_index"),
                 ),
             )
+        # §4.1 (face_rows rule): the conflict arm refreshes payload cells
+        # (confidence/person_id/gender/age) of existing faces — stamp the
+        # media's face embedding rows, plus its keyframe rows because video
+        # payloads embed people names. Fresh faces' embedding rows don't
+        # exist yet (no-op); their upsert stamps itself.
+        seq = self._stamp()
+        self.conn.execute(
+            """
+            UPDATE face_embedding SET updated_seq = ?
+            WHERE face_id IN (SELECT face_id FROM face WHERE media_id = ?)
+            """,
+            (seq, media_id),
+        )
+        self.conn.execute(
+            """
+            UPDATE keyframe_embedding SET updated_seq = ?
+            WHERE keyframe_id IN (SELECT id FROM video_keyframes WHERE video_id = ?)
+            """,
+            (seq, media_id),
+        )
         self._maybe_commit()
 
     def get_media_faces(self, media_id: str) -> list[dict]:
@@ -855,14 +1847,17 @@ class SQLiteStore:
         
         return faces
 
-    def iter_faces(self, order_by='default'):
+    def iter_faces(self, order_by='default', since_seq: Optional[int] = None):
         """
         Yield all face detections with associated media information for export to vector DB.
-        
+
         Args:
-            order_by: Ordering method - 'default' (media_id, face_id), 
+            order_by: Ordering method - 'default' (media_id, face_id),
                      'labeled_first' (labeled faces first, then unknown)
-        
+            since_seq: (M-8/S-3 §4.2) when set, delta mode — only faces
+                     whose embedding row is stamped above the watermark.
+                     None = full.
+
         Returns dicts with: face_id, media_id, path, bbox, confidence, person_id, person_name, etc.
         """
         # Choose ORDER BY clause based on order_by parameter
@@ -872,7 +1867,16 @@ class SQLiteStore:
         else:
             # Default ordering
             order_clause = "ORDER BY f.media_id, f.face_id"
-        
+
+        delta_join = ""
+        params: tuple = ()
+        if since_seq is not None:
+            delta_join = (
+                "JOIN face_embedding fe ON fe.face_id = f.face_id"
+                " AND fe.updated_seq > ?"
+            )
+            params = (int(since_seq),)
+
         cur = self.conn.execute(
             f"""
             SELECT f.face_id, f.media_id, m.path, m.source_name, m.rel_path, m.ts_utc,
@@ -881,10 +1885,12 @@ class SQLiteStore:
                    f.gender, f.age, f.shot_index, f.kf_index
             FROM face f
             JOIN media m ON f.media_id = m.media_id
+            {delta_join}
             LEFT JOIN person p ON f.person_id = p.person_id
             WHERE m.deleted = 0
             {order_clause}
-            """
+            """,
+            params,
         )
         
         for row in cur.fetchall():
@@ -1073,32 +2079,57 @@ class SQLiteStore:
         return total
 
 
+    # NOTE (M-8/S-2 §4 rollback semantics): the labeling/person mutation
+    # methods below commit via _maybe_commit(), not commit(), so a caller
+    # constructing SQLiteStore(path, autocommit=False) — the API's Qdrant
+    # payload-write guard — can defer the commit until the Qdrant sync
+    # outcome is known and ROLL BACK when the shared client was closed
+    # mid-sync (drain-ceiling residual). Every existing caller uses the
+    # default autocommit=True and is byte-identical in behavior.
+
     def update_face_person(self, face_id: str, person_id: str):
-        """Update the person_id for a face (used in labeling/clustering)."""
+        """Update the person_id for a face (used in labeling/clustering).
+
+        §4.1 (face_label rule): stamps the face's embedding row + the
+        owning video's keyframe rows. The live qdrant_sync payload patch
+        stays the immediate path; the stamp guarantees convergence via the
+        next delta export if the patch was skipped or failed (#204).
+        """
         self.conn.execute(
             "UPDATE face SET person_id=? WHERE face_id=?",
             (person_id, face_id),
         )
-        self.commit()
+        self._stamp_face_rows([face_id])
+        self._maybe_commit()
 
     def update_faces_person_batch(self, face_ids: list[str], person_id: str) -> int:
-        """Label multiple faces with the same person in one transaction. Returns count updated."""
+        """Label multiple faces with the same person in one transaction. Returns count updated.
+
+        §4.1 (face_label rule): stamps every labeled face's embedding row +
+        the owning videos' keyframe rows.
+        """
         unique_ids = list(dict.fromkeys(face_ids))  # deduplicate, preserve order
         before = self.conn.total_changes
         self.conn.executemany(
             "UPDATE face SET person_id=? WHERE face_id=?",
             [(person_id, fid) for fid in unique_ids],
         )
-        self.commit()
-        return self.conn.total_changes - before
+        changed = self.conn.total_changes - before
+        self._stamp_face_rows(unique_ids)
+        self._maybe_commit()
+        return changed
 
     def clear_face_person(self, face_id: str):
-        """Remove person assignment from a face (set person_id=NULL)."""
+        """Remove person assignment from a face (set person_id=NULL).
+
+        §4.1 (face_label rule): stamps like update_face_person.
+        """
         self.conn.execute(
             "UPDATE face SET person_id=NULL WHERE face_id=?",
             (face_id,),
         )
-        self.commit()
+        self._stamp_face_rows([face_id])
+        self._maybe_commit()
 
     def get_unassigned_faces(self) -> list[dict]:
         """Get all faces without a person_id (for clustering)."""
@@ -1132,7 +2163,7 @@ class SQLiteStore:
                 "INSERT INTO person(person_id, name, is_labeled) VALUES (?, ?, 1)",
                 (pid, name),
             )
-            self.commit()
+            self._maybe_commit()
         except sqlite3.IntegrityError as e:
             # Likely UNIQUE(name) violation
             raise
@@ -1164,13 +2195,21 @@ class SQLiteStore:
         return out
 
     def rename_person(self, person_id: str, new_name: str):
-        """Rename a person to a unique new name. Raises IntegrityError on conflict."""
+        """Rename a person to a unique new name. Raises IntegrityError on conflict.
+
+        §4.1 (person_rows rule): face payloads carry person_name and
+        keyframe payloads carry people names, so EVERY face of the person
+        (plus affected videos' keyframe rows) is stamped — a rename whose
+        live payload patch failed would otherwise stay stale under delta
+        export forever.
+        """
         try:
             self.conn.execute(
                 "UPDATE person SET name=? WHERE person_id=?",
                 (new_name, person_id),
             )
-            self.commit()
+            self._stamp_person_rows(person_id)
+            self._maybe_commit()
         except sqlite3.IntegrityError:
             raise
 
@@ -1178,6 +2217,10 @@ class SQLiteStore:
         """Merge source person into target person by reassigning faces and deleting source.
 
         Returns the number of faces reassigned.
+
+        §4.1 (person_rows rule): after the reassignment every former-source
+        face carries the target's name — stamp all of the target's faces
+        (superset: includes the reassigned ones) + affected keyframe rows.
         """
         if source_id == target_id:
             raise ValueError("Cannot merge a person into itself")
@@ -1189,7 +2232,8 @@ class SQLiteStore:
         reassigned = cur.rowcount if cur is not None else 0
         # Remove source person row
         self.conn.execute("DELETE FROM person WHERE person_id=?", (source_id,))
-        self.commit()
+        self._stamp_person_rows(target_id)
+        self._maybe_commit()
         return int(reassigned)
 
     def get_person(self, person_id: str) -> Optional[Dict[str, Any]]:

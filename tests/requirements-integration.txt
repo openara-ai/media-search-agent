@@ -28,7 +28,10 @@ facenet-pytorch>=2.6.0  # Face recognition (MIT); installed --no-deps after torc
 transformers>=4.42.0  # RT-DETR object detection backend (default, Apache-2.0)
 tokenizers>=0.19.0
 accelerate>=0.27.0
-scenedetect[opencv]
+# cv2 comes from opencv-python-headless above (matches requirements-api.txt). Do NOT
+# use scenedetect[opencv]: that extra pulls the GUI opencv-python, which links
+# libGL.so.1 — absent on the headless self-hosted CI VM, so cv2 fails to import.
+scenedetect
 
 # vector store — faiss is no longer used by the runtime app (see ADR-010);
 # kept here for the porter regression tests and the one-off

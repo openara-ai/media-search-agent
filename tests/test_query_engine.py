@@ -839,3 +839,75 @@ def test_invalid_filters(query_engine, invalid_filter):
     except (TypeError, ValueError, KeyError):
         # Acceptable to raise exception for invalid filters
         pass
+
+
+class TestDeletedMediaFilter:
+    """R6 (M-8/S-1): tombstoned media must not surface via /search even while
+    its Qdrant point still exists."""
+
+    def _make_db(self, tmp_path, rows):
+        db_path = tmp_path / "media.sqlite"
+        conn = sqlite3.connect(str(db_path))
+        try:
+            conn.execute(
+                "CREATE TABLE media (media_id TEXT PRIMARY KEY, path TEXT, deleted INTEGER DEFAULT 0)"
+            )
+            conn.executemany(
+                "INSERT INTO media(media_id, path, deleted) VALUES (?, ?, ?)", rows
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return db_path
+
+    def test_tombstoned_media_dropped_from_results(
+        self, tmp_path, mock_text_encoder, mock_retriever
+    ):
+        db_path = self._make_db(
+            tmp_path,
+            [
+                ("photo_001", "/data/a.heic", 1),  # tombstoned
+                ("photo_002", "/data/b.heic", 0),
+                ("photo_003", "/data/c.heic", 0),
+            ],
+        )
+        engine = QueryEngine(
+            retriever=mock_retriever,
+            text_encoder=mock_text_encoder,
+            sqlite_path=db_path,
+        )
+        results = engine.search("sunset")
+        ids = [r["id"] for r in results]
+        assert "photo_001" not in ids, "tombstoned media leaked into /search results"
+        assert "photo_002" in ids and "photo_003" in ids
+
+    def test_unknown_ids_are_kept(self, tmp_path, mock_text_encoder, mock_retriever):
+        # Hits with no media row at all (e.g. exported before the row landed)
+        # must not be dropped — only positive deleted=1 matches are filtered.
+        db_path = self._make_db(tmp_path, [("photo_001", "/data/a.heic", 0)])
+        engine = QueryEngine(
+            retriever=mock_retriever,
+            text_encoder=mock_text_encoder,
+            sqlite_path=db_path,
+        )
+        ids = [r["id"] for r in engine.search("sunset")]
+        assert {"photo_001", "photo_002", "photo_003"} <= set(ids)
+
+    def test_filter_fails_open_on_connection_error(
+        self, tmp_path, mock_text_encoder, mock_retriever
+    ):
+        from msa_query.query_engine.engine import _filter_deleted_media
+
+        class _BrokenConn:
+            def execute(self, *_a, **_k):
+                raise sqlite3.OperationalError("db is locked")
+
+        candidates = [{"id": "photo_001"}, {"id": "photo_002"}]
+        out = _filter_deleted_media(_BrokenConn(), candidates)
+        assert out == candidates, "filter must fail open to keep search available"
+
+    def test_no_connection_is_noop(self):
+        from msa_query.query_engine.engine import _filter_deleted_media
+
+        candidates = [{"id": "x"}]
+        assert _filter_deleted_media(None, candidates) == candidates

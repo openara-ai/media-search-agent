@@ -15,6 +15,7 @@ the rationale behind the default thresholds.
 """
 from __future__ import annotations
 
+import os
 import re
 from types import SimpleNamespace
 
@@ -29,7 +30,57 @@ from PIL import Image
 # ---------------------------------------------------------------------------
 
 
-class _RecordingFakeSQLite:
+class _FingerprintNoOpsMixin:
+    """M-8 fingerprint fast-path store methods as no-ops (fakes pretend the
+    fingerprint table is empty, so every file goes through the hash path)."""
+
+    def begin_scan_run(self):
+        return 1
+
+    def complete_scan_run(self, _scan_id, _sources_json):
+        pass
+
+    def get_fingerprint(self, _source_name, _rel_path):
+        return None
+
+    def upsert_fingerprint(self, *_args, **_kwargs):
+        pass
+
+    def mark_fingerprints_seen(self, _scan_id, _keys):
+        pass
+
+    def delete_fingerprint(self, _source_name, _rel_path):
+        pass
+
+    def count_fingerprints_for_media(self, _media_id):
+        return 0
+
+    def get_live_fingerprints_for_media(self, _media_id):
+        return []
+
+    def find_media_by_id_any(self, _media_id):
+        return None
+
+    def iter_stale_fingerprints(self, _source_name, _scan_id):
+        return []
+
+    def iter_legacy_orphan_media(self, _source_name):
+        return []
+
+    def set_fingerprint_missing(self, *_args):
+        pass
+
+    def set_media_missing_since(self, *_args):
+        pass
+
+    def tombstone_media(self, _media_id):
+        pass
+
+    def resurrect_media(self, _media_id):
+        pass
+
+
+class _RecordingFakeSQLite(_FingerprintNoOpsMixin):
     """SQLite stub that counts commit() calls and pretends every file is new."""
 
     _state = {"index_version_seq": 0, "index_version_ts": None}
@@ -132,7 +183,7 @@ class _FakeFaissStore:
         pass
 
 
-class _FakeSkipAllSQLite:
+class _FakeSkipAllSQLite(_FingerprintNoOpsMixin):
     """SQLite stub that pretends every file is already fully indexed."""
 
     _state = {"index_version_seq": 0, "index_version_ts": None}
@@ -238,6 +289,11 @@ def _common_pipeline_patches(monkeypatch, pipeline, image_paths, store_factory):
     monkeypatch.setattr(pipeline, "resolve_for_access", lambda p: p)
     monkeypatch.setattr(
         pipeline, "iter_media", lambda *_args, **_kwargs: list(image_paths)
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "iter_media_entries",
+        lambda *_args, **_kwargs: [(p, os.stat(p)) for p in image_paths],
     )
     monkeypatch.setattr(pipeline, "sha256_of_file", lambda p: f"id-{p.name}")
     monkeypatch.setattr(pipeline, "get_exif_basic", lambda _p: {})

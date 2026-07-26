@@ -1,6 +1,6 @@
 import asyncio
 import json
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from fastapi import FastAPI, Depends, HTTPException, WebSocket
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -1120,7 +1120,7 @@ def face_search(req: FaceSearchRequest, request: Request):
     try:
         import numpy as np
         from msa_indexer.db.sqlite_store import SQLiteStore
-        from msa_query.storage.qdrant_client import get_shared_client
+        from msa_query.storage.qdrant_client import shared_client_op
         S = _get_config(request)
 
         db_path = Path(S.sqlite_path)
@@ -1134,10 +1134,10 @@ def face_search(req: FaceSearchRequest, request: Request):
             raise HTTPException(status_code=404, detail="Face vector not found (reindex required)")
         v = np.frombuffer(blob, dtype=np.float32)
 
-        client = get_shared_client()
-        if client is None:
-            raise HTTPException(status_code=503, detail="Qdrant unavailable (indexer running)")
-        hits = client.search(collection_name=S.collections.face, query_vector=v.tolist(), limit=req.top_k)
+        with shared_client_op() as client:
+            if client is None:
+                raise HTTPException(status_code=503, detail="Qdrant unavailable (indexer running)")
+            hits = client.search(collection_name=S.collections.face, query_vector=v.tolist(), limit=req.top_k)
         matches: list[FaceSearchMatch] = []
         for h in hits:
             payload = h.payload or {}
@@ -1159,6 +1159,141 @@ def face_search(req: FaceSearchRequest, request: Request):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 # ---------------- People & labeling endpoints ----------------
+
+class _PayloadWriteHandle:
+    """What _qdrant_payload_write_guard yields: the guarded client plus the
+    commit gate that decides the fate of the endpoint's DEFERRED SQLite
+    transaction once the Qdrant sync outcome is known (round-4, P2)."""
+
+    def __init__(self, client, enabled: bool, entry_gen: int, close_generation, reject):
+        self.client = client
+        self._enabled = enabled
+        self._entry_gen = entry_gen
+        self._close_generation = close_generation
+        self._reject = reject
+        self.finalized = False
+
+    def commit_after_sync(self, db) -> None:
+        """Commit the deferred SQLite transaction — or roll it back and 503.
+
+        Call IMMEDIATELY after the qdrant_sync helper, before building the
+        response. If the close generation advanced since guard entry, the
+        drain_writes hard ceiling fired mid-request: the sync ran (or is
+        indistinguishable from having run) against a closed client with the
+        failure swallowed. Committing SQLite here would strand the exact
+        committed-but-unsynced state §4 forbids — and for a merge it would
+        also delete the source person, making the advertised retry fail its
+        existence check forever (round-4 finding). Instead the mutation is
+        ROLLED BACK and the retryable 503 raised with state unchanged, so
+        the retry after the window replays cleanly. Closes ``db`` on both
+        paths.
+        """
+        self.finalized = True
+        if (
+            self.client is not None
+            and self._enabled
+            and self._close_generation() != self._entry_gen
+        ):
+            try:
+                db.rollback()
+            finally:
+                db.close()
+            logger.error(
+                "Payload write outlived the handoff write-drain ceiling — its "
+                "Qdrant sync ran against a closed client; rolling back the "
+                "SQLite mutation and failing with a retryable 503 (state "
+                "unchanged, the retry after the window replays cleanly)"
+            )
+            self._reject()
+        db.commit()
+        db.close()
+
+
+@contextmanager
+def _qdrant_payload_write_guard():
+    """M-8/S-2 §4: guard a Qdrant-payload-mutating write end-to-end.
+
+    While the indexer holds the handoff window (shared client blocked), any
+    endpoint whose SQLite commit implies a Qdrant payload patch — face label
+    assign/clear/batch and person rename/merge — must reject BEFORE touching
+    SQLite: a committed label whose payload patch was skipped would stay
+    silently stale until a forced export (label writes produce no indexer-side
+    change signal). Clean retryable 503; the window is minutes today, seconds
+    once S-3 shrinks the export (after which these may soften to
+    accept-and-stamp).
+
+    A point-in-time check is not enough: the window can open BETWEEN the
+    check and the sync (TOCTOU), committing SQLite while the payload patch
+    silently no-ops. So the caller wraps its WHOLE SQLite-mutate + sync body
+    in this guard: the shared-client WRITE hold (``write=True``) is held from
+    before the first SQLite touch through the sync call, and the watcher's
+    drain_writes() waits BEHIND this write — without the bounded reader cap —
+    instead of closing the client mid-request.
+
+    Residual (drain_writes hard-ceiling fired — a wedged/over-long write):
+    the client can still be closed under us, and the qdrant_sync helpers
+    swallow the resulting failure. Rollback semantics (round-4, P2): the
+    endpoint opens SQLite with ``autocommit=False``, mutates, syncs on the
+    yielded handle's ``.client``, then calls ``handle.commit_after_sync(db)``
+    — which commits only when the close generation is unchanged, and
+    otherwise ROLLS BACK the SQLite mutation and raises the retryable 503
+    with state unchanged. §4's promise (no committed-but-unsynced state)
+    thereby holds through the ceiling residual too, and the retry always
+    replays cleanly — the earlier commit-then-503 shape left a merge's
+    source person deleted, so its advertised retry 404ed and the stale
+    Qdrant payloads survived until a full export. A post-body backstop
+    keeps the plain 503 for any future caller that skips the gate.
+
+    With the kill switch off, _blocked spans the whole run and rejection stays
+    disabled — the pre-S-2 commit + silently-skipped-sync behavior remains. A
+    None client with the window inactive (embedded client construction failed)
+    also keeps the legacy tolerate-and-skip path.
+    """
+    from msa_indexer.db.qdrant_handoff import handoff_enabled
+    from msa_query.storage.qdrant_client import (
+        close_generation,
+        is_blocked,
+        shared_client_op,
+    )
+
+    def _reject() -> None:
+        raise HTTPException(
+            status_code=503,
+            detail="Finalizing index — try again in a moment",
+            headers={"Retry-After": "30"},
+        )
+
+    enabled = handoff_enabled()
+    if enabled and is_blocked():
+        _reject()
+    with shared_client_op(write=True) as client:
+        # Re-check inside the refcount-held window: the request may have
+        # landed between the fast-path check above and shared_client_op()
+        # observing _blocked (in which case client is None here).
+        if client is None and enabled and is_blocked():
+            _reject()
+        handle = _PayloadWriteHandle(
+            client, enabled, close_generation(), close_generation, _reject
+        )
+        yield handle
+        # Backstop for a caller that did not route through the commit gate
+        # (legacy shape: autocommitted SQLite + sync). Skipped when the gate
+        # ran — a close AFTER a validated commit+sync is the normal grant
+        # for the window that queued behind this write, not a failure.
+        if (
+            not handle.finalized
+            and client is not None
+            and enabled
+            and close_generation() != handle._entry_gen
+        ):
+            logger.error(
+                "Payload write outlived the handoff write-drain ceiling — its "
+                "Qdrant sync ran against a closed client; failing the request "
+                "with a retryable 503 (retry converges SQLite and Qdrant)"
+            )
+            _reject()
+
+
 @app.post("/people", response_model=PersonOut)
 def create_person(req: PersonCreate, request: Request):
     try:
@@ -1249,28 +1384,31 @@ def rename_person(person_id: str, req: PersonRename, request: Request):
         import sqlite3
         from msa_indexer.db.sqlite_store import SQLiteStore
         from msa_indexer.db.qdrant_sync import sync_person_rename
-        from msa_query.storage.qdrant_client import get_shared_client
         S = _get_config(request)
         db_path = Path(S.sqlite_path)
         if not db_path.exists():
             raise HTTPException(status_code=500, detail="SQLite database not found")
-        db = SQLiteStore(db_path)
-        # Ensure person exists
-        person = db.get_person(person_id)
-        if not person:
-            db.close()
-            raise HTTPException(status_code=404, detail="Person not found")
-        try:
-            db.rename_person(person_id, req.name)
-        except sqlite3.IntegrityError:
-            db.close()
-            raise HTTPException(status_code=409, detail="Person name already exists")
-        person = db.get_person(person_id) or {"person_id": person_id, "name": req.name}
-        # Face count after rename
-        people = db.list_people()
-        db.close()
-        # Sync to Qdrant
-        sync_person_rename(person_id, req.name, client=get_shared_client())
+        # §4 guard held across SQLite mutation + Qdrant sync; the commit is
+        # DEFERRED until the sync outcome is known (rollback on a mid-sync
+        # close — see _qdrant_payload_write_guard).
+        with _qdrant_payload_write_guard() as guard:
+            db = SQLiteStore(db_path, autocommit=False)
+            # Ensure person exists
+            person = db.get_person(person_id)
+            if not person:
+                db.close()
+                raise HTTPException(status_code=404, detail="Person not found")
+            try:
+                db.rename_person(person_id, req.name)
+            except sqlite3.IntegrityError:
+                db.close()
+                raise HTTPException(status_code=409, detail="Person name already exists")
+            person = db.get_person(person_id) or {"person_id": person_id, "name": req.name}
+            # Face count after rename
+            people = db.list_people()
+            # Sync to Qdrant, then commit-or-rollback
+            sync_person_rename(person_id, req.name, client=guard.client)
+            guard.commit_after_sync(db)
         cnt = next((p.get("face_count", 0) for p in people if p["person_id"] == person_id), 0)
         return PersonOut(person_id=person["person_id"], name=person["name"], face_count=cnt)
     except HTTPException:
@@ -1285,27 +1423,32 @@ def merge_people(target_id: str, req: MergeRequest, request: Request):
         from pathlib import Path
         from msa_indexer.db.sqlite_store import SQLiteStore
         from msa_indexer.db.qdrant_sync import sync_person_merge
-        from msa_query.storage.qdrant_client import get_shared_client
         S = _get_config(request)
         db_path = Path(S.sqlite_path)
         if not db_path.exists():
             raise HTTPException(status_code=500, detail="SQLite database not found")
-        db = SQLiteStore(db_path)
-        # Validate both exist
-        src = db.get_person(req.source_id)
-        tgt = db.get_person(target_id)
-        if not src or not tgt:
-            db.close()
-            raise HTTPException(status_code=404, detail="Source or target person not found")
-        target_name = tgt.get("name", "")
-        try:
-            reassigned = db.merge_people(req.source_id, target_id)
-        except ValueError as ve:
-            db.close()
-            raise HTTPException(status_code=400, detail=str(ve))
-        db.close()
-        # Sync to Qdrant
-        sync_person_merge(req.source_id, target_id, target_name, client=get_shared_client())
+        # §4 guard held across SQLite mutation + Qdrant sync; the commit is
+        # DEFERRED until the sync outcome is known. The merge is the round-4
+        # motivating case: committing before the sync deleted the source
+        # person, so the 503's advertised retry failed its existence check
+        # and the stale Qdrant payloads survived until a full export.
+        with _qdrant_payload_write_guard() as guard:
+            db = SQLiteStore(db_path, autocommit=False)
+            # Validate both exist
+            src = db.get_person(req.source_id)
+            tgt = db.get_person(target_id)
+            if not src or not tgt:
+                db.close()
+                raise HTTPException(status_code=404, detail="Source or target person not found")
+            target_name = tgt.get("name", "")
+            try:
+                reassigned = db.merge_people(req.source_id, target_id)
+            except ValueError as ve:
+                db.close()
+                raise HTTPException(status_code=400, detail=str(ve))
+            # Sync to Qdrant, then commit-or-rollback
+            sync_person_merge(req.source_id, target_id, target_name, client=guard.client)
+            guard.commit_after_sync(db)
         return {"reassigned": reassigned, "target_id": target_id}
     except HTTPException:
         raise
@@ -1320,41 +1463,45 @@ def label_face(face_id: str, req: FaceLabelRequest, request: Request):
         import sqlite3
         from msa_indexer.db.sqlite_store import SQLiteStore
         from msa_indexer.db.qdrant_sync import update_face_payload
-        from msa_query.storage.qdrant_client import get_shared_client
         S = _get_config(request)
         db_path = Path(S.sqlite_path)
         if not db_path.exists():
             raise HTTPException(status_code=500, detail="SQLite database not found")
-        db = SQLiteStore(db_path)
-        person_id: Optional[str] = req.person_id
-        person_name: Optional[str] = None
-        # Create person if only name provided
-        if not person_id and req.name:
-            try:
-                p = db.create_person(req.name)
-                person_id = p["person_id"]
-                person_name = p["name"]
-            except sqlite3.IntegrityError:
-                # Name exists: fetch existing
-                existing = db.find_person_by_name(req.name)
-                if not existing:
-                    db.close()
-                    raise HTTPException(status_code=409, detail="Person name already exists")
-                person_id = existing["person_id"]
-                person_name = existing["name"]
-        if not person_id:
-            db.close()
-            raise HTTPException(status_code=400, detail="person_id or name required")
-        # Assign in SQLite
-        db.update_face_person(face_id, person_id)
-        # Return info
-        person = db.get_person(person_id)
-        db.close()
-        # Sync to Qdrant using the shared client (avoids second embedded client conflict)
-        final_name = person_name or (person and person.get("name")) if person else None
-        if not isinstance(final_name, str):
-            final_name = None
-        update_face_payload(face_id, person_id, final_name, client=get_shared_client())
+        # §4 guard held across SQLite mutation + Qdrant sync; the commit is
+        # DEFERRED until the sync outcome is known (rollback on a mid-sync
+        # close — see _qdrant_payload_write_guard).
+        with _qdrant_payload_write_guard() as guard:
+            db = SQLiteStore(db_path, autocommit=False)
+            person_id: Optional[str] = req.person_id
+            person_name: Optional[str] = None
+            # Create person if only name provided
+            if not person_id and req.name:
+                try:
+                    p = db.create_person(req.name)
+                    person_id = p["person_id"]
+                    person_name = p["name"]
+                except sqlite3.IntegrityError:
+                    # Name exists: fetch existing
+                    existing = db.find_person_by_name(req.name)
+                    if not existing:
+                        db.close()
+                        raise HTTPException(status_code=409, detail="Person name already exists")
+                    person_id = existing["person_id"]
+                    person_name = existing["name"]
+            if not person_id:
+                db.close()
+                raise HTTPException(status_code=400, detail="person_id or name required")
+            # Assign in SQLite
+            db.update_face_person(face_id, person_id)
+            # Return info
+            person = db.get_person(person_id)
+            # Sync to Qdrant using the shared client (avoids second embedded
+            # client conflict), then commit-or-rollback
+            final_name = person_name or (person and person.get("name")) if person else None
+            if not isinstance(final_name, str):
+                final_name = None
+            update_face_payload(face_id, person_id, final_name, client=guard.client)
+            guard.commit_after_sync(db)
         return {"face_id": face_id, "person_id": person_id, "person_name": final_name}
     except HTTPException:
         raise
@@ -1374,7 +1521,6 @@ def label_faces_batch(req: BulkLabelRequest, request: Request):
         from pathlib import Path
         from msa_indexer.db.sqlite_store import SQLiteStore
         from msa_indexer.db.qdrant_sync import set_face_person_batch
-        from msa_query.storage.qdrant_client import get_shared_client
         S = _get_config(request)
         db_path = Path(S.sqlite_path)
         if not db_path.exists():
@@ -1382,44 +1528,49 @@ def label_faces_batch(req: BulkLabelRequest, request: Request):
         if not req.face_ids:
             raise HTTPException(status_code=400, detail="face_ids must not be empty")
 
-        db = SQLiteStore(db_path)
-        person_id: Optional[str] = req.person_id
-        person_name: Optional[str] = None
+        # §4 guard held across SQLite mutation + Qdrant sync; the commit is
+        # DEFERRED until the sync outcome is known (rollback on a mid-sync
+        # close — see _qdrant_payload_write_guard).
+        with _qdrant_payload_write_guard() as guard:
+            db = SQLiteStore(db_path, autocommit=False)
+            person_id: Optional[str] = req.person_id
+            person_name: Optional[str] = None
 
-        # Resolve or create person
-        if not person_id and req.name:
-            try:
-                p = db.create_person(req.name)
-                person_id = p["person_id"]
-                person_name = p["name"]
-            except sqlite3.IntegrityError:
-                existing = db.find_person_by_name(req.name)
-                if not existing:
-                    db.close()
-                    raise HTTPException(status_code=409, detail="Person name conflict")
-                person_id = existing["person_id"]
-                person_name = existing["name"]
-        if not person_id:
-            db.close()
-            raise HTTPException(status_code=400, detail="person_id or name required")
-
-        # Fetch person name if not already resolved; validate person exists
-        if not person_name:
-            p = db.get_person(person_id)
-            if not p:
+            # Resolve or create person
+            if not person_id and req.name:
+                try:
+                    p = db.create_person(req.name)
+                    person_id = p["person_id"]
+                    person_name = p["name"]
+                except sqlite3.IntegrityError:
+                    existing = db.find_person_by_name(req.name)
+                    if not existing:
+                        db.close()
+                        raise HTTPException(status_code=409, detail="Person name conflict")
+                    person_id = existing["person_id"]
+                    person_name = existing["name"]
+            if not person_id:
                 db.close()
-                raise HTTPException(status_code=404, detail="Person not found")
-            person_name = p.get("name")
-        if not isinstance(person_name, str):
-            person_name = None
+                raise HTTPException(status_code=400, detail="person_id or name required")
 
-        # Single-transaction SQLite update
-        labeled = db.update_faces_person_batch(req.face_ids, person_id)
-        db.close()
+            # Fetch person name if not already resolved; validate person exists
+            if not person_name:
+                p = db.get_person(person_id)
+                if not p:
+                    db.close()
+                    raise HTTPException(status_code=404, detail="Person not found")
+                person_name = p.get("name")
+            if not isinstance(person_name, str):
+                person_name = None
 
-        # Single chunked Qdrant update (1000 points per call)
-        qdrant_collection = getattr(getattr(S, 'collections', None), 'face', 'face_emb')
-        set_face_person_batch(req.face_ids, person_id, person_name, collection=qdrant_collection, client=get_shared_client())
+            # Single-transaction SQLite update (deferred commit)
+            labeled = db.update_faces_person_batch(req.face_ids, person_id)
+
+            # Single chunked Qdrant update (1000 points per call), then
+            # commit-or-rollback
+            qdrant_collection = getattr(getattr(S, 'collections', None), 'face', 'face_emb')
+            set_face_person_batch(req.face_ids, person_id, person_name, collection=qdrant_collection, client=guard.client)
+            guard.commit_after_sync(db)
 
         return {"labeled": labeled, "person_id": person_id, "person_name": person_name}
     except HTTPException:
@@ -1434,16 +1585,19 @@ def unlabel_face(face_id: str, request: Request):
         from pathlib import Path
         from msa_indexer.db.sqlite_store import SQLiteStore
         from msa_indexer.db.qdrant_sync import update_face_payload
-        from msa_query.storage.qdrant_client import get_shared_client
         S = _get_config(request)
         db_path = Path(S.sqlite_path)
         if not db_path.exists():
             raise HTTPException(status_code=500, detail="SQLite database not found")
-        db = SQLiteStore(db_path)
-        db.clear_face_person(face_id)
-        db.close()
-        # Sync to Qdrant using the shared client
-        update_face_payload(face_id, None, None, client=get_shared_client())
+        # §4 guard held across SQLite mutation + Qdrant sync; the commit is
+        # DEFERRED until the sync outcome is known (rollback on a mid-sync
+        # close — see _qdrant_payload_write_guard).
+        with _qdrant_payload_write_guard() as guard:
+            db = SQLiteStore(db_path, autocommit=False)
+            db.clear_face_person(face_id)
+            # Sync to Qdrant using the shared client, then commit-or-rollback
+            update_face_payload(face_id, None, None, client=guard.client)
+            guard.commit_after_sync(db)
         return {"ok": True}
     except HTTPException:
         raise
@@ -1457,29 +1611,32 @@ def bulk_label(req: BulkLabelRequest, request: Request):
         from pathlib import Path
         from msa_indexer.db.sqlite_store import SQLiteStore
         from msa_indexer.db.qdrant_sync import update_faces_payload_batch
-        from msa_query.storage.qdrant_client import get_shared_client
         S = _get_config(request)
         db_path = Path(S.sqlite_path)
         if not db_path.exists():
             raise HTTPException(status_code=500, detail="SQLite database not found")
-        db = SQLiteStore(db_path)
-        updated = 0
-        person_name: Optional[str] = None
-        if req.person_id:
-            # Get person name
-            person = db.get_person(req.person_id)
-            person_name = person.get("name") if person else None
-            for fid in req.face_ids:
-                db.update_face_person(fid, req.person_id)
-                updated += 1
-        else:
-            for fid in req.face_ids:
-                db.clear_face_person(fid)
-                updated += 1
-        db.close()
-        # Batch sync to Qdrant
-        qdrant_updates = [(fid, req.person_id, person_name) for fid in req.face_ids]
-        update_faces_payload_batch(qdrant_updates, client=get_shared_client())
+        # §4 guard held across SQLite mutation + Qdrant sync; the commit is
+        # DEFERRED until the sync outcome is known (rollback on a mid-sync
+        # close — see _qdrant_payload_write_guard).
+        with _qdrant_payload_write_guard() as guard:
+            db = SQLiteStore(db_path, autocommit=False)
+            updated = 0
+            person_name: Optional[str] = None
+            if req.person_id:
+                # Get person name
+                person = db.get_person(req.person_id)
+                person_name = person.get("name") if person else None
+                for fid in req.face_ids:
+                    db.update_face_person(fid, req.person_id)
+                    updated += 1
+            else:
+                for fid in req.face_ids:
+                    db.clear_face_person(fid)
+                    updated += 1
+            # Batch sync to Qdrant, then commit-or-rollback
+            qdrant_updates = [(fid, req.person_id, person_name) for fid in req.face_ids]
+            update_faces_payload_batch(qdrant_updates, client=guard.client)
+            guard.commit_after_sync(db)
         return {"updated": updated}
     except HTTPException:
         raise
@@ -1497,7 +1654,7 @@ def get_face_suggestions(request: Request, face_id: str, top_k: int = 5):
         from collections import defaultdict
         import numpy as np
         from msa_indexer.db.sqlite_store import SQLiteStore
-        from msa_query.storage.qdrant_client import get_shared_client
+        from msa_query.storage.qdrant_client import shared_client_op
         S = _get_config(request)
 
         db_path = Path(S.sqlite_path)
@@ -1510,14 +1667,14 @@ def get_face_suggestions(request: Request, face_id: str, top_k: int = 5):
         v = np.frombuffer(blob, dtype=np.float32)
 
         # Query Qdrant for similar faces
-        client = get_shared_client()
-        if client is None:
-            raise HTTPException(status_code=503, detail="Qdrant unavailable (indexer running)")
-        hits = client.search(
-            collection_name=S.collections.face,
-            query_vector=v.tolist(),
-            limit=50,  # Get more results to aggregate by person
-        )
+        with shared_client_op() as client:
+            if client is None:
+                raise HTTPException(status_code=503, detail="Qdrant unavailable (indexer running)")
+            hits = client.search(
+                collection_name=S.collections.face,
+                query_vector=v.tolist(),
+                limit=50,  # Get more results to aggregate by person
+            )
 
         # Aggregate by person_id
         from typing import cast
@@ -1588,10 +1745,7 @@ def batch_face_suggestions(req: BatchFaceSuggestionsRequest, request: Request):
         if not vectors:
             return BatchFaceSuggestionsResponse(results={}, missing=missing)
 
-        from msa_query.storage.qdrant_client import get_shared_client
-        client = get_shared_client()
-        if client is None:
-            raise HTTPException(status_code=503, detail="Qdrant unavailable (indexer running)")
+        from msa_query.storage.qdrant_client import shared_client_op
 
         # Prepare batch searches (request a bit more to aggregate per person)
         batch_limit = max(10, req.top_k * 10)
@@ -1607,19 +1761,22 @@ def batch_face_suggestions(req: BatchFaceSuggestionsRequest, request: Request):
             face_order.append(fid)
 
         results_map: dict[str, BatchFaceSuggestionItem] = {}
-        try:
-            batch_results = client.search_batch(searches)  # type: ignore[attr-defined]
-            iterable = zip(face_order, batch_results)
-        except Exception:
-            # Fallback: sequential search if batch API unavailable
-            seq_hits = []
-            face_order_seq: list[str] = []
-            for fid, vec in vectors.items():
-                vec_list = np.asarray(vec, dtype="float32").tolist()
-                hits = client.search(collection_name=S.collections.face, query_vector=cast("list[float]", vec_list), limit=batch_limit)
-                seq_hits.append(hits)
-                face_order_seq.append(fid)
-            iterable = zip(face_order_seq, seq_hits)
+        with shared_client_op() as client:
+            if client is None:
+                raise HTTPException(status_code=503, detail="Qdrant unavailable (indexer running)")
+            try:
+                batch_results = client.search_batch(searches)  # type: ignore[attr-defined]
+                iterable = zip(face_order, batch_results)
+            except Exception:
+                # Fallback: sequential search if batch API unavailable
+                seq_hits = []
+                face_order_seq: list[str] = []
+                for fid, vec in vectors.items():
+                    vec_list = np.asarray(vec, dtype="float32").tolist()
+                    hits = client.search(collection_name=S.collections.face, query_vector=cast("list[float]", vec_list), limit=batch_limit)
+                    seq_hits.append(hits)
+                    face_order_seq.append(fid)
+                iterable = zip(face_order_seq, seq_hits)
 
         for fid, hits in iterable:
             person_scores: dict[str, dict] = defaultdict(lambda: {"scores": [], "name": None})
@@ -2110,10 +2267,65 @@ def diagnostics(request: Request):
         "logs": logs,
         "api_url": _effective_api_url(cfg),
         "app_version": _APP_VERSION,
+        "cli": _cli_diagnostics(dp),
     }
     if qdrant_url:
         result["qdrant_url"] = qdrant_url
     return result
+
+
+def _cli_diagnostics(dp) -> dict:
+    """The optional ``msa`` command-line tool tier (M-7/S-5 spec item 3).
+
+    The backend runs from the app-private venv, so ``sys.executable``'s sibling is
+    the installed ``msa`` console script — the authoritative target a desktop user
+    would opt into (the desktop install provisions the venv but does not put ``msa``
+    on PATH; only the headless bootstrap does). On POSIX the well-known opt-in
+    location is ``~/.local/bin/msa``; Windows users add the reported directory to
+    PATH. ``launcher_installed`` lets the Settings section reflect the current state.
+    """
+    import sys as _sys
+    import shutil as _shutil
+
+    exe = "msa.exe" if _sys.platform == "win32" else "msa"
+    msa_exe = Path(_sys.executable).parent / exe
+    launcher = None if _sys.platform == "win32" else Path.home() / ".local" / "bin" / "msa"
+
+    def _targets_this_runtime(candidate: Optional[Path]) -> bool:
+        """True only if ``candidate`` actually resolves to THIS app-private ``msa``.
+
+        A bare ``msa`` on PATH — or a ``~/.local/bin/msa`` — may belong to an
+        unrelated install; reporting it as "installed" would hide the opt-in
+        command and point the user at the wrong program. Matches the symlink form
+        (realpath == our msa) and the headless wrapper form (a script that execs
+        our venv), and nothing else.
+        """
+        if not candidate:
+            return False
+        try:
+            if os.path.realpath(candidate) == os.path.realpath(msa_exe):
+                return True  # symlink or the console script itself
+            if candidate.is_file():
+                content = candidate.read_text(errors="replace")
+                return str(msa_exe) in content or str(msa_exe.parent) in content
+        except Exception:
+            pass
+        return False
+
+    which = _shutil.which("msa")
+    return {
+        # The installed console script in the running interpreter's venv, or None
+        # if this interpreter has no sibling msa (e.g. an odd dev layout).
+        "msa_path": dp(msa_exe) if msa_exe.exists() else None,
+        # POSIX opt-in symlink location (None on Windows — PATH-based there).
+        "launcher_path": dp(launcher) if launcher else None,
+        # Installed only when the launcher actually points at THIS runtime's msa —
+        # not merely that a file of that name exists.
+        "launcher_installed": bool(launcher and launcher.exists() and _targets_this_runtime(launcher)),
+        # On PATH only when the resolved `msa` is THIS runtime's, not an unrelated
+        # msa earlier on PATH.
+        "on_path": _targets_this_runtime(Path(which)) if which else False,
+    }
 
 
 # Log names that can be served via GET /logs/{name}

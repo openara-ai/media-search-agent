@@ -126,6 +126,74 @@ def test_start_parent_watchdog_exits_when_supervisor_gone():
     assert exits == [0]  # os._exit(0)-equivalent stub fired exactly once
 
 
+class _BrokenStderr:
+    """A stderr whose pipe reader (the supervisor) is dead: every write/flush raises EPIPE.
+    Exactly the stream state _on_dead runs against — the supervisor held the read end."""
+
+    def write(self, _text):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def flush(self):
+        raise BrokenPipeError(32, "Broken pipe")
+
+
+def test_watchdog_reaps_even_when_stderr_pipe_is_broken(monkeypatch, caplog):
+    """THE field-orphan regression: the supervisor dies → its end of the sidecar's stderr pipe
+    closes → the watchdog's farewell stderr write raises BrokenPipeError. That exception used to
+    kill the watchdog thread BEFORE exit_fn(0) ran, leaving a live backend orphaned on the port
+    and holding the instance lock (so every later app launch died on 'already running'). The
+    reap must fire regardless of stderr's state."""
+    import sys as _sys
+
+    monkeypatch.setattr(_sys, "stderr", _BrokenStderr())
+    exits: list[int] = []
+    with caplog.at_level(logging.INFO, logger="msa_apps.search_api.sidecar"):
+        t = sidecar.start_parent_watchdog(
+            1234,
+            interval=0,
+            alive=lambda _pid: False,  # supervisor gone on the first tick
+            exit_fn=lambda code: exits.append(code),
+            sleep=lambda s: None,
+        )
+        t.join(timeout=2.0)
+    assert exits == [0], "watchdog must reap even when its stderr pipe is broken"
+    # The reap is also visible in the unified msa-desktop.log — the only place a user can
+    # actually see it (stderr goes to the dead supervisor).
+    assert any("is gone" in r.getMessage() for r in caplog.records)
+
+
+def test_watchdog_thread_survives_probe_exception(caplog):
+    """A liveness probe that raises (odd OS/ctypes state) must not silently kill the watchdog
+    thread — it keeps polling and still reaps when the probe later reports the supervisor gone."""
+    calls = {"n": 0}
+
+    def _alive(_pid):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("transient probe failure")
+        return False  # then: supervisor gone
+
+    exits: list[int] = []
+    with caplog.at_level(logging.WARNING, logger="msa_apps.search_api.sidecar"):
+        t = sidecar.start_parent_watchdog(
+            1234,
+            interval=0,
+            alive=_alive,
+            exit_fn=lambda code: exits.append(code),
+            sleep=lambda s: None,
+        )
+        t.join(timeout=2.0)
+    assert exits == [0]
+    assert any("probe failed" in r.getMessage() for r in caplog.records)
+
+
+def test_safe_stderr_never_raises(monkeypatch):
+    import sys as _sys
+
+    monkeypatch.setattr(_sys, "stderr", _BrokenStderr())
+    sidecar._safe_stderr("must not raise\n")  # the assertion is: no exception
+
+
 # ── SIGTERM handler ──────────────────────────────────────────────────────────
 
 

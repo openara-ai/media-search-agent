@@ -512,3 +512,51 @@ class TestDetectDevice:
         cfg = cfg_mod._load_config_impl(str(config_file))
 
         assert cfg.device == "cpu"
+
+
+# ---------------------------------------------------------------------------
+# Incremental indexing config (M-8/S-1 §3.4 knobs)
+# ---------------------------------------------------------------------------
+
+class TestIncrementalConfig:
+    def test_defaults_are_enabled(self, monkeypatch, tmp_path):
+        from msa_settings import config as cfg_mod
+        cfg_mod.load_config.cache_clear()
+        monkeypatch.setenv("MSA_DATA_DIR", str(tmp_path / "data"))
+
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("log_level: INFO\n")
+        cfg = cfg_mod._load_config_impl(str(config_file))
+
+        assert cfg.incremental.fingerprint_enabled is True
+        assert cfg.incremental.deletion_sweep is True
+
+    def test_yaml_overrides_parse_into_nested_dataclass(self, monkeypatch, tmp_path):
+        from msa_settings import config as cfg_mod
+        from msa_settings.config import IncrementalConfig
+        cfg_mod.load_config.cache_clear()
+        monkeypatch.setenv("MSA_DATA_DIR", str(tmp_path / "data"))
+
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "incremental:\n"
+            "  fingerprint_enabled: false\n"
+            "  deletion_sweep: false\n"
+        )
+        cfg = cfg_mod._load_config_impl(str(config_file))
+
+        assert isinstance(cfg.incremental, IncrementalConfig)
+        assert cfg.incremental.fingerprint_enabled is False
+        assert cfg.incremental.deletion_sweep is False
+
+    def test_partial_yaml_keeps_other_defaults(self, monkeypatch, tmp_path):
+        from msa_settings import config as cfg_mod
+        cfg_mod.load_config.cache_clear()
+        monkeypatch.setenv("MSA_DATA_DIR", str(tmp_path / "data"))
+
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text("incremental:\n  deletion_sweep: false\n")
+        cfg = cfg_mod._load_config_impl(str(config_file))
+
+        assert cfg.incremental.fingerprint_enabled is True
+        assert cfg.incremental.deletion_sweep is False

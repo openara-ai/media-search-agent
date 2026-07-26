@@ -334,6 +334,48 @@ def _expand_candidates_for_people(
         return []
 
 
+def _filter_deleted_media(
+    conn: Any | None, candidates: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Drop candidates whose media row is tombstoned (R6, M-8/S-1).
+
+    Search results come straight from Qdrant payloads, and the indexer's
+    deletion sweep only soft-deletes in SQLite — the dangling Qdrant
+    points survive until the delta-export sprint removes them. Both image
+    and video payloads carry the media_id as the hit id, so one batched
+    lookup covers all collections.
+
+    Fail-open: any error returns the candidates unfiltered — search
+    availability wins over tombstone freshness.
+    """
+    if conn is None or not candidates:
+        return candidates
+    try:
+        ids = sorted({str(m.get("id")) for m in candidates if m.get("id") is not None})
+        if not ids:
+            return candidates
+        deleted: set[str] = set()
+        chunk_size = 500  # stay well under SQLite's bound-parameter limit
+        for i in range(0, len(ids), chunk_size):
+            chunk = ids[i : i + chunk_size]
+            placeholders = ",".join(["?"] * len(chunk))
+            cur = conn.execute(
+                f"SELECT media_id FROM media WHERE media_id IN ({placeholders}) AND deleted = 1",
+                tuple(chunk),
+            )
+            deleted.update(str(r[0]) for r in cur.fetchall())
+        if not deleted:
+            return candidates
+        kept = [m for m in candidates if str(m.get("id")) not in deleted]
+        logger.info(
+            f"Filtered {len(candidates) - len(kept)} tombstoned media item(s) from search results"
+        )
+        return kept
+    except Exception as exc:
+        logger.warning(f"Deleted-media filter failed; returning unfiltered results: {exc}")
+        return candidates
+
+
 def _enrich_places(conn: Any | None, candidates: List[Dict[str, Any]]) -> None:
     """Hydrate place metadata for the current candidate set using one shared connection."""
     if conn is None or not candidates:
@@ -653,6 +695,10 @@ class QueryEngine:
                             f"inferred_people={query_parts['inferred_people']!r} "
                             f"added_candidates={added}"
                         )
+
+            # 4.5) R6: drop tombstoned media before ranking/return — their
+            # Qdrant points may outlive the SQLite soft-delete.
+            candidates = _filter_deleted_media(sqlite_conn, candidates)
 
             # 5) filters (people, place, date, tags)
             # If place filter is requested, enrich candidates with latest place from SQLite before filtering

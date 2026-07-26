@@ -1056,9 +1056,23 @@ def ensure_dependencies(
                 os.unlink(tmp)
             except OSError:
                 pass
-    # 3) the app itself, --no-deps.
-    _run_step("app", "deps-app", 78, 86, "Installing MediaSearchAgent",
-              app_install_command(uv, interp, project))
+    # 3) the app itself, --no-deps — built from a writable TEMP COPY, never in place.
+    #    setuptools' build backend writes ``src/<pkg>.egg-info`` into the tree it builds, and
+    #    the staged tree lives inside the app bundle: read-only when macOS App Translocation
+    #    runs a quarantined app straight from the DMG (uv exit 1, "could not create
+    #    'src/media_search_agent.egg-info': Read-only file system"), and not ours to mutate
+    #    even where it happens to be writable (bundle integrity). Like the reqs temp file
+    #    above, only materialize the copy when the step actually needs to run — the disk
+    #    budget credits completed steps, so a wasted copy could fail a valid low-space resume.
+    if "app" in completed:
+        _emit("deps-app", 86, "Installing MediaSearchAgent — already installed")
+    else:
+        with tempfile.TemporaryDirectory(prefix="msa-app-build-") as build_tmp:
+            build_copy = Path(build_tmp) / project.name
+            shutil.copytree(project, build_copy,
+                            ignore=shutil.ignore_patterns("*.egg-info", "__pycache__"))
+            _run_step("app", "deps-app", 78, 86, "Installing MediaSearchAgent",
+                      app_install_command(uv, interp, build_copy))
     # 4) facenet-pytorch --no-deps (after torch so the resolver doesn't downgrade it).
     _run_step("facenet", "deps-app", 86, 94, "Installing face recognition",
               facenet_install_command(uv, interp))

@@ -99,6 +99,21 @@ class RankerConfig:
     ltr_model_dir: Optional[str] = None
 
 @dataclass
+class IncrementalConfig:
+    """Incremental-indexing knobs (fingerprint fast-path + deletion sweep).
+
+    `fingerprint_enabled` is the kill switch back to hash-everything: when
+    false, NO fingerprint state is read or written and the deletion sweep and
+    legacy-orphan reconcile are hard-disabled too (deletion detection is only
+    meaningful over live fingerprint state — with the fast path off, every
+    media row would look orphaned and be mass-tombstoned).
+
+    `deletion_sweep` toggles just the end-of-run sweep; the two-scan grace
+    plus completed-walk gating makes the default safe."""
+    fingerprint_enabled: bool = True
+    deletion_sweep: bool = True
+
+@dataclass
 class CollectionsConfig:
     """Qdrant collection names"""
     image: str = "image_emb"
@@ -172,6 +187,7 @@ class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     ranker: RankerConfig = field(default_factory=RankerConfig)
+    incremental: IncrementalConfig = field(default_factory=IncrementalConfig)
     collections: CollectionsConfig = field(default_factory=CollectionsConfig)
     api: ApiConfig = field(default_factory=ApiConfig)
     ui: UiConfig = field(default_factory=UiConfig)

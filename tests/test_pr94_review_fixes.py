@@ -322,6 +322,7 @@ def test_indexer_env_var_parsing_falls_back_on_bad_input(
     )
     monkeypatch.setattr(pipeline, "resolve_for_access", lambda p: p)
     monkeypatch.setattr(pipeline, "iter_media", lambda *_a, **_k: [])
+    monkeypatch.setattr(pipeline, "iter_media_entries", lambda *_a, **_k: [])
     monkeypatch.setattr(pipeline, "SQLiteStore", _FakeSQLiteStore)
     monkeypatch.setattr(pipeline, "ClipEmbedder", _FakeClipEmbedder)
     monkeypatch.setattr(pipeline, "_load_historical_perf", lambda _p: (1.0, 30.0, 5.0))

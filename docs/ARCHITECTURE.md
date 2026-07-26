@@ -166,8 +166,18 @@ For each file the pipeline:
 5. Commits everything to SQLite in batches (every 200 files / 15 s).
 6. Exports the new embeddings + payloads to Qdrant.
 
-The pipeline is incremental — re-running the indexer skips files whose
-content hash is unchanged.
+The pipeline is incremental end to end. On the scan side, re-running the
+indexer skips files whose size and modification time are unchanged and
+reuses their stored identity without re-reading them. On the export side,
+every write that affects a search payload stamps the affected embedding
+rows with a sequence number, and the Qdrant export uploads only rows
+stamped after the last recorded export — a run that changed one file
+re-uploads one file's vectors, not the whole library. Deletions propagate
+the same way: soft-deleted media carry a deletion stamp, and every export
+removes their image, keyframe, and face points from Qdrant. If an export
+fails partway (including a crash mid-run), the stamps survive and the next
+run detects and exports exactly the missed rows before recording the new
+export watermark.
 
 ## Storage layout
 
@@ -289,6 +299,53 @@ Two processes share three on-disk stores:
   batches and exports new vectors to Qdrant.
 - WAL mode lets the API see incremental indexing progress without restarts.
 
+### Qdrant lock lifecycle during an indexing run
+
+Embedded Qdrant uses a file lock only one process can hold. The indexer needs
+that lock only for its final export step — the hours of scanning and model
+work touch SQLite alone. The API therefore **keeps its embedded client open
+for the whole run** and search keeps working against the pre-run index; the
+lock changes hands only for the export window, via a sentinel-file handshake
+in the run directory (the same file-based mechanism as the cooperative-stop
+sentinel, so it behaves identically on Windows):
+
+1. Before its first Qdrant open, the indexer writes `qdrant.request` and
+   waits briefly for a grant.
+2. `IndexerManager`'s watcher thread sees the request, drains in-flight
+   Qdrant operations — waiting for any in-flight payload write to finish
+   before anything else, since reads abandon safely but writes do not —
+   closes the shared client, and writes `qdrant.granted` (echoing the
+   request's run id, so a stale grant can never authorize a later run).
+3. The indexer exports, then removes both files; the watcher reopens the
+   shared client and resets the query engine so search sees the new
+   collections. The SPA shows a "Finalizing index" banner during this window.
+
+The watcher runs for the API's whole lifetime, so one contract covers a
+fresh indexer launch, re-attach to an already-running indexer after an API
+restart, and a standalone `msa index export` arriving while the API is
+idle — the idle API still holds the embedded lock, and the manual-repair
+export must be granted the window too. Fallbacks are bounded and loud:
+with no API alive the indexer proceeds after a short timeout; if the lock
+is genuinely held it retries with backoff and then skips the export with
+an error, and the next run repairs the export automatically
+(`msa index export` also works manually and uses the same handshake).
+Stale handshake files from crashed runs are cleaned at startup, and a
+request from a dead process is discarded. Setting `MSA_QDRANT_HANDOFF=off`
+disables the handshake and restores the earlier behavior (the API closes
+its client for the entire run).
+
+While the export window is open, endpoints that would patch Qdrant payloads
+(face labeling, person rename/merge) return a retryable 503 rather than
+committing changes Qdrant would miss. Each of those writes holds the
+shared-client guard across its whole SQLite commit + payload sync, so a
+window opening mid-request queues the grant behind the write instead of
+separating the commit from its sync: the watcher waits for in-flight
+writes without the short reader-drain cap, up to a generous hard ceiling
+that only a wedged write can hit. If that ceiling ever fires, the write
+fails with the same retryable 503 instead of reporting success over a
+missed payload patch — retrying the operation once the window closes
+brings SQLite and Qdrant back in step.
+
 ## Where to look in the code
 
 | Concern | Path |
@@ -303,6 +360,7 @@ Two processes share three on-disk stores:
 | Indexer pipeline | `src/msa_indexer/` |
 | SQLite schema and queries | `src/msa_indexer/db/sqlite_store.py` |
 | Qdrant export and client | `src/msa_indexer/db/qdrant_export.py`, `src/msa_query/storage/qdrant_client.py` |
+| Qdrant lock handshake (export window) | `src/msa_indexer/db/qdrant_handoff.py`, `IndexerManager` watcher in `src/msa_apps/search_api/indexer_manager.py` |
 | Unified CLI (`msa`) | `src/msa_cli/` |
 | Desktop shell — supervisor, sidecar shim | `src-tauri/`, `src/msa_apps/search_api/sidecar.py` |
 

@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build shell installer bundles for macOS and Linux.
+# Build the Linux shell installer bundle.
 # Produces a self-contained tarball that install.sh downloads and extracts —
 # no git, no Node.js, no package managers needed on the target machine.
 #
+# Linux-only since M-7/S-5.5: macOS + Windows moved to the Tauri desktop app;
+# their shell bundles were retired. (This file still lives under installer/macos/
+# for git history; it now builds only the Linux bundle. release.yml's
+# build-linux-shell-bundle calls it with --platform linux.)
+#
 # Usage (from repo root):
-#   bash installer/macos/shell/build-bundle.sh --version 0.2.0
-#   bash installer/macos/shell/build-bundle.sh --version 0.2.0 --platform linux
+#   bash installer/macos/shell/build-bundle.sh --version 0.2.0 [--platform linux]
 #   bash installer/macos/shell/build-bundle.sh --version 0.2.0 --dirty
 #     --dirty  Copy app source from the working tree instead of git archive HEAD.
 #              Picks up staged and unstaged changes. Use for local dev testing only.
 #
-# Outputs (in dist/shell/):
-#   MediaSearchAgent-<version>-macos-arm64.tar.gz
+# Output (in dist/shell/):
 #   MediaSearchAgent-<version>-linux-x86_64.tar.gz
 #
 # Bundle layout:
@@ -23,11 +26,11 @@ set -euo pipefail
 #     pyproject.toml
 #     requirements.txt
 #     src/msa_apps/ui/dist/      ← pre-built React UI (must exist before running)
-#     bin/uv                     ← uv binary (platform-specific)
+#     bin/uv                     ← uv binary (linux musl)
 #     bin/exiftool               ← exiftool (pure Perl)
 #     bin/lib/                   ← exiftool Perl libs
 #     bin/mediainfo              ← static mediainfo
-#     config.yaml.template       ← platform-specific user-facing config
+#     config.yaml.template       ← Linux user-facing config
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 DIST_DIR="$REPO_ROOT/dist/shell"
@@ -35,7 +38,11 @@ DIST_DIR="$REPO_ROOT/dist/shell"
 # ── Parse args ────────────────────────────────────────────────────────────────
 
 VERSION=""
-PLATFORM=""   # macos | linux — defaults to current host OS
+# Linux-only since M-7/S-5.5: the macOS + Windows shell bundles were retired in
+# favour of the Tauri desktop app. This builder still produces the Linux
+# tar.gz shell bundle (release.yml build-linux-shell-bundle). --platform is
+# accepted for backward compatibility but must be linux.
+PLATFORM="linux"
 DIRTY=""      # non-empty = copy from working tree instead of git archive
 
 while [[ $# -gt 0 ]]; do
@@ -47,30 +54,20 @@ while [[ $# -gt 0 ]]; do
     --dirty)      DIRTY=1; shift ;;
     --msa-ranker-wheel)   RANKER_WHEEL="${2:?'--msa-ranker-wheel requires a value'}"; shift 2 ;;
     --msa-ranker-wheel=*) RANKER_WHEEL="${1#*=}"; shift ;;
-    *) echo "ERROR: unknown argument: $1"; echo "Usage: $0 --version X.Y.Z [--platform macos|linux] [--dirty] [--msa-ranker-wheel PATH]"; exit 1 ;;
+    *) echo "ERROR: unknown argument: $1"; echo "Usage: $0 --version X.Y.Z [--platform linux] [--dirty] [--msa-ranker-wheel PATH]"; exit 1 ;;
   esac
 done
 
-[[ -z "$VERSION" ]] && { echo "Usage: $0 --version X.Y.Z [--platform macos|linux] [--dirty] [--msa-ranker-wheel PATH]"; exit 1; }
+[[ -z "$VERSION" ]] && { echo "Usage: $0 --version X.Y.Z [--platform linux] [--dirty] [--msa-ranker-wheel PATH]"; exit 1; }
 
-if [[ -z "$PLATFORM" ]]; then
-  case "$(uname -s)" in
-    Darwin) PLATFORM="macos" ;;
-    Linux)  PLATFORM="linux" ;;
-    *) echo "ERROR: unsupported OS $(uname -s) — pass --platform explicitly"; exit 1 ;;
-  esac
+if [[ "$PLATFORM" != "linux" ]]; then
+  echo "ERROR: only --platform linux is supported. The macOS/Windows shell bundles were"
+  echo "       retired in M-7/S-5.5; use the Tauri desktop app (build-desktop-* in release.yml)."
+  exit 1
 fi
 
 # Linux bundles are x86_64 only regardless of the host machine architecture.
-# macOS bundles use the host arch (arm64 on Apple Silicon, the only supported target).
-if [[ "$PLATFORM" == "linux" ]]; then
-  ARCH="x86_64"
-else
-  case "$(uname -m)" in
-    arm64|aarch64) ARCH="arm64" ;;
-    *) ARCH="x86_64" ;;
-  esac
-fi
+ARCH="x86_64"
 
 BUNDLE_NAME="MediaSearchAgent-${VERSION}-${PLATFORM}-${ARCH}"
 BUNDLE_DIR="$(mktemp -d)/${BUNDLE_NAME}"
@@ -171,15 +168,7 @@ mkdir -p "$BIN_DIR"
 
 TMP="$(mktemp -d)"
 
-if [[ "$PLATFORM" == "macos" ]]; then
-  [[ "$ARCH" == "arm64" ]] \
-    && UV_ARCHIVE="uv-aarch64-apple-darwin.tar.gz" \
-    || UV_ARCHIVE="uv-x86_64-apple-darwin.tar.gz"
-else
-  [[ "$ARCH" == "arm64" ]] \
-    && UV_ARCHIVE="uv-aarch64-unknown-linux-musl.tar.gz" \
-    || UV_ARCHIVE="uv-x86_64-unknown-linux-musl.tar.gz"
-fi
+UV_ARCHIVE="uv-x86_64-unknown-linux-musl.tar.gz"
 
 download \
   "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${UV_ARCHIVE}" \
@@ -201,116 +190,25 @@ cp "$TMP/exiftool-${EXIFTOOL_VERSION}/exiftool" "$BIN_DIR/exiftool"
 cp -r "$TMP/exiftool-${EXIFTOOL_VERSION}/lib" "$BIN_DIR/lib"
 chmod +x "$BIN_DIR/exiftool"
 
-if [[ "$PLATFORM" == "macos" ]]; then
-  # mediainfo — extract from official macOS DMG
-  MEDIAINFO_VERSION="24.01"
-  DMG_URL="https://mediaarea.net/download/binary/mediainfo/${MEDIAINFO_VERSION}/MediaInfo_CLI_${MEDIAINFO_VERSION}_Mac.dmg"
-  download "$DMG_URL" "$TMP/mediainfo.dmg" "mediainfo $MEDIAINFO_VERSION"
-  MOUNT="$(mktemp -d)"
-  hdiutil attach "$TMP/mediainfo.dmg" -mountpoint "$MOUNT" -nobrowse -quiet
-  PKG="$(find "$MOUNT" -name "*.pkg" | head -1)"
-  PKG_EXPAND="$TMP/pkg_expand"
-  pkgutil --expand "$PKG" "$PKG_EXPAND"
-  hdiutil detach "$MOUNT" -quiet 2>/dev/null || true
-  PAYLOAD="$(find "$PKG_EXPAND" -name Payload | head -1)"
-  PAYLOAD_DIR="$TMP/pkg_payload"
-  mkdir -p "$PAYLOAD_DIR"
-  # BSD cpio (macOS) does not support -D; use cd instead
-  (cd "$PAYLOAD_DIR" && gzip -dc "$PAYLOAD" | cpio -id 2>/dev/null) || true
-  MEDIAINFO_BIN="$(find "$PAYLOAD_DIR" -name mediainfo -type f | head -1)"
-  if [[ -f "$MEDIAINFO_BIN" ]]; then
-    if file "$MEDIAINFO_BIN" | grep -q "universal binary"; then
-      lipo -thin "$ARCH" "$MEDIAINFO_BIN" -output "$BIN_DIR/mediainfo"
-    else
-      cp "$MEDIAINFO_BIN" "$BIN_DIR/mediainfo"
-    fi
-    chmod +x "$BIN_DIR/mediainfo"
-  fi
-  [[ -f "$BIN_DIR/mediainfo" ]] || { echo "ERROR: could not obtain mediainfo binary"; exit 1; }
-
-else
-  # Linux — static builds, no sudo required
-
-  # mediainfo official Linux binary package from mediaarea.net.
-  # Do not use the MediaInfo source archive here: it is not a guaranteed
-  # prebuilt CLI binary, and can leave bin/mediainfo missing at release time.
-  MEDIAINFO_VERSION="25.04"
-  download \
-    "https://old.mediaarea.net/download/binary/mediainfo/${MEDIAINFO_VERSION}/MediaInfo_CLI_${MEDIAINFO_VERSION}_Lambda_x86_64.zip" \
-    "$TMP/mediainfo.zip" "mediainfo $MEDIAINFO_VERSION (linux x86_64)"
-  unzip -q "$TMP/mediainfo.zip" -d "$TMP/mediainfo"
-  MEDIAINFO_BIN="$(find "$TMP/mediainfo" -type f -name mediainfo | head -1 || true)"
-  [[ -n "$MEDIAINFO_BIN" ]] || { echo "ERROR: mediainfo binary not found in Linux zip package"; exit 1; }
-  cp "$MEDIAINFO_BIN" "$BIN_DIR/mediainfo"
-  chmod +x "$BIN_DIR/mediainfo"
-fi
+# mediainfo official Linux binary package from mediaarea.net.
+# Do not use the MediaInfo source archive here: it is not a guaranteed
+# prebuilt CLI binary, and can leave bin/mediainfo missing at release time.
+MEDIAINFO_VERSION="25.04"
+download \
+  "https://old.mediaarea.net/download/binary/mediainfo/${MEDIAINFO_VERSION}/MediaInfo_CLI_${MEDIAINFO_VERSION}_Lambda_x86_64.zip" \
+  "$TMP/mediainfo.zip" "mediainfo $MEDIAINFO_VERSION (linux x86_64)"
+unzip -q "$TMP/mediainfo.zip" -d "$TMP/mediainfo"
+MEDIAINFO_BIN="$(find "$TMP/mediainfo" -type f -name mediainfo | head -1 || true)"
+[[ -n "$MEDIAINFO_BIN" ]] || { echo "ERROR: mediainfo binary not found in Linux zip package"; exit 1; }
+cp "$MEDIAINFO_BIN" "$BIN_DIR/mediainfo"
+chmod +x "$BIN_DIR/mediainfo"
 
 rm -rf "$TMP"
-
-# ── 4b. Swift menu bar app ───────────────────────────────────────────────────
-# Compile main.swift into a native arm64 NSStatusItem app and embed it in the
-# bundle. install.sh extracts it to ~/Applications/MediaSearchAgent.app and
-# writes a msa-paths.env sidecar so the binary finds the shell-bundle layout.
-# Only built on macOS (swiftc not available on Linux runners).
-
-if [[ "$PLATFORM" == "macos" ]]; then
-  echo "==> [4b/6] Swift menu bar app"
-  SWIFT_SRC="$REPO_ROOT/installer/macos/launcher_app/main.swift"
-  APP_DIR="$BUNDLE_DIR/MediaSearchAgent.app"
-  mkdir -p "$APP_DIR/Contents/MacOS"
-  mkdir -p "$APP_DIR/Contents/Resources"
-
-  swiftc \
-    -framework AppKit \
-    -framework Foundation \
-    -target "arm64-apple-macos12.0" \
-    -O \
-    -o "$APP_DIR/Contents/MacOS/MediaSearchAgent" \
-    "$SWIFT_SRC" \
-    || { echo "ERROR: swiftc failed — Swift menu bar app not included"; rm -rf "$APP_DIR"; }
-
-  if [[ -d "$APP_DIR" ]]; then
-    ICON="$REPO_ROOT/installer/macos/assets/icon.icns"
-    [[ -f "$ICON" ]] && cp "$ICON" "$APP_DIR/Contents/Resources/AppIcon.icns"
-
-    cat > "$APP_DIR/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleIdentifier</key>        <string>ai.openara.mediasearchagent</string>
-    <key>CFBundleName</key>              <string>MediaSearchAgent</string>
-    <key>CFBundleDisplayName</key>       <string>MediaSearchAgent</string>
-    <key>CFBundleVersion</key>           <string>${VERSION}</string>
-    <key>CFBundleShortVersionString</key><string>${VERSION}</string>
-    <key>CFBundleExecutable</key>        <string>MediaSearchAgent</string>
-    <key>CFBundlePackageType</key>       <string>APPL</string>
-    <key>CFBundleIconFile</key>          <string>AppIcon</string>
-    <key>LSMinimumSystemVersion</key>    <string>12.0</string>
-    <key>LSUIElement</key>               <true/>
-    <key>NSHighResolutionCapable</key>   <true/>
-    <key>NSPrincipalClass</key>          <string>NSApplication</string>
-    <key>LSArchitectures</key>
-    <array><string>arm64</string></array>
-</dict>
-</plist>
-PLIST
-    chmod +x "$APP_DIR/Contents/MacOS/MediaSearchAgent"
-    echo "    Swift menu bar app built"
-  fi
-fi
 
 # ── 5. Config template ────────────────────────────────────────────────────────
 
 echo "==> [5/6] Config template"
-# Use a platform-specific template. installer/linux/config.linux.yaml.template
-# exists for Linux; macOS falls back to installer/macos/config.macos.yaml.template.
-if [[ "$PLATFORM" == "linux" && -f "$REPO_ROOT/installer/linux/config.linux.yaml.template" ]]; then
-  TEMPLATE="$REPO_ROOT/installer/linux/config.linux.yaml.template"
-else
-  TEMPLATE="$REPO_ROOT/installer/macos/config.macos.yaml.template"
-fi
+TEMPLATE="$REPO_ROOT/installer/linux/config.linux.yaml.template"
 [[ -f "$TEMPLATE" ]] || { echo "ERROR: config template not found at $TEMPLATE"; exit 1; }
 cp "$TEMPLATE" "$BUNDLE_DIR/config.yaml.template"
 

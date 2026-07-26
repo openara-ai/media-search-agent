@@ -31,8 +31,10 @@ PYTHON_BIN=""
 SETUP_STATUS="NOT_RUN"
 FAST_STATUS="NOT_RUN"
 INDEX_STATUS="NOT_RUN"
+INCREMENTAL_STATUS="NOT_RUN"
 API_STATUS="NOT_RUN"
 RUNTIME_STATUS="NOT_RUN"
+SEARCH_DURING_INDEXING_STATUS="NOT_RUN"
 SLOW_STATUS="NOT_RUN"
 
 FIXTURE_ROOT_REL="tests/real_media/fixtures"
@@ -71,8 +73,10 @@ phase_fail() {
     setup) SETUP_STATUS="FAILED" ;;
     fast) FAST_STATUS="FAILED" ;;
     index) INDEX_STATUS="FAILED" ;;
+    incremental) INCREMENTAL_STATUS="FAILED" ;;
     api) API_STATUS="FAILED" ;;
     runtime) RUNTIME_STATUS="FAILED" ;;
+    search_during_indexing) SEARCH_DURING_INDEXING_STATUS="FAILED" ;;
     slow) SLOW_STATUS="FAILED" ;;
   esac
   die "$message"
@@ -265,8 +269,10 @@ write_summary() {
 - Setup: $SETUP_STATUS
 - Fast fixtures: $FAST_STATUS
 - Index: $INDEX_STATUS
+- Incremental (Phases C/D): $INCREMENTAL_STATUS
 - API: $API_STATUS
 - Runtime: $RUNTIME_STATUS
+- Search during indexing (M-8/S-2): $SEARCH_DURING_INDEXING_STATUS
 - Slow checks: $SLOW_STATUS
 
 ## Final Result
@@ -279,7 +285,10 @@ copy_reports() {
   [[ -n "$REPORT_DIR" ]] || return 0
   mkdir -p "$REPORT_COPY_DIR"
   cp -f "$ARTIFACTS_DIR"/summary.md "$REPORT_COPY_DIR"/
-  for log_file in indexer.log api.log pytest-fast.log pytest-runtime.log pytest-slow.log pytest-lifecycle.log; do
+  for log_file in indexer.log api.log pytest-fast.log pytest-runtime.log pytest-slow.log pytest-lifecycle.log \
+    pytest-search-during-indexing.log \
+    incremental-phases.log indexer-phase-c.log indexer-phase-d-exif.log \
+    indexer-phase-d-move.log indexer-phase-d-del1.log indexer-phase-d-del2.log; do
     if [[ -f "$ARTIFACTS_DIR/$log_file" ]]; then
       cp -f "$ARTIFACTS_DIR/$log_file" "$REPORT_COPY_DIR"/
     fi
@@ -528,15 +537,33 @@ fi
 # test_video_media_*_includes_keyframe_tags. Force detection on so the
 # indexer actually runs RT-DETR, mirroring the override the bundle BVT
 # validators apply (tests/real_media/scripts/validate-installed-bundle-*).
-"$WORKSPACE_PATH/.venv/bin/python" - "$WORKSPACE_PATH/config.yaml" <<'PY'
+# Also pin media_sources to the staged fixture root: the CLI index steps
+# pass --media-source-override, but the M-8/S-2 search-during-indexing
+# step starts a run through POST /indexer/start, which reads media
+# sources from this config — the two must agree.
+"$WORKSPACE_PATH/.venv/bin/python" - "$WORKSPACE_PATH/config.yaml" "$WORKSPACE_PATH/$FIXTURE_INDEX_ROOT_REL" <<'PY'
 import sys, yaml
 from pathlib import Path
 p = Path(sys.argv[1])
+fixture_root = sys.argv[2]
 data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
 data["enable_object_detection"] = True
 data["enable_video_object_detection"] = True
+data["media_sources"] = [
+    {"name": "Real Media Fixtures", "path": fixture_root, "read_only": True}
+]
 p.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 PY
+
+# Stage the content-unique seed files that BVT Phases C/D mutate (M-8/S-1
+# plan §6.2). The seeds live in a sibling subdir of the staged fixture copy
+# — the fixture-inventory tests only assert their expected sets exist, so
+# additions are safe, and mutation never touches a shared fixture file.
+if [[ $SKIP_INDEX -eq 0 ]]; then
+  bash "$WORKSPACE_PATH/tests/real_media/scripts/incremental-phases.sh" seed \
+    --fixture-root "$WORKSPACE_PATH/$FIXTURE_INDEX_ROOT_REL" \
+    || phase_fail setup "Failed to stage incremental-phase seed files"
+fi
 
 export MSA_CONFIG_PATH="$WORKSPACE_PATH/config.yaml"
 export MSA_REALDATA_WORKSPACE="$WORKSPACE_PATH"
@@ -595,6 +622,38 @@ else
   INDEX_STATUS="SKIPPED"
 fi
 
+# BVT Phases C/D — incremental indexing (M-8/S-1 plan §6.2). Counter-based
+# assertions on the INDEXER_SUMMARY complete payload: Phase C proves a
+# no-op re-run hashes nothing and skips the export; Phase D mutates the
+# staged fixture copy (EXIF re-inject, move, delete) and asserts the
+# supersede/move/tombstone paths. Runs before the API starts because the
+# indexer needs the embedded-Qdrant lock for its auto-exports.
+if [[ $SKIP_INDEX -eq 0 ]]; then
+  INCREMENTAL_STATUS="RUNNING"
+  log "Running incremental-indexing Phases C/D"
+  if (
+    cd "$WORKSPACE_PATH"
+    export MSA_CONFIG_PATH PYTHONPATH="$WORKSPACE_PYTHONPATH" HF_HUB_OFFLINE \
+      MSA_INDEXER_COMMIT_BATCH_FILES MSA_INDEXER_COMMIT_BATCH_SECONDS
+    exec bash tests/real_media/scripts/incremental-phases.sh run \
+      --python "$WORKSPACE_PATH/.venv/bin/python" \
+      --sqlite "$MSA_REALDATA_SQLITE_PATH" \
+      --fixture-root "$WORKSPACE_PATH/$FIXTURE_INDEX_ROOT_REL" \
+      --log-dir "$ARTIFACTS_DIR" \
+      --qdrant "$WORKSPACE_PATH/qdrant" \
+      -- bash scripts/dev-cli.sh msa index run \
+        --config "$WORKSPACE_PATH/config.yaml" \
+        --media-source-override "$WORKSPACE_PATH/$FIXTURE_INDEX_ROOT_REL"
+  ) >"$ARTIFACTS_DIR/incremental-phases.log" 2>&1; then
+    INCREMENTAL_STATUS="PASSED"
+    export MSA_REALDATA_INCREMENTAL=1
+  else
+    phase_fail incremental "Incremental Phases C/D failed. See $ARTIFACTS_DIR/incremental-phases.log"
+  fi
+else
+  INCREMENTAL_STATUS="SKIPPED"
+fi
+
 if [[ $SKIP_API -eq 0 ]]; then
   API_STATUS="RUNNING"
   log "Starting API on port $PORT"
@@ -645,6 +704,28 @@ if (
   RUNTIME_STATUS="PASSED"
 else
   phase_fail runtime "Runtime validation failed. See $ARTIFACTS_DIR/pytest-runtime.log"
+fi
+
+# M-8/S-2 — search-during-indexing gate (plan §6.2). With the API still up,
+# mutate one staged seed, start a run through POST /indexer/start, and keep
+# /search polling for the whole run: every response 200, non-empty during
+# pre-export phases, handshake lines in order, no embedded-lock contention.
+# Needs both a fresh index (seeds staged + Phases C/D state) and a live API.
+if [[ $SKIP_INDEX -eq 0 && $SKIP_API -eq 0 ]]; then
+  SEARCH_DURING_INDEXING_STATUS="RUNNING"
+  log "Running search-during-indexing gate (M-8/S-2)"
+  if (
+    cd "$WORKSPACE_PATH"
+    export MSA_CONFIG_PATH PYTHONPATH="$WORKSPACE_PYTHONPATH" HF_HUB_OFFLINE
+    export MSA_REALDATA_SEARCH_DURING_INDEXING=1
+    exec bash scripts/dev-cli.sh pytest tests/real_media/test_real_media_runtime.py -v -k TestSearchDuringIndexing
+  ) >"$ARTIFACTS_DIR/pytest-search-during-indexing.log" 2>&1; then
+    SEARCH_DURING_INDEXING_STATUS="PASSED"
+  else
+    phase_fail search_during_indexing "Search-during-indexing gate failed. See $ARTIFACTS_DIR/pytest-search-during-indexing.log"
+  fi
+else
+  SEARCH_DURING_INDEXING_STATUS="SKIPPED"
 fi
 
 if [[ $SKIP_SLOW_MODEL_CHECKS -eq 0 ]]; then
