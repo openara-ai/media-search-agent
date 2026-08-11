@@ -6,6 +6,7 @@ name: CI
 # workflow_dispatch → test + integration (Linux) by default; check full_gate to also
 #                     run the macOS + Windows jobs (the full pre-release gate)
 # tag push (v*)  → handled entirely by release.yml; ci.yml is skipped
+# any failed push to main → notify-on-failure opens/updates a tracking issue.
 #
 # Windows is NO LONGER run on every push here — Windows runners are slow and
 # metered, and the release.yml gate already blocks shipping a broken installer.
@@ -440,3 +441,45 @@ jobs:
 
   # The legacy macOS .pkg/.dmg (Platypus) installer job was retired in M-7/S-5.5:
   # macOS ships as the Tauri desktop app (build-desktop-macos in release.yml).
+
+  # ── Notify on red ──────────────────────────────────────────────────────────
+  # Open (or update) a single tracking issue when a push to main fails, so CI
+  # going red is seen immediately instead of via a badge nobody watches.
+  # Scoped to push — PR failures are already visible in the PR itself.
+  notify-on-failure:
+    name: Notify on failure
+    needs: [ test, integration ]
+    if: failure() && github.event_name == 'push'
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_LABELS || '["ubuntu-latest"]') }}
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the ci-failure issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = `CI failed on \`${context.ref}\` @ \`${context.sha.slice(0, 9)}\` (${context.eventName}).\n\n${run}`;
+            // Ensure the dedup label exists (idempotent) so the lookup below finds an
+            // existing report instead of opening a duplicate issue on every red run.
+            try {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner, repo: context.repo.repo,
+                name: 'ci-failure', color: 'b60205', description: 'Automated: CI is red',
+              });
+            } catch (e) { if (e.status !== 422) throw e; }
+            const open = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'ci-failure',
+            });
+            if (open.data.length) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: open.data[0].number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title: 'CI is red on main', body, labels: ['ci-failure'],
+              });
+            }

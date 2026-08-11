@@ -1,0 +1,96 @@
+name: Drift Check
+
+# Public-only daily upstream-dependency-drift check.
+#
+# The public repo is a fast-forward mirror of the private source and only receives
+# pushes at release time, so between releases NOTHING re-runs its CI. A new upstream
+# release that breaks an import (e.g. qdrant-client dropping SearchRequest) would sit
+# undetected until the next release. This runs the Python unit suite daily on free
+# hosted runners and opens a tracking issue on failure.
+#
+# Deps install WITHOUT a pip cache on purpose: a cached wheel could hold a pre-drift
+# version and mask exactly the breakage this job exists to catch.
+#
+# Gated to openara-ai (public) in every job's if:. `on.schedule` can't be made
+# conditional per-repo, and public is a FF mirror of private, so this file exists on
+# both repos; on the private mirror the scheduled run is created but every job is
+# skipped (zero compute). Manual runs are available anywhere via workflow_dispatch.
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  drift:
+    name: Python unit suite (dependency drift)
+    if: github.repository == 'openara-ai/media-search-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install CI dependencies (no cache — fresh resolution catches drift)
+        run: |
+          python -m pip install --upgrade pip
+          # Mirror ci.yml Quick Tests: install everything except facenet-pytorch
+          # first so torch resolves freely, then facenet-pytorch --no-deps.
+          grep -v '^facenet-pytorch' tests/requirements-ci.txt | python -m pip install -r /dev/stdin
+          python -m pip install "facenet-pytorch>=2.6.0" --no-deps
+          python -m pip install -e .
+
+      - name: Run unit tests (skip E2E) — same scope as ci.yml Quick Tests
+        run: python -m pytest tests/ -v -m "not slow"
+
+  # Open/update the shared ci-failure tracking issue when the drift run goes red,
+  # so an upstream break is seen immediately instead of via a stale badge.
+  notify-on-failure:
+    name: Notify on failure
+    needs: [ drift ]
+    if: failure() && github.repository == 'openara-ai/media-search-agent'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the ci-failure issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = `Drift Check failed on \`${context.ref}\` @ \`${context.sha.slice(0, 9)}\` (${context.eventName}) — likely an upstream dependency release.\n\n${run}`;
+            // Ensure the dedup label exists (idempotent) so the lookup below finds an
+            // existing report instead of opening a duplicate issue on every red run.
+            try {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner, repo: context.repo.repo,
+                name: 'ci-failure', color: 'b60205', description: 'Automated: CI is red',
+              });
+            } catch (e) { if (e.status !== 422) throw e; }
+            const open = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'ci-failure',
+            });
+            if (open.data.length) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: open.data[0].number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title: 'CI is red on main', body, labels: ['ci-failure'],
+              });
+            }

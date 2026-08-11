@@ -13,7 +13,10 @@ pydantic-settings  # for get_settings()
 open_clip_torch  # for ClipEmbedder (imported even if mocked)
 Pillow  # for PIL imports
 pillow_heif  # for HEIF image format support
-qdrant-client  # for QdrantStore imports in retrievers
+# Pin to the product (requirements*.txt: qdrant-client==1.11.3). Left unpinned, CI
+# floated to a newer qdrant-client that dropped SearchRequest from
+# qdrant_client.http.models, breaking test collection on untouched main.
+qdrant-client==1.11.3  # for QdrantStore imports in retrievers
 
 # Required for API tests
 fastapi  # for FastAPI TestClient
